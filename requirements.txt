@@ -25,6 +25,8 @@ pandas==2.3.3
     # via -r requirements.in
 py4j==0.10.9.9
     # via pyspark
+pyarrow==21.0.0
+    # via -r requirements.in
 pyspark==4.0.2
     # via -r requirements.in
 python-dateutil==2.9.0.post0

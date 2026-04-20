@@ -13,5 +13,8 @@ pandas
 # Numerical operations (used in VIIRS pixel masking and aggregation)
 numpy
 
-# Distributed data processing pipeline
+# Distributed data processing pipeline (Phase 2/3)
 pyspark
+
+# Parquet I/O for Phase 1 (direct file writing, bypasses JVM overhead)
+pyarrow
