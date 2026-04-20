@@ -1,1 +1,17 @@
+# Core HTTP for VIIRS and KNMI downloads
 requests
+
+# HDF5 reading for VIIRS VNP46A2 satellite data
+h5py
+
+# Excel reading for ENTSO-E load data
+openpyxl
+
+# Data manipulation (used in preprocessing for small-file parsing)
+pandas
+
+# Numerical operations (used in VIIRS pixel masking and aggregation)
+numpy
+
+# Distributed data processing pipeline
+pyspark
