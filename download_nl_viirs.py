@@ -56,8 +56,11 @@ def get_curl(url, token, out_path=None):
         return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Download VIIRS VNP46A2 (Standard/NRT) for the Netherlands.")
+    parser = argparse.ArgumentParser(description="Download VIIRS VNP46A1/A2 (Standard/NRT) for the Netherlands.")
     parser.add_argument('-d', '--dest', default="/projects/prjs2061/data/viirs", help="Destination folder path")
+    parser.add_argument('-p', '--product', choices=['A1', 'A2'], default='A2', help="Product variant to download (A1 or A2)")
+    parser.add_argument('-s', '--start', default="2012-01-01", help="Start date in YYYY-MM-DD format")
+    parser.add_argument('-e', '--end', default=datetime.today().strftime('%Y-%m-%d'), help="End date in YYYY-MM-DD format")
     args = parser.parse_args()
 
     if os.environ.get('LAADS_TOKEN'):
@@ -73,15 +76,15 @@ def main():
     # The Netherlands fits perfectly within the h18v03 tile on the 10x10 degree geographic grid
     TARGET_TILE = "h18v03"
     
-    # LAADS DAAC endpoints (Collection 5200 is standard for VIIRS VNP46A2 Collection 2)
-    STD_URL = "https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/5200/VNP46A2"
-    NRT_URL = "https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/5200/VNP46A2_NRT"
+    # LAADS DAAC endpoints (Collection 5200 is standard for VIIRS VNP46 Collection 2)
+    STD_URL = f"https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/5200/VNP46{args.product}"
+    NRT_URL = f"https://ladsweb.modaps.eosdis.nasa.gov/archive/allData/5200/VNP46{args.product}_NRT"
 
     os.makedirs(args.dest, exist_ok=True)
 
     # Note: Actual VIIRS satellite data collection began in Jan 2012
-    start_date = datetime(2012, 1, 1).date()
-    end_date = datetime.today().date()
+    start_date = datetime.strptime(args.start, "%Y-%m-%d").date()
+    end_date = datetime.strptime(args.end, "%Y-%m-%d").date()
     
     print(f"Starting download for tile {TARGET_TILE} (Netherlands) from {start_date} to {end_date}...\n")
 
