@@ -18,3 +18,15 @@ pyspark
 
 # Parquet I/O for Phase 1 (direct file writing, bypasses JVM overhead)
 pyarrow
+
+# ── Analysis notebook dependencies (analysis/01_time_series_analysis.ipynb) ──
+
+# Plotting
+matplotlib
+seaborn
+
+# Time series analysis: STL decomposition, ACF/PACF, VIF
+statsmodels
+
+# Jupyter environment for running notebooks
+jupyterlab
