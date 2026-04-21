@@ -227,3 +227,8 @@ download_knmi.log
 spark-warehouse/
 derby.log
 metastore_db/
+
+# Python virtual environment (created by setup_env.sh)
+.venv/
+venv/
+env/

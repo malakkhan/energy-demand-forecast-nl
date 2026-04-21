@@ -30,3 +30,6 @@ statsmodels
 
 # Jupyter environment for running notebooks
 jupyterlab
+
+# Jupyter kernel registration (registers this venv as a kernel inside JupyterHub)
+ipykernel
