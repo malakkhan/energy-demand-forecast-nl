@@ -11,7 +11,8 @@ partitioned by year, with a comprehensive ``data_quality.json``.
 
 Join strategy (pure pandas — the total dataset is ~122K rows):
     - **ENTSO-E** (hourly): Left-join on ``timestamp``.
-    - **VIIRS A2 daily** (daily): Left-join on ``date``.
+    - **VIIRS A2 daily** (daily): Left-join on ``date``; columns prefixed ``ntl_a2_``.
+    - **VIIRS A1 daily** (daily): Left-join on ``date``; columns prefixed ``ntl_a1_``.
     - **CBS Combined** (monthly): Left-join on ``(year, month)``.
 
 Usage::
@@ -189,21 +190,30 @@ def join_entsoe(spine: pd.DataFrame, p2_entsoe_path: str) -> pd.DataFrame:
     return spine.merge(entsoe, on="timestamp", how="left")
 
 
-def join_viirs(spine: pd.DataFrame, p2_viirs_path: str) -> pd.DataFrame:
-    """Left-join VIIRS daily aggregates onto the spine by date."""
-    viirs_cols = [
+def join_viirs(spine: pd.DataFrame, p2_viirs_path: str,
+               product: str = "a2") -> pd.DataFrame:
+    """Left-join VIIRS daily aggregates onto the spine by date.
+
+    Output columns are prefixed with the product identifier so that A1 and
+    A2 can coexist in the final dataset (e.g. ``ntl_a2_mean``, ``ntl_a1_mean``).
+    """
+    base_cols = [
         "ntl_mean", "ntl_sum", "ntl_valid_count",
         "ntl_fill_count", "ntl_invalid_count",
     ]
+    # ntl_mean → ntl_a2_mean (strip "ntl_" prefix, add product-specific prefix)
+    prefixed_cols = [f"ntl_{product}_{c[4:]}" for c in base_cols]
+
     if not os.path.exists(p2_viirs_path):
-        logger.warning("VIIRS P2 not found — columns will be null.")
-        for c in viirs_cols:
+        logger.warning("VIIRS %s P2 not found — columns will be null.", product.upper())
+        for c in prefixed_cols:
             spine[c] = np.nan
         return spine
 
-    viirs = pd.read_parquet(p2_viirs_path, columns=["date"] + viirs_cols)
+    viirs = pd.read_parquet(p2_viirs_path, columns=["date"] + base_cols)
     viirs["date"] = pd.to_datetime(viirs["date"]).dt.date
-    logger.info("  Joining VIIRS daily (%d rows).", len(viirs))
+    viirs = viirs.rename(columns=dict(zip(base_cols, prefixed_cols)))
+    logger.info("  Joining VIIRS %s daily (%d rows).", product.upper(), len(viirs))
     return spine.merge(viirs, on="date", how="left")
 
 
@@ -248,9 +258,12 @@ def _ordered_columns(columns: list) -> list:
         "timestamp",
         # Target
         "entsoe_load_mw",
-        # VIIRS aggregates
-        "ntl_mean", "ntl_sum",
-        "ntl_valid_count", "ntl_fill_count", "ntl_invalid_count",
+        # VIIRS A2 aggregates (gap-filled BRDF-corrected)
+        "ntl_a2_mean", "ntl_a2_sum",
+        "ntl_a2_valid_count", "ntl_a2_fill_count", "ntl_a2_invalid_count",
+        # VIIRS A1 aggregates (at-sensor radiance)
+        "ntl_a1_mean", "ntl_a1_sum",
+        "ntl_a1_valid_count", "ntl_a1_fill_count", "ntl_a1_invalid_count",
         # CBS — energy tariffs (explicit order)
         "cbs_gas_transport_rate", "cbs_gas_fixed_supply_rate",
         "cbs_gas_ode_tax", "cbs_gas_energy_tax", "cbs_gas_total_tax",
@@ -353,7 +366,8 @@ def main() -> None:
 
     # 2. Join sources — all done in-memory with pandas merge.
     df = join_entsoe(df, os.path.join(p2_dir, "entsoe", "data"))
-    df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_daily", "data"))
+    df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_daily", "data"), product="a2")
+    df = join_viirs(df, os.path.join(p2_dir, "viirs_a1_daily", "data"), product="a1")
     df = join_cbs(df, os.path.join(p2_dir, "cbs_combined", "data"))
 
     # 3. Reorder columns, drop internal join key
@@ -384,15 +398,18 @@ def main() -> None:
     # 6. Quality + coverage
     total = len(df)
     entsoe_nn = int(df["entsoe_load_mw"].notna().sum())
-    viirs_nn = int(df["ntl_mean"].notna().sum())
+    viirs_a2_nn = int(df["ntl_a2_mean"].notna().sum()) if "ntl_a2_mean" in df.columns else 0
+    viirs_a1_nn = int(df["ntl_a1_mean"].notna().sum()) if "ntl_a1_mean" in df.columns else 0
     cbs_energy_nn = int(df["cbs_gas_total_tax"].notna().sum()) if "cbs_gas_total_tax" in df.columns else 0
     cbs_gdp_nn = int(df["cbs_gdp_yy"].notna().sum()) if "cbs_gdp_yy" in df.columns else 0
     load = df["entsoe_load_mw"].dropna()
 
     logger.info("Final: %d hourly rows.", total)
     logger.info(
-        "Coverage — ENTSO-E: %.1f%% | VIIRS: %.1f%% | CBS Tariffs: %.1f%% | CBS GDP: %.1f%%",
-        100 * entsoe_nn / total, 100 * viirs_nn / total,
+        "Coverage — ENTSO-E: %.1f%% | VIIRS A2: %.1f%% | VIIRS A1: %.1f%% "
+        "| CBS Tariffs: %.1f%% | CBS GDP: %.1f%%",
+        100 * entsoe_nn / total, 100 * viirs_a2_nn / total,
+        100 * viirs_a1_nn / total,
         100 * cbs_energy_nn / total, 100 * cbs_gdp_nn / total,
     )
 
@@ -416,9 +433,13 @@ def main() -> None:
                 "non_null": entsoe_nn,
                 "pct": round(100 * entsoe_nn / total, 2) if total else 0.0,
             },
-            "ntl_mean": {
-                "non_null": viirs_nn,
-                "pct": round(100 * viirs_nn / total, 2) if total else 0.0,
+            "ntl_a2_mean": {
+                "non_null": viirs_a2_nn,
+                "pct": round(100 * viirs_a2_nn / total, 2) if total else 0.0,
+            },
+            "ntl_a1_mean": {
+                "non_null": viirs_a1_nn,
+                "pct": round(100 * viirs_a1_nn / total, 2) if total else 0.0,
             },
             "cbs_gas_total_tax": {
                 "non_null": cbs_energy_nn,

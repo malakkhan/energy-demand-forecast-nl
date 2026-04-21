@@ -8,6 +8,8 @@ produces aggregated/combined tables in ``data/processing_2/``.
 Operations:
     - **VIIRS A2**: Pixel-level spatial data → daily scalar aggregates
       (mean, sum, valid/fill/invalid pixel counts).
+    - **VIIRS A1**: Same aggregation applied to the A1 (at-sensor radiance)
+      pixel data.
     - **CBS Combined**: Merge CBS energy (monthly) and CBS macro (annual)
       into a single aligned table.
     - **ENTSO-E**: Pass-through with consistent year-partitioning and a
@@ -152,7 +154,7 @@ def _write_quality_json(metrics: dict, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2A: VIIRS A2 daily aggregates
+# Phase 2A: VIIRS daily aggregates (A1 and A2)
 # ---------------------------------------------------------------------------
 
 
@@ -161,8 +163,13 @@ def aggregate_viirs(
     p1_dir: str,
     out_dir: str,
     force: bool = False,
+    product: str = "a2",
 ) -> None:
     """Aggregate pixel-level VIIRS data to daily scalar statistics.
+
+    Supports both VNP46A1 (``product="a1"``) and VNP46A2 (``product="a2"``).
+    Both products share the same Phase 1 output schema, so the aggregation
+    logic is identical.
 
     Reads the NL-masked pixel-level Parquet from Phase 1 and computes per-day
     aggregates over the spatial dimension. This is the heaviest Phase 2 stage
@@ -173,17 +180,13 @@ def aggregate_viirs(
     Output columns:
         - ``date``: Observation date.
         - ``ntl_mean``: Mean NTL radiance of valid pixels (quality ≤ 1, not
-          fill). Unit: nW/cm²/sr (raw values from the VNP46A2 Gap-Filled
-          layer, which is already in physical units).
-        - ``ntl_sum``: Sum of NTL radiance of valid pixels — total emission
-          over the NL region.
+          fill). Unit: nW/cm²/sr.
+        - ``ntl_sum``: Sum of NTL radiance of valid pixels.
         - ``ntl_valid_count``: Number of valid pixels (quality ≤ 1, not fill).
-        - ``ntl_fill_count``: Number of fill-value pixels (``-999.9``),
-          indicating sensor/retrieval gaps.
-        - ``ntl_invalid_count``: Number of non-fill pixels with poor quality
-          (quality flag > 1), indicating cloud/atmospheric contamination.
+        - ``ntl_fill_count``: Number of fill-value pixels (``-999.9``).
+        - ``ntl_invalid_count``: Number of non-fill pixels with poor quality.
     """
-    logger.info("=== Phase 2: VIIRS A2 daily aggregation ===")
+    logger.info("=== Phase 2: VIIRS %s daily aggregation ===", product.upper())
     t0 = time.time()
 
     if _stage_done(out_dir) and not force:
@@ -256,7 +259,7 @@ def aggregate_viirs(
         },
         "stage_elapsed_seconds": round(time.time() - t0, 1),
     }
-    metrics = _compute_quality_metrics(out_parquet, "viirs_a2_daily", 2, extra)
+    metrics = _compute_quality_metrics(out_parquet, f"viirs_{product}_daily", 2, extra)
     _write_quality_json(metrics, out_dir)
 
 
@@ -271,12 +274,21 @@ def combine_cbs(
     out_dir: str,
     force: bool = False,
 ) -> None:
-    """Combine CBS energy (monthly) and CBS GDP (monthly, from quarterly) into one table.
+    """Combine all CBS monthly tables into one wide table.
 
-    Both sources are at monthly resolution: CBS energy prices are natively
-    monthly, and CBS GDP indicators have been forward-filled from quarterly
-    to monthly in Phase 1.  The join on ``(year, month)`` produces a clean
-    combined table with no orphaned rows.
+    Outer-joins three Phase 1 CBS sources on ``(year, month)``:
+
+    * **cbs_energy** — tariff components (transport, supply, taxes).
+      Coverage: 2018–2026.
+    * **cbs_gdp** — quarterly national accounts forward-filled to monthly.
+      Coverage: 1996–2025.
+    * **cbs_cpi** — Consumer Price Index for energy (electricity + gas).
+      Coverage: 1996–2025.
+
+    An outer join preserves all months present in any source, so the result
+    spans 1996–2026 with source-appropriate nulls outside each source's
+    coverage window.  All three sources are small (~400 rows each), so
+    broadcast joins are used throughout.
     """
     logger.info("=== Phase 2: CBS combination ===")
     t0 = time.time()
@@ -288,39 +300,28 @@ def combine_cbs(
     if force:
         _clear_output(out_dir)
 
-    energy_path = os.path.join(p1_dir, "cbs_energy", "data")
-    gdp_path = os.path.join(p1_dir, "cbs_gdp", "data")
+    # Ordered list of (label, path) — each is outer-joined if present.
+    sources = [
+        ("CBS Energy",       os.path.join(p1_dir, "cbs_energy", "data")),
+        ("CBS GDP",          os.path.join(p1_dir, "cbs_gdp",    "data")),
+        ("CBS CPI",          os.path.join(p1_dir, "cbs_cpi",    "data")),
+    ]
 
-    has_energy = os.path.exists(energy_path)
-    has_gdp = os.path.exists(gdp_path)
+    frames = []
+    for label, path in sources:
+        if os.path.exists(path):
+            frames.append(spark.read.parquet(path))
+            logger.info("%s loaded from %s.", label, path)
+        else:
+            logger.warning("%s Phase 1 not found at %s — skipping.", label, path)
 
-    if not has_energy and not has_gdp:
+    if not frames:
         logger.warning("No CBS Phase 1 data found — skipping.")
         return
 
-    energy_df = None
-    gdp_df = None
-
-    if has_energy:
-        energy_df = spark.read.parquet(energy_path)
-        logger.info("CBS Energy loaded from %s.", energy_path)
-    else:
-        logger.warning("CBS Energy Phase 1 not found.")
-
-    if has_gdp:
-        gdp_df = spark.read.parquet(gdp_path)
-        logger.info("CBS GDP loaded from %s.", gdp_path)
-    else:
-        logger.warning("CBS GDP Phase 1 not found.")
-
-    if energy_df is not None and gdp_df is not None:
-        combined = energy_df.join(
-            F.broadcast(gdp_df), on=["year", "month"], how="outer"
-        )
-    elif energy_df is not None:
-        combined = energy_df
-    else:
-        combined = gdp_df
+    combined = frames[0]
+    for df in frames[1:]:
+        combined = combined.join(F.broadcast(df), on=["year", "month"], how="outer")
 
     combined = combined.orderBy("year", "month")
 
@@ -502,6 +503,14 @@ def main() -> None:
             p1_dir=os.path.join(p1_dir, "viirs_a2"),
             out_dir=os.path.join(p2_dir, "viirs_a2_daily"),
             force=args.force,
+            product="a2",
+        )
+        aggregate_viirs(
+            spark,
+            p1_dir=os.path.join(p1_dir, "viirs_a1"),
+            out_dir=os.path.join(p2_dir, "viirs_a1_daily"),
+            force=args.force,
+            product="a1",
         )
         combine_cbs(
             spark,

@@ -44,19 +44,22 @@ logger = logging.getLogger("phase1_extract")
 # Constants
 # ---------------------------------------------------------------------------
 
-# VNP46A2 HDF5 structure (Collection 2, v002). All files in the input
-# directory are assumed to be from the same MODIS/VIIRS sinusoidal tile
-# (h18v03, which covers Western Europe including the Netherlands), so
-# lat/lon grids are identical across files and the NL crop indices can be
-# computed once and reused.
+# Both VNP46A1 and VNP46A2 (Collection 2, v002) share the same HDF5 group
+# and lat/lon structure for the h18v03 sinusoidal tile.
 _VIIRS_GROUP = "HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields"
-_VIIRS_NTL_DATASET = "Gap_Filled_DNB_BRDF-Corrected_NTL"
-_VIIRS_QF_DATASET = "Mandatory_Quality_Flag"
 _VIIRS_LAT_DATASET = "lat"
 _VIIRS_LON_DATASET = "lon"
 
-# Fill value for Gap_Filled_DNB_BRDF-Corrected_NTL (float32)
+# Fill value for both products' NTL datasets (float32)
 _VIIRS_FILL_VALUE = -999.9
+
+# VNP46A2-specific dataset names
+_A2_NTL_DATASET = "Gap_Filled_DNB_BRDF-Corrected_NTL"
+_A2_QF_DATASET = "Mandatory_Quality_Flag"   # uint8: 0=best, 1=good, 2+=degraded
+
+# VNP46A1-specific dataset names
+_A1_NTL_DATASET = "DNB_At_Sensor_Radiance"
+_A1_QF_DATASET = "QF_DNB"   # uint16 bitmask; bits 0-1 encode quality tier
 
 # Netherlands bounding box (WGS84)
 _NL_LAT_MIN = 50.75
@@ -224,13 +227,20 @@ def _viirs_output_path(out_dir: str, obs_date: date) -> str:
 
 
 def _process_one_viirs_file(filepath: str) -> dict:
-    """Process a single VNP46A2 HDF5 file → write a Parquet partition file.
+    """Process a single VNP46A1 or VNP46A2 HDF5 file → write a Parquet partition.
 
     Runs in a child process. Reads the HDF5 file, crops to the NL bounding
     box, builds a pandas DataFrame using vectorised numpy, and writes a
     single Parquet file directly (no Spark/JVM involved). Idempotent:
     skips files whose output already exists unless the cache is marked
     ``force=True``.
+
+    Quality flag handling:
+    - A2: ``Mandatory_Quality_Flag`` is uint8; stored as-is.
+    - A1: ``QF_DNB`` is uint16 bitmask; bits 0-1 encode the quality tier
+      (0=best, 1=low, 2=poor, 3=no retrieval) and are extracted into a uint8.
+      This makes the output schema identical for both products, and the
+      Phase 2 ``quality_flag <= 1`` filter applies correctly to both.
     """
     lat_idx = _NL_CACHE["lat_idx"]
     lon_idx = _NL_CACHE["lon_idx"]
@@ -238,6 +248,9 @@ def _process_one_viirs_file(filepath: str) -> dict:
     lon_vals = _NL_CACHE["lon_vals"]
     out_dir = _NL_CACHE["out_dir"]
     force = _NL_CACHE.get("force", False)
+    ntl_dataset = _NL_CACHE["ntl_dataset"]
+    qf_dataset = _NL_CACHE["qf_dataset"]
+    qf_is_bitmask = _NL_CACHE.get("qf_is_bitmask", False)
 
     obs_date = _parse_viirs_date(filepath)
     if obs_date is None:
@@ -260,8 +273,8 @@ def _process_one_viirs_file(filepath: str) -> dict:
             grp = hf[_VIIRS_GROUP]
             r_start, r_end = int(lat_idx[0]), int(lat_idx[-1]) + 1
             c_start, c_end = int(lon_idx[0]), int(lon_idx[-1]) + 1
-            ntl_crop = grp[_VIIRS_NTL_DATASET][r_start:r_end, c_start:c_end]
-            qf_crop = grp[_VIIRS_QF_DATASET][r_start:r_end, c_start:c_end]
+            ntl_crop = grp[ntl_dataset][r_start:r_end, c_start:c_end]
+            qf_crop = grp[qf_dataset][r_start:r_end, c_start:c_end]
     except Exception as exc:
         return {"file": filepath, "status": "error", "reason": str(exc)}
 
@@ -276,6 +289,13 @@ def _process_one_viirs_file(filepath: str) -> dict:
     radiance = ntl_flat.copy()
     radiance[is_fill] = np.nan
 
+    # For A1, extract bits 0-1 of the uint16 QF_DNB bitmask so the output
+    # quality_flag column is uint8 with the same semantics as A2.
+    if qf_is_bitmask:
+        quality_flag_flat = (qf_crop.ravel() & np.uint16(0x03)).astype(np.uint8)
+    else:
+        quality_flag_flat = qf_crop.ravel().astype(np.uint8)
+
     df = pd.DataFrame({
         "date": np.datetime64(obs_date),
         "row_idx": ri_grid.ravel().astype(np.int32),
@@ -283,7 +303,7 @@ def _process_one_viirs_file(filepath: str) -> dict:
         "lat": lat_grid.ravel().astype(np.float32),
         "lon": lon_grid.ravel().astype(np.float32),
         "ntl_radiance": radiance,
-        "quality_flag": qf_crop.ravel().astype(np.uint8),
+        "quality_flag": quality_flag_flat,
         "is_fill": is_fill,
     })
 
@@ -309,13 +329,17 @@ def _process_one_viirs_file(filepath: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1A: VIIRS A2
+# Phase 1A: VIIRS A1 / A2
 # ---------------------------------------------------------------------------
 
 
 def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
-                   force: bool = False) -> None:
+                  force: bool = False, product: str = "a2") -> None:
     """Extract VIIRS HDF5 files to NL-masked pixel-level Parquet.
+
+    Supports both VNP46A1 (``product="a1"``) and VNP46A2 (``product="a2"``).
+    The two products share the same HDF5 group and lat/lon structure, but
+    differ in their NTL and quality-flag dataset names.
 
     Uses ``multiprocessing`` for true process-level parallelism, bypassing
     PySpark's JVM serialisation overhead. Each worker reads one HDF5 file,
@@ -326,7 +350,19 @@ def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
     each file is fully independent (embarrassingly parallel). Already-
     processed files are skipped automatically unless ``force=True``.
     """
-    logger.info("=== Phase 1: VIIRS A2 extraction ===")
+    product = product.lower()
+    if product == "a2":
+        ntl_dataset = _A2_NTL_DATASET
+        qf_dataset = _A2_QF_DATASET
+        qf_is_bitmask = False
+    elif product == "a1":
+        ntl_dataset = _A1_NTL_DATASET
+        qf_dataset = _A1_QF_DATASET
+        qf_is_bitmask = True
+    else:
+        raise ValueError(f"Unknown VIIRS product: {product!r}. Expected 'a1' or 'a2'.")
+
+    logger.info("=== Phase 1: VIIRS %s extraction ===", product.upper())
     h5_files = sorted(glob.glob(os.path.join(viirs_dir, "*.h5")))
     if not h5_files:
         logger.warning("No .h5 files found in %s — skipping.", viirs_dir)
@@ -355,6 +391,9 @@ def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
         "lon_vals": lon_vals,
         "out_dir": data_dir,
         "force": force,
+        "ntl_dataset": ntl_dataset,
+        "qf_dataset": qf_dataset,
+        "qf_is_bitmask": qf_is_bitmask,
     }
     # Populate the parent's cache too, for consistency under fork.
     _init_worker(cache)
@@ -405,9 +444,9 @@ def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
 
     elapsed = time.time() - t0
     logger.info(
-        "VIIRS A2: %d processed + %d cached + %d errors, "
+        "VIIRS %s: %d processed + %d cached + %d errors, "
         "%d new pixel rows, %.1f GB total in %.0fs (%.0f files/s).",
-        ok_count, cached_count, err_count, total_rows,
+        product.upper(), ok_count, cached_count, err_count, total_rows,
         total_bytes / 1e9, elapsed,
         (ok_count + cached_count) / elapsed if elapsed > 0 else 0,
     )
@@ -451,7 +490,7 @@ def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
         extra["columns_sample"] = col_metrics
 
     metrics = {
-        "source": "viirs_a2",
+        "source": f"viirs_{product}",
         "phase": 1,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "row_count": total_rows,
@@ -485,6 +524,12 @@ _CBS_TARIFF_NEW_COLS = [
 _ENGLISH_MONTHS = {m: i for i, m in enumerate(
     ["january", "february", "march", "april", "may", "june",
      "july", "august", "september", "october", "november", "december"],
+    start=1,
+)}
+
+_DUTCH_MONTHS = {m: i for i, m in enumerate(
+    ["januari", "februari", "maart", "april", "mei", "juni",
+     "juli", "augustus", "september", "oktober", "november", "december"],
     start=1,
 )}
 
@@ -890,7 +935,117 @@ def extract_cbs_gdp(cbs_dir: str, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1D: ENTSO-E Load
+# Phase 1D: CBS Consumer Price Index (CPI) — Energy
+# ---------------------------------------------------------------------------
+
+
+def _parse_cpi_period(raw: str) -> Optional[Tuple[int, int]]:
+    """Parse a Dutch CBS period string into ``(year, month)`` or ``None``.
+
+    Accepts monthly strings like ``"1996 januari"`` or ``"2025 december*"``.
+    Annual-only strings like ``"1996"`` return ``None`` and are dropped — the
+    CPI file includes one annual-average row per year which duplicates the
+    monthly data; we only need the monthly granularity.
+    """
+    s = str(raw).strip().rstrip("*").strip()
+    parts = s.split()
+    if len(parts) != 2:
+        return None
+    try:
+        year = int(parts[0])
+    except ValueError:
+        return None
+    month = _DUTCH_MONTHS.get(parts[1].lower())
+    return (year, month) if month else None
+
+
+def extract_cbs_cpi(cbs_dir: str, out_dir: str) -> None:
+    """Extract CBS Consumer Price Index (CPI) for energy into monthly Parquet.
+
+    Reads the CBS ``Consumentenprijzen; prijsindex 2015=100`` file, which
+    contains three monthly CPI series for the Netherlands:
+
+    * **Energy (045000)** — overall energy basket (electricity + gas,
+      weighted by household spending shares).
+    * **Electricity (045100)** — electricity component.
+    * **Gas (045200)** — gas component.
+
+    All three are dimensionless index values normalised to 2015 = 100.
+    A value of 162 in 2024 therefore means energy cost 62 % more in 2024
+    than it did in 2015.
+
+    The file uses Dutch month names and comma decimal separators.  Annual
+    summary rows (one per year) are filtered out; only the 12 monthly rows
+    per year are retained.
+
+    Coverage: January 1996 – December 2025 (~360 monthly rows).  This
+    extends the energy price signal back to 1996, filling the 2012–2017
+    gap left by the tariff files which only start in 2018.
+    """
+    logger.info("=== Phase 1: CBS Consumer Price Index extraction ===")
+
+    cpi_matches = glob.glob(
+        os.path.join(cbs_dir, "Consumentenprijzen__prijsindex_2015_100__*")
+    )
+    if not cpi_matches:
+        logger.warning("No CBS CPI file found in %s — skipping.", cbs_dir)
+        return
+
+    path = cpi_matches[0]
+    logger.info("Reading CBS CPI: %s", path)
+
+    # 6-line header: title · 2 blank · sub-header · category names · units
+    # Column order after skipping: period_raw | energy | electricity | gas
+    df = pd.read_csv(
+        path, sep=";", skiprows=6, header=None,
+        names=["period_raw", "cbs_cpi_energy", "cbs_cpi_electricity", "cbs_cpi_gas"],
+        encoding="utf-8-sig", skipfooter=1, engine="python", dtype=str,
+    )
+
+    df["period_raw"] = df["period_raw"].str.strip()
+    parsed = df["period_raw"].apply(_parse_cpi_period)
+    df["year"] = parsed.apply(lambda x: x[0] if x else None)
+    df["month"] = parsed.apply(lambda x: x[1] if x else None)
+
+    # Keep only monthly rows (annual summaries have month=None)
+    df = df.dropna(subset=["year", "month"]).copy()
+    df["year"] = df["year"].astype(int)
+    df["month"] = df["month"].astype(int)
+
+    # CBS uses Dutch decimal comma ("42,06" → 42.06)
+    for col in ["cbs_cpi_energy", "cbs_cpi_electricity", "cbs_cpi_gas"]:
+        df[col] = (
+            df[col].str.strip()
+                   .str.replace(",", ".", regex=False)
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    result = (
+        df[["year", "month", "cbs_cpi_energy", "cbs_cpi_electricity", "cbs_cpi_gas"]]
+        .sort_values(["year", "month"])
+        .reset_index(drop=True)
+    )
+
+    logger.info(
+        "CBS CPI: %d monthly rows, years %d–%d.",
+        len(result), int(result["year"].min()), int(result["year"].max()),
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+    parquet_path = os.path.join(out_dir, "data")
+    os.makedirs(parquet_path, exist_ok=True)
+    result.to_parquet(
+        os.path.join(parquet_path, "cbs_cpi.parquet"),
+        index=False, engine="pyarrow",
+    )
+    logger.info("CBS CPI written → %s", parquet_path)
+
+    metrics = _compute_parquet_quality(parquet_path, "cbs_cpi", 1)
+    _write_quality_json(metrics, out_dir)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1E: ENTSO-E Load
 # ---------------------------------------------------------------------------
 
 
@@ -1130,6 +1285,14 @@ def main() -> None:
         os.path.join(p1_dir, "viirs_a2"),
         workers=workers,
         force=args.force,
+        product="a2",
+    )
+    extract_viirs(
+        os.path.join(data_root, "viirs", "A1"),
+        os.path.join(p1_dir, "viirs_a1"),
+        workers=workers,
+        force=args.force,
+        product="a1",
     )
     extract_cbs_energy(
         os.path.join(data_root, "cbs"),
@@ -1138,6 +1301,10 @@ def main() -> None:
     extract_cbs_gdp(
         os.path.join(data_root, "cbs"),
         os.path.join(p1_dir, "cbs_gdp"),
+    )
+    extract_cbs_cpi(
+        os.path.join(data_root, "cbs"),
+        os.path.join(p1_dir, "cbs_cpi"),
     )
     extract_entsoe(
         os.path.join(data_root, "entso-e"),

@@ -1,6 +1,6 @@
 # Energy Demand Forecast — Netherlands
 
-A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests VIIRS satellite nighttime-lights imagery, CBS consumer energy tariffs and quarterly economic statistics, and ENTSO-E electricity load data, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
+A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests both VIIRS VNP46A1 (at-sensor raw radiance) and VNP46A2 (gap-filled BRDF-corrected NTL) satellite nighttime-lights imagery, CBS consumer energy tariffs and quarterly economic statistics, and ENTSO-E electricity load data, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
 
 ---
 
@@ -93,10 +93,10 @@ Downloads VIIRS Black Marble satellite imagery from NASA's [LAADS DAAC](https://
 ```bash
 source .env
 
-# Download A2 (gap-filled BRDF-corrected NTL) — used in the processing pipeline
+# Download A2 (gap-filled BRDF-corrected NTL)
 python3 -u download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 -s 2012-01-01
 
-# Download A1 (raw at-sensor radiance) — supplementary
+# Download A1 (at-sensor raw radiance)
 python3 -u download_nl_viirs.py -p A1 -d /projects/prjs2061/data/viirs/A1 -s 2012-01-01
 
 # Download only specific days (re-download corrupt files, etc.)
@@ -158,6 +158,7 @@ The CBS and ENTSO-E source files are downloaded manually from their respective p
 |---|---|---|---|
 | **CBS Consumer Tariffs (old)** | `data/cbs/Average_energy_prices_for_consumers__2018*.csv` | Semicolon CSV, 6-line header | Old schema 2018–2023 |
 | **CBS Consumer Tariffs (new)** | `data/cbs/Average_energy_prices_for_consumers_2*.csv` | Semicolon CSV, 6-line header | New schema 2021+ |
+| **CBS Consumer Price Index** | `data/cbs/Consumentenprijzen__prijsindex_2015_100__*.csv` | Semicolon CSV, Dutch, 6-line header | CPI 2015=100 for energy/electricity/gas, monthly 1996–2025 |
 | **CBS GDP Quarterly** | `data/cbs/GDP__output_and_expenditures__changes__*.csv` | Semicolon CSV, 4-line header | Wide-format: 18 indicators × 2 metrics, quarterly 1995–2025 |
 | **CBS Population** | `data/cbs/Population (x million).csv` | Semicolon CSV | Annual population in millions |
 | **ENTSO-E Load** | `data/entso-e/*.xlsx` | Excel workbooks | Wide format (2006–2015) + long format (2015+) |
@@ -172,7 +173,8 @@ The pipeline is organized in three sequential phases. Each phase reads from the 
 
 ```
 data/viirs/A2/*.h5 ──┐
-data/cbs/*.csv ──────┤──▶ Phase 1 ──▶ data/processing_1/ ──▶ Phase 2 ──▶ data/processing_2/ ──▶ Phase 3 ──▶ data/processed/
+data/viirs/A1/*.h5 ──┤
+data/cbs/*.csv ──────┼──▶ Phase 1 ──▶ data/processing_1/ ──▶ Phase 2 ──▶ data/processing_2/ ──▶ Phase 3 ──▶ data/processed/
 data/entso-e/*.xlsx ─┘    (Extract)     (source-level           (Aggregate)    (aggregated/            (Merge)     nl_hourly_dataset.parquet
                                          Parquet)                               combined Parquet)
 ```
@@ -183,18 +185,25 @@ data/entso-e/*.xlsx ─┘    (Extract)     (source-level           (Aggregate) 
 
 **Script:** `phase1_extract.py`
 
-Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **four sub-stages** sequentially:
+Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **six sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + ENTSO-E):
 
-#### 1A: VIIRS A2 Extraction
+#### 1A: VIIRS A2 and A1 Extraction
 
-Reads VNP46A2 HDF5 files, crops to the Netherlands bounding box (`50.75°N–53.55°N`, `3.35°E–7.25°E`), and writes one Parquet file per day.
+The same `extract_viirs()` function (parameterised by `product`) processes both VNP46A2 and VNP46A1 HDF5 files. Both products share the same HDF5 group structure, NL bounding-box crop (`50.75°N–53.55°N`, `3.35°E–7.25°E`), and fill value (−999.9). The key differences:
+
+| Aspect | VNP46A2 | VNP46A1 |
+|---|---|---|
+| NTL dataset | `Gap_Filled_DNB_BRDF-Corrected_NTL` | `DNB_At_Sensor_Radiance` |
+| Quality flag | `Mandatory_Quality_Flag` (uint8) | `QF_DNB` bits 0-1 extracted → uint8 |
+| Output dir | `processing_1/viirs_a2/` | `processing_1/viirs_a1/` |
 
 - **Parallelism**: `multiprocessing.ProcessPoolExecutor` — each worker processes one HDF5 file independently. On a 96-core node this achieves near-linear speedup.
 - **Spatial masking**: Computes NL row/col indices once from the h18v03 sinusoidal grid, then reuses for all files (the grid is identical across the tile).
 - **Caching**: Existing Parquet outputs are skipped (unless `--force`); partial writes are prevented via atomic `tmp → rename`.
 - **Retry**: HDF5 opens retry up to 3 times with exponential backoff for transient GPFS errors.
 
-**Output schema** — `data/processing_1/viirs_a2/data/year=YYYY/day_YYYYDDD.parquet`:
+**Output schema** — identical for both products (`viirs_a2` and `viirs_a1`):
+- Path: `data/processing_1/viirs_a2/data/year=YYYY/day_YYYYDDD.parquet` (and `viirs_a1/`)
 
 | Column | Type | Description |
 |---|---|---|
@@ -203,8 +212,8 @@ Reads VNP46A2 HDF5 files, crops to the Netherlands bounding box (`50.75°N–53.
 | `col_idx` | `int32` | VIIRS grid column index |
 | `lat` | `float32` | Latitude (WGS84) |
 | `lon` | `float32` | Longitude (WGS84) |
-| `ntl_radiance` | `float32` | Gap-filled BRDF-corrected NTL (nW/cm²/sr); `NaN` for fill pixels |
-| `quality_flag` | `uint8` | VNP46A2 mandatory quality flag (0 = best, 1 = good, 2+ = degraded) |
+| `ntl_radiance` | `float32` | NTL radiance (nW/cm²/sr); `NaN` for fill pixels |
+| `quality_flag` | `uint8` | 0 = best, 1 = good, 2+ = degraded/no retrieval |
 | `is_fill` | `bool` | `True` if the pixel was a fill value (`-999.9`) in the source |
 
 #### 1B: CBS Consumer Energy Tariffs (Harmonized)
@@ -275,7 +284,27 @@ Reads the wide-format CBS quarterly GDP CSV (18 economic indicators × 2 metric 
 | `cbs_final_exp_total_yy` / `_qq` | `float64` | Total final expenditure, y/y and q/q (%) |
 | `cbs_population_million` | `float64` | Population (millions), annual forward-filled |
 
-#### 1D: ENTSO-E Load Extraction
+#### 1D: CBS Consumer Price Index (CPI) — Energy
+
+Reads the CBS CPI file (`Consumentenprijzen; prijsindex 2015=100`) and extracts three monthly energy price-index series.
+
+**What a CPI value means.** The index is anchored to 2015 = 100. A value of 162 in a given month means the energy basket costs 62 % more than it did in 2015. This makes the series directly comparable across all years without any unit-conversion, unlike the absolute tariff prices (Euro/kWh, Euro/m³) which cannot be compared across years without accounting for inflation.
+
+**How it complements the tariff files.** The tariff files (Phase 1B) cover 2018–2026 and give a detailed component breakdown (transport, supply, taxes). The CPI covers 1996–2025 and gives a single aggregate index per energy type. The two are complementary: the CPI provides the long-horizon price trend while the tariff files provide the structural decomposition. Critically, the CPI fills the 2012–2017 period where the tariff columns are null in the final dataset.
+
+**Parsing notes.** The file uses Dutch month names and comma decimal separators. Annual summary rows (one per calendar year) are dropped; only the 12 monthly rows per year are kept.
+
+**Output schema** — `data/processing_1/cbs_cpi/data/cbs_cpi.parquet` (360 monthly rows × 5 columns):
+
+| Column | Type | Description |
+|---|---|---|
+| `year` | `int64` | Year (1996–2025) |
+| `month` | `int64` | Month (1–12) |
+| `cbs_cpi_energy` | `float64` | Overall energy basket CPI (2015 = 100) |
+| `cbs_cpi_electricity` | `float64` | Electricity CPI (2015 = 100) |
+| `cbs_cpi_gas` | `float64` | Gas CPI (2015 = 100) |
+
+#### 1E: ENTSO-E Load Extraction
 
 Reads ENTSO-E Excel workbooks (both legacy wide format and modern long format), filters to Netherlands (`NL`), deduplicates to hourly resolution, and writes year-partitioned Parquet.
 
@@ -309,13 +338,15 @@ Each sub-stage writes a `data_quality.json` alongside its output (e.g. `data/pro
 
 **Script:** `phase2_aggregate.py`
 
-Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs three sub-stages:
+Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **four sub-stages** (A2 aggregation, A1 aggregation, CBS combination of three sources, ENTSO-E pass-through):
 
-#### 2A: VIIRS A2 Daily Aggregation
+#### 2A: VIIRS A2 and A1 Daily Aggregation
 
-Reads the NL pixel-level Parquet (~630K pixels/day × ~5000 days) and aggregates to **one row per day** with spatial summary statistics. Uses column pruning (only reads 4 of 8 columns) to halve I/O.
+The same `aggregate_viirs()` function (parameterised by `product`) is run for both VNP46A2 and VNP46A1. Reads the NL pixel-level Parquet (~630K pixels/day × ~5000 days) and aggregates to **one row per day** with spatial summary statistics. Uses column pruning (only reads 4 of 8 columns) to halve I/O.
 
-**Output schema** — `data/processing_2/viirs_a2_daily/data/year=YYYY/part-*.parquet`:
+**Output schema** — identical for both products:
+- `data/processing_2/viirs_a2_daily/data/year=YYYY/part-*.parquet`
+- `data/processing_2/viirs_a1_daily/data/year=YYYY/part-*.parquet`
 
 | Column | Type | Description |
 |---|---|---|
@@ -328,15 +359,15 @@ Reads the NL pixel-level Parquet (~630K pixels/day × ~5000 days) and aggregates
 
 #### 2B: CBS Combined
 
-Outer-joins CBS energy tariffs (monthly, 2018–2026) and CBS GDP indicators (monthly, 1996–2025) into a single monthly-resolution table on `(year, month)`. Both sources are monthly-resolution thanks to forward-filling in Phase 1, producing a clean join with ~400 rows and ~50 `cbs_*` columns.
+Outer-joins all three CBS monthly sources on `(year, month)` via a broadcast-join loop. The result spans 1996–2026 with source-appropriate nulls outside each source's coverage window.
 
 **Output schema** — `data/processing_2/cbs_combined/data/part-*.parquet`:
 
-All columns from both CBS energy and CBS GDP are carried through. The combined table includes:
-- The 13 `cbs_gas_*` / `cbs_elec_*` tariff columns (non-null for 2018–2026)
-- The 35 `cbs_*_yy` / `cbs_*_qq` GDP indicator columns (non-null for 1996–2025)
-- `cbs_population_million` (non-null for years with CBS population data)
-- `year`, `month` as the join keys
+| Source | Columns included | Non-null coverage |
+|---|---|---|
+| CBS Energy | 13 `cbs_gas_*` / `cbs_elec_*` tariff columns | 2018–2026 |
+| CBS GDP | 35 `cbs_*_yy` / `cbs_*_qq` indicator columns + `cbs_population_million` | 1996–2025 |
+| CBS CPI | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` | 1996–2025 |
 
 #### 2C: ENTSO-E Pass-through
 
@@ -373,29 +404,31 @@ Joins all Phase 2 outputs onto a **contiguous hourly UTC timestamp spine** (2012
 
 **Join strategy:**
 
-| Source | Join Key | Join Type |
-|---|---|---|
-| ENTSO-E (hourly) | `timestamp` | Broadcast left-join |
-| VIIRS A2 (daily) | `date` | Broadcast left-join |
-| CBS Combined (monthly) | `(year, month)` | Broadcast left-join |
+| Source | Join Key | Output Columns | Join Type |
+|---|---|---|---|
+| ENTSO-E (hourly) | `timestamp` | `entsoe_load_mw` | Broadcast left-join |
+| VIIRS A2 (daily) | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Broadcast left-join |
+| VIIRS A1 (daily) | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Broadcast left-join |
+| CBS Combined (monthly) | `(year, month)` | All `cbs_*` columns | Broadcast left-join |
 
 All source tables are small enough to be broadcast; no shuffles occur.
 
 **Final output** — `data/processed/nl_hourly_dataset.parquet/year=YYYY/part-*.parquet`:
 
-The final dataset contains ~60 columns. Column ordering is deterministic:
+The final dataset contains ~73 columns. Column ordering is deterministic:
 
 1. `timestamp` — hourly UTC timestamp (primary key)
 2. `entsoe_load_mw` — **target variable** (electricity load in MW)
-3. VIIRS satellite aggregates (5 columns: `ntl_mean`, `ntl_sum`, `ntl_valid_count`, `ntl_fill_count`, `ntl_invalid_count`)
-4. CBS gas tariff columns (5 columns: transport rate, fixed supply rate, ODE tax, energy tax, total tax)
-5. CBS electricity tariff columns (8 columns: transport rate, fixed supply rate, dynamic rates, ODE tax, energy tax, total tax, tax refund)
-6. CBS GDP headline indicators (`cbs_gdp_yy`, `cbs_gdp_qq`, `cbs_gdp_wda_yy`, `cbs_gdp_wda_qq`)
-7. CBS population (`cbs_population_million`)
-8. All remaining `cbs_*` columns (auto-appended in sorted order — forward-compatible with new indicators)
-9. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
+3. VIIRS A2 satellite aggregates (5 columns: `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count`)
+4. VIIRS A1 satellite aggregates (5 columns: `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count`)
+5. CBS gas tariff columns (5 columns: transport rate, fixed supply rate, ODE tax, energy tax, total tax)
+6. CBS electricity tariff columns (8 columns: transport rate, fixed supply rate, dynamic rates, ODE tax, energy tax, total tax, tax refund)
+7. CBS GDP headline indicators (`cbs_gdp_yy`, `cbs_gdp_qq`, `cbs_gdp_wda_yy`, `cbs_gdp_wda_qq`)
+8. CBS population (`cbs_population_million`)
+9. All remaining `cbs_*` columns in sorted order — includes `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` and any future indicators (forward-compatible)
+10. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
 
-**Coverage tracking**: Phase 3 logs separate coverage metrics for CBS tariffs (tracked via `cbs_gas_total_tax`) and CBS GDP (tracked via `cbs_gdp_yy`), alongside ENTSO-E and VIIRS coverage, and writes them to `data_quality.json`.
+**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, and CBS GDP, and writes them all to `data_quality.json`.
 
 #### CLI Options
 
@@ -512,12 +545,15 @@ Every processing stage writes a `data_quality.json` alongside its Parquet output
 ```bash
 # Phase 1 quality reports
 cat /projects/prjs2061/data/processing_1/viirs_a2/data_quality.json
+cat /projects/prjs2061/data/processing_1/viirs_a1/data_quality.json
 cat /projects/prjs2061/data/processing_1/cbs_energy/data_quality.json
 cat /projects/prjs2061/data/processing_1/cbs_gdp/data_quality.json
+cat /projects/prjs2061/data/processing_1/cbs_cpi/data_quality.json
 cat /projects/prjs2061/data/processing_1/entsoe/data_quality.json
 
 # Phase 2 quality reports
 cat /projects/prjs2061/data/processing_2/viirs_a2_daily/data_quality.json
+cat /projects/prjs2061/data/processing_2/viirs_a1_daily/data_quality.json
 cat /projects/prjs2061/data/processing_2/cbs_combined/data_quality.json
 cat /projects/prjs2061/data/processing_2/entsoe/data_quality.json
 
@@ -570,13 +606,16 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 ├── knmi/                                 # KNMI meteorological data
 │
 ├── processing_1/                         # Phase 1 output
-│   ├── viirs_a2/data/year=YYYY/          # Per-day pixel Parquet (+ data_quality.json)
+│   ├── viirs_a2/data/year=YYYY/          # Per-day VNP46A2 pixel Parquet (+ data_quality.json)
+│   ├── viirs_a1/data/year=YYYY/          # Per-day VNP46A1 pixel Parquet (+ data_quality.json)
 │   ├── cbs_energy/data/                  # Monthly consumer tariffs (harmonized)
 │   ├── cbs_gdp/data/                     # Monthly GDP/economic indicators + population
+│   ├── cbs_cpi/data/                     # Monthly energy CPI (2015=100)
 │   └── entsoe/data/year=YYYY/            # Hourly NL load
 │
 ├── processing_2/                         # Phase 2 output
-│   ├── viirs_a2_daily/data/year=YYYY/    # Daily VIIRS aggregates
+│   ├── viirs_a2_daily/data/year=YYYY/    # Daily VNP46A2 aggregates
+│   ├── viirs_a1_daily/data/year=YYYY/    # Daily VNP46A1 aggregates
 │   ├── cbs_combined/data/                # Merged CBS (tariffs + GDP, ~50 columns)
 │   └── entsoe/data/year=YYYY/            # Re-partitioned ENTSO-E
 │

@@ -6,38 +6,46 @@
 flowchart TD
     subgraph RAW["🗂️ RAW DATA SOURCES"]
         direction LR
-        V_RAW["🛰️ VIIRS VNP46A2\n5,080 HDF5 files\n2400×2400 px each\n~500m resolution"]
+        VA2_RAW["🛰️ VIIRS VNP46A2\n~5,080 HDF5 files\n2400×2400 px each\nGap-filled BRDF-corrected NTL"]
+        VA1_RAW["🛰️ VIIRS VNP46A1\n~5,080 HDF5 files\n2400×2400 px each\nAt-sensor raw radiance"]
         C1_RAW["📊 CBS Energy Tariffs\n2 semicolon CSVs\nOld schema 2018–2023\nNew schema 2021–2026"]
+        C3_RAW["📈 CBS Energy CPI\nConsumer Price Index\n2015=100 base year\n1996–2025"]
         C2_RAW["🏛️ CBS GDP/Pop\nQuarterly CSV + Pop CSV\n18 indicators × 2 metrics\n1995–2025"]
         E_RAW["⚡ ENTSO-E\n8 XLSX files\nHourly load\n2006–2024"]
     end
 
     subgraph P1["PHASE 1 — EXTRACTION  ·  phase1_extract.py"]
         direction TB
-        V1["🔬 VIIRS Processor\n· Read HDF5 via h5py + multiprocessing\n· Crop to NL bbox: 672×937 pixels\n· Preserve fill pixels with is_fill flag\n· 1 row per pixel per day"]
+        VA2_1["🔬 VIIRS A2 Processor\n· Gap_Filled_DNB_BRDF-Corrected_NTL\n· Mandatory_Quality_Flag (uint8)\n· Crop to NL bbox: 672×937 pixels\n· 1 row per pixel per day"]
+        VA1_1["🔬 VIIRS A1 Processor\n· DNB_At_Sensor_Radiance\n· QF_DNB bits 0-1 → uint8 quality\n· Crop to NL bbox: 672×937 pixels\n· 1 row per pixel per day"]
         C1_1["📋 CBS Tariff Harmonizer\n· Read old schema (2018–2023)\n· Read new schema (2021+)\n· Splice at 2020/2021 boundary\n· ODE + energy tax → total_tax\n· Drop non-comparable variable rates"]
+        C3_1["📋 CBS CPI Parser\n· Parse Dutch month names\n· Drop annual summary rows\n· Convert comma decimals\n· 3 index series (energy/elec/gas)"]
         C2_1["📋 CBS GDP Parser\n· Read quarterly wide-format CSV\n· 18 indicators × 2 metrics (y/y, q/q)\n· Forward-fill quarterly → monthly\n· Population merged from annual CSV"]
         E1["📋 ENTSO-E Parser\n· Detect wide vs long schema\n· Filter CountryCode = NL\n· Normalize CET/CEST → UTC\n· Deduplicate overlaps"]
     end
 
     subgraph P1_OUT["processing_1/ outputs"]
         direction LR
-        V1_O["viirs_a2/\n~3.2B rows\n📁 by year"]
+        VA2_1_O["viirs_a2/\n~3.2B rows\n📁 by year"]
+        VA1_1_O["viirs_a1/\n~3.2B rows\n📁 by year"]
         C1_O["cbs_energy/\n99 rows\n13 tariff columns"]
+        C3_O["cbs_cpi/\n360 rows\n3 index columns"]
         C2_O["cbs_gdp/\n360 rows\n36 indicator columns"]
         E1_O["entsoe/\n~150K rows\n📁 by year"]
     end
 
     subgraph P2["PHASE 2 — AGGREGATION  ·  phase2_aggregate.py"]
         direction TB
-        V2["📐 VIIRS Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count\n· Pixel consistency check"]
-        C2_2["🔗 CBS Combiner\n· Outer-join energy + GDP\n· on (year, month)\n· Both sources monthly\n· Year gap detection"]
+        VA2_2["📐 VIIRS A2 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
+        VA1_2["📐 VIIRS A1 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
+        C2_2["🔗 CBS Combiner\n· Outer-join energy + GDP + CPI\n· on (year, month)\n· All sources monthly\n· Year gap detection"]
         E2["✅ ENTSO-E Validator\n· Re-partition by year\n· Per-year hour coverage\n· Load statistics"]
     end
 
     subgraph P2_OUT["processing_2/ outputs"]
         direction LR
-        V2_O["viirs_a2_daily/\n~5,080 rows\n📁 by year"]
+        VA2_2_O["viirs_a2_daily/\n~5,080 rows\n📁 by year"]
+        VA1_2_O["viirs_a1_daily/\n~5,080 rows\n📁 by year"]
         C2_O2["cbs_combined/\n~400 rows\n~50 columns"]
         E2_O["entsoe/\n~150K rows\n📁 by year"]
     end
@@ -45,34 +53,42 @@ flowchart TD
     subgraph P3["PHASE 3 — MERGE  ·  phase3_merge.py"]
         direction TB
         SPINE["🕐 Hourly UTC Spine\n2012-01-01 → today\n~126,000 rows\n+ 9 temporal features"]
-        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS on date (broadcast)\n3. CBS on year,month (broadcast)"]
+        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A1 on date → ntl_a1_*\n4. CBS on year,month (broadcast)"]
     end
 
     subgraph FINAL["📦 FINAL OUTPUT"]
-        OUT["nl_hourly_dataset.parquet\n~60 columns · ~126K rows\nPartitioned by year"]
+        OUT["nl_hourly_dataset.parquet\n~70 columns · ~126K rows\nPartitioned by year"]
     end
 
-    V_RAW --> V1
+    VA2_RAW --> VA2_1
+    VA1_RAW --> VA1_1
     C1_RAW --> C1_1
+    C3_RAW --> C3_1
     C2_RAW --> C2_1
     E_RAW --> E1
 
-    V1 --> V1_O
+    VA2_1 --> VA2_1_O
+    VA1_1 --> VA1_1_O
     C1_1 --> C1_O
+    C3_1 --> C3_O
     C2_1 --> C2_O
     E1 --> E1_O
 
-    V1_O --> V2
+    VA2_1_O --> VA2_2
+    VA1_1_O --> VA1_2
     C1_O --> C2_2
+    C3_O --> C2_2
     C2_O --> C2_2
     E1_O --> E2
 
-    V2 --> V2_O
+    VA2_2 --> VA2_2_O
+    VA1_2 --> VA1_2_O
     C2_2 --> C2_O2
     E2 --> E2_O
 
     E2_O --> JOIN
-    V2_O --> JOIN
+    VA2_2_O --> JOIN
+    VA1_2_O --> JOIN
     C2_O2 --> JOIN
     SPINE --> JOIN
 
@@ -99,12 +115,24 @@ flowchart TD
 
 ---
 
-#### 1A. VIIRS VNP46A2 — Satellite Nighttime Light
+#### 1A. VIIRS VNP46A2 and VNP46A1 — Satellite Nighttime Light
 
 ```
-Input:  data/viirs/A2/*.h5  (5,080 files, ~70 GB total)
-Output: data/processing_1/viirs_a2/data/  (partitioned by year)
+Input A2:  data/viirs/A2/*.h5  (~5,080 files — gap-filled BRDF-corrected NTL)
+Output A2: data/processing_1/viirs_a2/data/  (partitioned by year)
+
+Input A1:  data/viirs/A1/*.h5  (~5,080 files — at-sensor raw radiance)
+Output A1: data/processing_1/viirs_a1/data/  (partitioned by year)
 ```
+
+Both products are extracted by the same `extract_viirs()` function with a `product` parameter. They share the same HDF5 group (`HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields`), lat/lon structure, fill value (−999.9), and NL bounding-box crop. The only differences are the NTL and quality-flag dataset names:
+
+| Aspect | VNP46A2 | VNP46A1 |
+|---|---|---|
+| NTL dataset | `Gap_Filled_DNB_BRDF-Corrected_NTL` | `DNB_At_Sensor_Radiance` |
+| QF dataset | `Mandatory_Quality_Flag` (uint8) | `QF_DNB` (uint16 bitmask) |
+| QF storage | Stored as-is | Bits 0-1 extracted → uint8 |
+| Fill value | −999.9 | −999.9 |
 
 ````carousel
 **Step 1 — NL Mask Computation**
@@ -119,15 +147,13 @@ These index arrays are computed **once** and broadcast to all workers.
 <!-- slide -->
 **Step 2 — Parallel HDF5 Reading**
 
-File paths are distributed across a `ProcessPoolExecutor` with ~96 workers. Each worker runs `h5py` to:
-1. Open the `.h5` file
-2. Read `Gap_Filled_DNB_BRDF-Corrected_NTL` (float32) — sliced to NL rectangle only
-3. Read `Mandatory_Quality_Flag` (uint8) — same slice
-4. Parse date from filename (`AYYYYDDD` → `datetime.date`)
+File paths are distributed across a `ProcessPoolExecutor` with ~96 workers. Each worker reads one HDF5 file using `h5py`, sliced to the NL rectangle only, and parses the date from the filename (`AYYYYDDD` → `datetime.date`).
+
+For **A1**, `QF_DNB` is a uint16 bitmask; bits 0–1 are extracted into a uint8 quality tier (0=best, 1=low, 2=poor, 3=no retrieval) — identical semantics to A2's `Mandatory_Quality_Flag`.
 <!-- slide -->
 **Step 3 — Pixel Row Emission**
 
-For each of the 672 × 937 = **629,664 pixels** per file:
+The output schema is **identical** for both products:
 
 | Column | Type | Description |
 |---|---|---|
@@ -137,13 +163,13 @@ For each of the 672 × 937 = **629,664 pixels** per file:
 | `col_idx` | int | Original raster column index |
 | `lat` | double | Latitude (WGS84) |
 | `lon` | double | Longitude (WGS84) |
-| `ntl_radiance` | float | Raw radiance (nW/cm²/sr), **null if fill** |
-| `quality_flag` | short | 0=best, 1=good, 255=no retrieval |
-| `is_fill` | boolean | True if pixel was -999.9 (fill value) |
+| `ntl_radiance` | float | NTL radiance (nW/cm²/sr), **null if fill** |
+| `quality_flag` | uint8 | 0=best, 1=good, 2+=degraded/no retrieval |
+| `is_fill` | boolean | True if pixel was −999.9 (fill value) |
 
 Fill pixels are **retained** (not discarded) so Phase 2 can count them.
 
-**Total rows**: 629,664 × 5,080 ≈ **3.2 billion**
+**Total rows per product**: 629,664 × ~5,080 ≈ **3.2 billion**
 ````
 
 ---
@@ -249,7 +275,30 @@ Annual population from `Population (x million).csv` is left-joined on `year`, re
 
 ---
 
-#### 1D. ENTSO-E Electricity Load
+#### 1D. CBS Consumer Price Index (CPI) — Energy
+
+```
+Input:  data/cbs/Consumentenprijzen__prijsindex_2015_100__*.csv
+Output: data/processing_1/cbs_cpi/data/  (360 monthly rows)
+```
+
+The CBS CPI file contains three monthly price-index series, all normalised to **2015 = 100**:
+
+| Output column | CBS code | What it measures |
+|---|---|---|
+| `cbs_cpi_energy` | 045000 Energie | Overall energy basket (electricity + gas, household-weighted) |
+| `cbs_cpi_electricity` | 045100 Elektriciteit | Electricity component |
+| `cbs_cpi_gas` | 045200 Gas | Gas component |
+
+**What a CPI value means.** If `cbs_cpi_energy = 162` in a given month, energy costs 62 % more than in 2015. The index captures the *relative movement* of prices rather than their absolute level, making it directly comparable across all years from 1996 to 2025.
+
+**How it complements the tariff files.** The tariff files record the actual euros consumers pay per kWh or m³, broken down by component (transport, taxes, supply). The CPI records how the overall price level has shifted. Both signals are useful for demand modelling, and crucially the CPI **fills the 2012–2017 gap** where the tariff data is absent.
+
+**Parsing notes.** The file uses Dutch month names (`januari`–`december`) and comma decimal separators (`42,06` → 42.06). Annual summary rows (one per calendar year) are filtered out; only the 12 monthly rows per year are retained.
+
+---
+
+#### 1E. ENTSO-E Electricity Load
 
 ```
 Input:  data/entso-e/*.xlsx  (8 files)
@@ -306,14 +355,17 @@ Final: truncate to whole hours with `floor("h")`, drop NaT/NaN rows.
 
 ---
 
-#### 2A. VIIRS Daily Aggregates
+#### 2A. VIIRS Daily Aggregates (A2 and A1)
 
 ```
-Input:  data/processing_1/viirs_a2/data/  (3.2B pixel rows)
-Output: data/processing_2/viirs_a2_daily/data/  (~5,080 rows, partitioned by year)
+Input A2:  data/processing_1/viirs_a2/data/   (3.2B pixel rows)
+Output A2: data/processing_2/viirs_a2_daily/data/  (~5,080 rows, partitioned by year)
+
+Input A1:  data/processing_1/viirs_a1/data/   (3.2B pixel rows)
+Output A1: data/processing_2/viirs_a1_daily/data/  (~5,080 rows, partitioned by year)
 ```
 
-Groups all ~630K pixels per day into **one row per date** with five aggregate columns:
+Both products are aggregated by the same `aggregate_viirs()` function (with `product="a2"` and `product="a1"` respectively). Groups all ~630K pixels per day into **one row per date** with five aggregate columns:
 
 | Column | Aggregation | Filter |
 |---|---|---|
@@ -330,11 +382,19 @@ Groups all ~630K pixels per day into **one row per date** with five aggregate co
 #### 2B. CBS Combined
 
 ```
-Input:  processing_1/cbs_energy/ + processing_1/cbs_gdp/
+Input:  processing_1/cbs_energy/ + processing_1/cbs_gdp/ + processing_1/cbs_cpi/
 Output: data/processing_2/cbs_combined/data/  (~400 rows)
 ```
 
-Outer-joins monthly energy tariffs with monthly GDP indicators on `(year, month)`. Both sources are now monthly-resolution — the energy tariffs are natively monthly (2018–2026) and the GDP indicators have been forward-filled from quarterly to monthly (1996–2025) in Phase 1. The resulting table has ~50 `cbs_*` columns. A year-gap check detects any missing calendar years.
+Outer-joins all three monthly CBS sources on `(year, month)` via a broadcast-join loop:
+
+| Source | Coverage | Columns added |
+|---|---|---|
+| CBS Energy | 2018–2026 | 13 `cbs_gas_*` / `cbs_elec_*` tariff columns |
+| CBS GDP | 1996–2025 | 35 `cbs_*_yy` / `cbs_*_qq` + `cbs_population_million` |
+| CBS CPI | 1996–2025 | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` |
+
+The outer join preserves all months present in any source (effectively 1996–2026). Tariff columns are null before 2018; CPI and GDP columns are null before 1996. A year-gap check detects any missing calendar years.
 
 ---
 
@@ -366,28 +426,33 @@ flowchart LR
     SPINE["🕐 Hourly Spine\n2012-01-01 00:00\n   ↓ every hour\n2026-04-20 23:00\n~126,000 rows"]
 
     E["⚡ ENTSO-E\n~150K rows\nhourly"]
-    V["🛰️ VIIRS Daily\n~5K rows\ndaily"]
+    VA2["🛰️ VIIRS A2 Daily\n~5K rows\ndaily"]
+    VA1["🛰️ VIIRS A1 Daily\n~5K rows\ndaily"]
     C["📊 CBS Combined\n~400 rows\nmonthly\n~50 columns"]
 
     SPINE -->|"LEFT JOIN\non timestamp"| J1
     E --> J1
 
-    J1 -->|"LEFT JOIN\non date\n(broadcast)"| J2
-    V --> J2
+    J1 -->|"LEFT JOIN on date\n→ ntl_a2_* cols"| J2
+    VA2 --> J2
 
-    J2 -->|"LEFT JOIN\non (year,month)\n(broadcast)"| J3
-    C --> J3
+    J2 -->|"LEFT JOIN on date\n→ ntl_a1_* cols"| J3
+    VA1 --> J3
 
-    J3 --> OUT["📦 Final Dataset\n~60 columns\n~126K rows"]
+    J3 -->|"LEFT JOIN\non (year,month)\n(broadcast)"| J4
+    C --> J4
+
+    J4 --> OUT["📦 Final Dataset\n~70 columns\n~126K rows"]
 ```
 
 #### Join Details
 
-| # | Source | Join Key | Join Type | Strategy |
+| # | Source | Join Key | Output Columns | Strategy |
 |---|---|---|---|---|
-| 1 | ENTSO-E | `timestamp` | Left equi-join | Standard sort-merge (both sides ~100K+ rows) |
-| 2 | VIIRS | `date` | Left + broadcast | VIIRS table (~5K rows) sent to all executors |
-| 3 | CBS | `(year, month)` | Left + broadcast | CBS table (~400 rows) sent to all executors |
+| 1 | ENTSO-E | `timestamp` | `entsoe_load_mw` | Left equi-join |
+| 2 | VIIRS A2 | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Left + broadcast |
+| 3 | VIIRS A1 | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Left + broadcast |
+| 4 | CBS | `(year, month)` | All `cbs_*` columns | Left + broadcast |
 
 #### Temporal Feature Generation
 
@@ -434,12 +499,14 @@ data/processed/nl_hourly_dataset.parquet/
 | Group | Columns | Source | Native Res. | Notes |
 |---|---|---|---|---|
 | Target | `entsoe_load_mw` | ENTSO-E | Hourly | Target variable (MW) |
-| Satellite | `ntl_mean`, `ntl_sum`, `ntl_valid_count`, `ntl_fill_count`, `ntl_invalid_count` | VIIRS | Daily | Spatial aggregates |
+| Satellite A2 | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | VIIRS VNP46A2 | Daily | Gap-filled BRDF-corrected NTL spatial aggregates |
+| Satellite A1 | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | VIIRS VNP46A1 | Daily | At-sensor raw radiance spatial aggregates |
 | Gas tariffs | `cbs_gas_transport_rate`, `cbs_gas_fixed_supply_rate`, `cbs_gas_ode_tax`, `cbs_gas_energy_tax`, `cbs_gas_total_tax` | CBS | Monthly | 2018–2026; ODE null after 2022 |
 | Electricity tariffs | `cbs_elec_transport_rate`, `cbs_elec_fixed_supply_rate`, `cbs_elec_*_dynamic`, `cbs_elec_ode_tax`, `cbs_elec_energy_tax`, `cbs_elec_total_tax`, `cbs_elec_energy_tax_refund` | CBS | Monthly | 2018–2026; dynamic null before 2025 |
 | GDP (y/y) | `cbs_gdp_yy`, `cbs_gdp_wda_yy`, `cbs_imports_total_yy`, ... (18 cols) | CBS | Quarterly→Monthly | 1996–2025, forward-filled |
 | GDP (q/q) | `cbs_gdp_qq`, `cbs_imports_total_qq`, ... (17 cols) | CBS | Quarterly→Monthly | 1996–2025, forward-filled |
 | Population | `cbs_population_million` | CBS | Annual→Monthly | Replicated to all months |
+| Energy CPI | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` | CBS | Monthly | Index (2015=100), 1996–2025 |
 | Temporal | `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter` | Derived | Hourly | From timestamp |
 
 ---
@@ -451,18 +518,19 @@ Every phase produces a `data_quality.json` alongside its output:
 ```mermaid
 flowchart LR
     subgraph P1_QC["Phase 1 Quality Checks"]
-        Q1A["VIIRS: file count, observation days,\npixels/day, NL coordinate range"]
+        Q1A["VIIRS A2 + A1: file count,\nobservation days, pixels/day,\nNL coordinate range"]
         Q1B["CBS Energy: non-null counts per\ntariff column, period coverage"]
         Q1C["CBS GDP: indicator column count,\nyear range, null percentages"]
-        Q1D["ENTSO-E: file count, year range,\nhourly record count"]
+        Q1D["CBS CPI: 3 index series,\nyear range, null percentages"]
+        Q1E["ENTSO-E: file count, year range,\nhourly record count"]
     end
     subgraph P2_QC["Phase 2 Quality Checks"]
-        Q2A["VIIRS: pixel-count consistency\n(valid+fill+invalid = 629,664),\nvalid pixel fraction stats"]
+        Q2A["VIIRS A2 + A1: pixel-count consistency\n(valid+fill+invalid = 629,664),\nvalid pixel fraction stats"]
         Q2B["CBS: year gap detection,\nmissing year list"]
         Q2C["ENTSO-E: per-year hour coverage\nvs expected, load min/max/σ"]
     end
     subgraph P3_QC["Phase 3 Quality Checks"]
-        Q3["Source coverage %,\nENTSO-E ≥ 85% assertion,\nCBS tariffs + GDP coverage,\nload statistics,\nspine completeness"]
+        Q3["Source coverage % (A1 + A2 separately),\nENTSO-E ≥ 85% assertion,\nCBS tariffs + GDP coverage,\nload statistics,\nspine completeness"]
     end
 
     P1_QC --> P2_QC --> P3_QC
