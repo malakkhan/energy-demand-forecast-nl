@@ -94,13 +94,13 @@ Downloads VIIRS Black Marble satellite imagery from NASA's [LAADS DAAC](https://
 source .env
 
 # Download A2 (gap-filled BRDF-corrected NTL)
-python3 -u download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 -s 2012-01-01
+python3 -u src/download/download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 -s 2012-01-01
 
 # Download A1 (at-sensor raw radiance)
-python3 -u download_nl_viirs.py -p A1 -d /projects/prjs2061/data/viirs/A1 -s 2012-01-01
+python3 -u src/download/download_nl_viirs.py -p A1 -d /projects/prjs2061/data/viirs/A1 -s 2012-01-01
 
 # Download only specific days (re-download corrupt files, etc.)
-python3 -u download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 -s 2016-10-07 -e 2016-10-07
+python3 -u src/download/download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 -s 2016-10-07 -e 2016-10-07
 ```
 
 **CLI options:**
@@ -120,7 +120,7 @@ python3 -u download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 -s 201
 - **Long-running**: For a full 2012-present download (~5000 files per product), this takes many hours. Use `nohup` and `python3 -u` (unbuffered) for terminal-safe operation:
 
   ```bash
-  nohup python3 -u download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 >> download_A2.log 2>&1 &
+  nohup python3 -u src/download/download_nl_viirs.py -p A2 -d /projects/prjs2061/data/viirs/A2 >> download_A2.log 2>&1 &
   ```
 
 ### `download_nl_knmi.py` — KNMI Meteorological Data
@@ -130,7 +130,7 @@ Downloads hourly in-situ meteorological observations from the [KNMI Open Data Pl
 **Usage:**
 
 ```bash
-python3 download_nl_knmi.py --dest /projects/prjs2061/data/knmi --start-year 2012
+python3 src/download/download_nl_knmi.py --dest /projects/prjs2061/data/knmi --start-year 2012
 ```
 
 **CLI options:**
@@ -173,18 +173,18 @@ The CBS and ENTSO-E source files are downloaded manually from their respective p
 The pipeline is organized in three sequential phases. Each phase reads from the previous phase's output directory and writes to the next. All phases support **idempotent re-runs** — already-processed outputs are skipped unless `--force` is passed.
 
 ```
-data/viirs/A2/*.h5 ──┐
-data/viirs/A1/*.h5 ──┤
-data/cbs/*.csv ──────┼──▶ Phase 1 ──▶ data/processing_1/ ──▶ Phase 2 ──▶ data/processing_2/ ──▶ Phase 3 ──▶ data/processed/
-data/entso-e/*.xlsx ─┘    (Extract)     (source-level           (Aggregate)    (aggregated/            (Merge)     nl_hourly_dataset.parquet
-                                         Parquet)                               combined Parquet)
+/projects/prjs2061/data/viirs/A2/*.h5 ──┐
+/projects/prjs2061/data/viirs/A1/*.h5 ──┤
+/projects/prjs2061/data/cbs/*.csv ───────┼──▶ Phase 1 ──▶ data/processing_1/ ──▶ Phase 2 ──▶ data/processing_2/ ──▶ Phase 3 ──▶ data/processed/
+/projects/prjs2061/data/entso-e/*.xlsx ─┘    (Extract)     (source-level             (Aggregate)  (aggregated/              (Merge)     nl_hourly_dataset.parquet
+                                                             Parquet)                               combined Parquet)
 ```
 
 ---
 
 ### Phase 1 — Extract
 
-**Script:** `phase1_extract.py`
+**Script:** `src/pipeline/phase1_extract.py`
 
 Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **seven sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + CBS GEP + ENTSO-E):
 
@@ -343,12 +343,13 @@ Reads ENTSO-E Excel workbooks (both legacy wide format and modern long format), 
 #### CLI Options
 
 ```bash
-python phase1_extract.py [--data-root /path/to/data] [--workers N] [--force] [--start-method fork|spawn]
+python src/pipeline/phase1_extract.py [--data-root /path/to/raw/data] [--out-root /path/to/output] [--workers N] [--force] [--start-method fork|spawn]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-root` | `/projects/prjs2061/data` | Root data directory |
+| `--data-root` | `/projects/prjs2061/data` | Root directory for raw input data (VIIRS, CBS, ENTSO-E) |
+| `--out-root` | `<repo>/data` | Root directory for pipeline outputs (`processing_1/`, etc.) |
 | `--workers` | All CPUs | Number of parallel worker processes |
 | `--force` | `false` | Re-process files even if output already exists |
 | `--start-method` | `fork` | Python multiprocessing start method |
@@ -361,7 +362,7 @@ Each sub-stage writes a `data_quality.json` alongside its output (e.g. `data/pro
 
 ### Phase 2 — Aggregate
 
-**Script:** `phase2_aggregate.py`
+**Script:** `src/pipeline/phase2_aggregate.py`
 
 Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **four sub-stages** (A2 aggregation, A1 aggregation, CBS combination of three sources, ENTSO-E pass-through):
 
@@ -402,12 +403,12 @@ Re-partitions ENTSO-E hourly data by year with one file per partition and genera
 #### CLI Options
 
 ```bash
-python phase2_aggregate.py [--data-root /path/to/data] [--workers N] [--force] [--driver-memory 64g]
+python src/pipeline/phase2_aggregate.py [--out-root /path/to/output] [--workers N] [--force] [--driver-memory 64g]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-root` | `/projects/prjs2061/data` | Root data directory |
+| `--out-root` | `<repo>/data` | Root directory for pipeline outputs (`processing_1/`, `processing_2/`) |
 | `--workers` | All CPUs | Spark local-mode thread count |
 | `--driver-memory` | `64g` | Spark driver memory (JVM heap) |
 | `--force` | `false` | Re-run stages even if `_SUCCESS` marker exists |
@@ -424,7 +425,7 @@ Each sub-stage checks for Spark's `_SUCCESS` marker file. If present, the stage 
 
 ### Phase 3 — Merge
 
-**Script:** `phase3_merge.py`
+**Script:** `src/pipeline/phase3_merge.py`
 
 Joins all Phase 2 outputs onto a **contiguous hourly UTC timestamp spine** (2012-01-01 00:00 → today 23:00) to produce the final unified dataset.
 
@@ -459,16 +460,16 @@ The final dataset contains ~91 columns. Column ordering is deterministic:
 #### CLI Options
 
 ```bash
-python phase3_merge.py [--data-root /path/to/data] [--start 2012-01-01] [--end 2026-04-20]
-                       [--workers N] [--driver-memory 64g] [--force]
+python src/pipeline/phase3_merge.py [--out-root /path/to/output] [--start 2012-01-01] [--end 2026-04-20]
+                       [--workers N] [--force]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
+| `--out-root` | `<repo>/data` | Root directory for pipeline outputs (`processing_2/`, `processed/`) |
 | `--start` | `2012-01-01` | Spine start date |
 | `--end` | Today (UTC) | Spine end date |
-| `--workers` | All CPUs | Spark local-mode thread count |
-| `--driver-memory` | `64g` | Spark driver memory |
+| `--workers` | All CPUs | Accepted for compatibility; merge is single-threaded |
 | `--force` | `false` | Re-run even if final output exists |
 
 ---
@@ -481,13 +482,13 @@ Each phase has a corresponding `.slurm` batch script. You can submit them indivi
 
 ```bash
 # Phase 1 — Extract (96 cores, 4-hour time limit)
-sbatch phase1.slurm
+sbatch src/pipeline/phase1.slurm
 
 # Phase 2 — Aggregate (128 cores, exclusive node, 2-hour limit)
-sbatch phase2.slurm
+sbatch src/pipeline/phase2.slurm
 
 # Phase 3 — Merge (32 cores, 64 GB explicit memory, 30-minute limit)
-sbatch phase3.slurm
+sbatch src/pipeline/phase3.slurm
 ```
 
 ### Chained Submission (Recommended)
@@ -495,17 +496,17 @@ sbatch phase3.slurm
 Submit Phase 2 after Phase 1, and Phase 3 after Phase 2, using SLURM dependency chains:
 
 ```bash
-JOB1=$(sbatch --parsable phase1.slurm)
-JOB2=$(sbatch --parsable --dependency=afterok:$JOB1 phase2.slurm)
-JOB3=$(sbatch --parsable --dependency=afterok:$JOB2 phase3.slurm)
+JOB1=$(sbatch --parsable src/pipeline/phase1.slurm)
+JOB2=$(sbatch --parsable --dependency=afterok:$JOB1 src/pipeline/phase2.slurm)
+JOB3=$(sbatch --parsable --dependency=afterok:$JOB2 src/pipeline/phase3.slurm)
 echo "Phase 1: $JOB1, Phase 2: $JOB2, Phase 3: $JOB3"
 ```
 
 If Phase 1 has already completed (outputs are cached), you can skip it:
 
 ```bash
-JOB2=$(sbatch --parsable phase2.slurm)
-JOB3=$(sbatch --parsable --dependency=afterok:$JOB2 phase3.slurm)
+JOB2=$(sbatch --parsable src/pipeline/phase2.slurm)
+JOB3=$(sbatch --parsable --dependency=afterok:$JOB2 src/pipeline/phase3.slurm)
 echo "Phase 2: $JOB2, Phase 3: $JOB3"
 ```
 
@@ -513,9 +514,9 @@ echo "Phase 2: $JOB2, Phase 3: $JOB3"
 
 | Phase | SLURM Script | Partition | CPUs | Memory | Time Limit | Node |
 |---|---|---|---|---|---|---|
-| 1 | `phase1.slurm` | `rome` | 96 | Default (shared) | 4 hours | Shared |
-| 2 | `phase2.slurm` | `rome` | 128 | Full node | 2 hours | **Exclusive** |
-| 3 | `phase3.slurm` | `rome` | 32 | 64 GB | 30 minutes | Shared |
+| 1 | `src/pipeline/phase1.slurm` | `rome` | 96 | Default (shared) | 4 hours | Shared |
+| 2 | `src/pipeline/phase2.slurm` | `rome` | 128 | Full node | 2 hours | **Exclusive** |
+| 3 | `src/pipeline/phase3.slurm` | `rome` | 32 | 64 GB | 30 minutes | Shared |
 
 ---
 
@@ -527,13 +528,13 @@ Each SLURM job writes its log to the submit directory with the pattern `phase<N>
 
 ```bash
 # View the most recent Phase 2 log
-cat phase2_22050133.log
+cat logs/phase2_22050133.log
 
 # Stream a log in real-time while a job is running
-tail -f phase2_$(squeue -u $USER -h -o "%i" | head -1).log
+tail -f logs/phase2_$(squeue -u $USER -h -o "%i" | head -1).log
 ```
 
-Download scripts log to dedicated files:
+Download scripts log to dedicated files (at repo root):
 
 ```bash
 tail -f download_A1.log    # VIIRS A1 download progress
@@ -570,57 +571,78 @@ Every processing stage writes a `data_quality.json` alongside its Parquet output
 
 ```bash
 # Phase 1 quality reports
-cat /projects/prjs2061/data/processing_1/viirs_a2/data_quality.json
-cat /projects/prjs2061/data/processing_1/viirs_a1/data_quality.json
-cat /projects/prjs2061/data/processing_1/cbs_energy/data_quality.json
-cat /projects/prjs2061/data/processing_1/cbs_gdp/data_quality.json
-cat /projects/prjs2061/data/processing_1/cbs_cpi/data_quality.json
-cat /projects/prjs2061/data/processing_1/cbs_gep/data_quality.json
-cat /projects/prjs2061/data/processing_1/entsoe/data_quality.json
+cat data/processing_1/viirs_a2/data_quality.json
+cat data/processing_1/viirs_a1/data_quality.json
+cat data/processing_1/cbs_energy/data_quality.json
+cat data/processing_1/cbs_gdp/data_quality.json
+cat data/processing_1/cbs_cpi/data_quality.json
+cat data/processing_1/cbs_gep/data_quality.json
+cat data/processing_1/entsoe/data_quality.json
 
 # Phase 2 quality reports
-cat /projects/prjs2061/data/processing_2/viirs_a2_daily/data_quality.json
-cat /projects/prjs2061/data/processing_2/viirs_a1_daily/data_quality.json
-cat /projects/prjs2061/data/processing_2/cbs_combined/data_quality.json
-cat /projects/prjs2061/data/processing_2/entsoe/data_quality.json
+cat data/processing_2/viirs_a2_daily/data_quality.json
+cat data/processing_2/viirs_a1_daily/data_quality.json
+cat data/processing_2/cbs_combined/data_quality.json
+cat data/processing_2/entsoe/data_quality.json
 
 # Phase 3 final quality report
-cat /projects/prjs2061/data/processed/data_quality.json
+cat data/processed/data_quality.json
 ```
 
 Each report includes: row/column counts, per-column null percentages and dtypes, date ranges, output size in bytes/MB, and stage-specific metrics (pixel coverage fractions, year coverage percentages, load MW statistics, performance timings).
 
 ---
 
-## Directory Layout
-
 ```
 energy-demand-forecast-nl/                # Repository root (on Snellius)
 ├── .env                                  # API tokens (git-ignored)
 ├── .gitignore
 ├── README.md
+├── pipeline_architecture.md              # Pipeline design document
 ├── requirements.in                       # Top-level Python dependencies
 ├── requirements.txt                      # Locked/pinned versions (pip-compile)
 │
-├── download_nl_viirs.py                  # VIIRS HDF5 download script
-├── download_nl_knmi.py                   # KNMI weather data download script
+├── src/
+│   ├── pipeline/                         # ETL pipeline: scripts + SLURM jobs
+│   │   ├── phase1_extract.py             # Phase 1: Raw → source-level Parquet
+│   │   ├── phase2_aggregate.py           # Phase 2: Source-level → aggregated Parquet
+│   │   ├── phase3_merge.py               # Phase 3: Aggregated → final hourly dataset
+│   │   ├── phase1.slurm                  # SLURM job script for Phase 1
+│   │   ├── phase2.slurm                  # SLURM job script for Phase 2
+│   │   └── phase3.slurm                  # SLURM job script for Phase 3
+│   │
+│   └── download/                         # Data download utilities
+│       ├── download_nl_viirs.py          # VIIRS HDF5 download script
+│       └── download_nl_knmi.py           # KNMI weather data download script
 │
-├── phase1_extract.py                     # Phase 1: Raw → source-level Parquet
-├── phase2_aggregate.py                   # Phase 2: Source-level → aggregated Parquet
-├── phase3_merge.py                       # Phase 3: Aggregated → final hourly dataset
+├── data/                                 # Pipeline outputs (inside repo)
+│   ├── processing_1/                     # Phase 1 output (source-level Parquet)
+│   │   ├── viirs_a2/data/year=YYYY/      # Per-day VNP46A2 pixel Parquet (+ data_quality.json)
+│   │   ├── viirs_a1/data/year=YYYY/      # Per-day VNP46A1 pixel Parquet (+ data_quality.json)
+│   │   ├── cbs_energy/data/              # Monthly consumer tariffs (harmonized)
+│   │   ├── cbs_gdp/data/                 # Monthly GDP/economic indicators + population
+│   │   ├── cbs_cpi/data/                 # Monthly energy CPI (2015=100)
+│   │   ├── cbs_gep/data/                 # Monthly gas & electricity prices by band
+│   │   └── entsoe/data/year=YYYY/        # Hourly NL load
+│   │
+│   ├── processing_2/                     # Phase 2 output (aggregated Parquet)
+│   │   ├── viirs_a2_daily/data/year=YYYY/  # Daily VNP46A2 aggregates
+│   │   ├── viirs_a1_daily/data/year=YYYY/  # Daily VNP46A1 aggregates
+│   │   ├── cbs_combined/data/              # Merged CBS (~70 columns)
+│   │   └── entsoe/data/year=YYYY/          # Re-partitioned ENTSO-E
+│   │
+│   └── processed/                        # Phase 3 final output
+│       ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~91 columns)
+│       └── data_quality.json             # Comprehensive quality report
 │
-├── phase1.slurm                          # SLURM job script for Phase 1
-├── phase2.slurm                          # SLURM job script for Phase 2
-├── phase3.slurm                          # SLURM job script for Phase 3
+├── logs/                                 # SLURM job output logs (git-ignored)
+│   └── phase*_*.log
 │
-├── pipeline_architecture.md              # Pipeline design document
-│
-├── download.log                          # VIIRS A2 download log
-├── download_A1.log                       # VIIRS A1 download log
-├── download_knmi.log                     # KNMI download log
-└── phase*_*.log                          # SLURM job output logs
+├── download.log                          # VIIRS A2 download log  (root, git-ignored)
+├── download_A1.log                       # VIIRS A1 download log  (root, git-ignored)
+└── download_knmi.log                     # KNMI download log      (root, git-ignored)
 
-/projects/prjs2061/data/                  # Data root (outside repo)
+/projects/prjs2061/data/                  # Raw input data (outside repo — too large for git)
 ├── viirs/
 │   ├── A1/                               # Raw VNP46A1 HDF5 files
 │   └── A2/                               # Raw VNP46A2 HDF5 files
@@ -632,24 +654,5 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   ├── GDP__output_and_expenditures__changes__*.csv     # Quarterly national accounts
 │   └── Population (x million).csv                       # Annual population
 ├── entso-e/                              # ENTSO-E Excel workbooks
-├── knmi/                                 # KNMI meteorological data
-│
-├── processing_1/                         # Phase 1 output
-│   ├── viirs_a2/data/year=YYYY/          # Per-day VNP46A2 pixel Parquet (+ data_quality.json)
-│   ├── viirs_a1/data/year=YYYY/          # Per-day VNP46A1 pixel Parquet (+ data_quality.json)
-│   ├── cbs_energy/data/                  # Monthly consumer tariffs (harmonized)
-│   ├── cbs_gdp/data/                     # Monthly GDP/economic indicators + population
-│   ├── cbs_cpi/data/                     # Monthly energy CPI (2015=100)
-│   ├── cbs_gep/data/                     # Monthly gas & electricity prices by band
-│   └── entsoe/data/year=YYYY/            # Hourly NL load
-│
-├── processing_2/                         # Phase 2 output
-│   ├── viirs_a2_daily/data/year=YYYY/    # Daily VNP46A2 aggregates
-│   ├── viirs_a1_daily/data/year=YYYY/    # Daily VNP46A1 aggregates
-│   ├── cbs_combined/data/                # Merged CBS (tariffs + GDP + CPI + GEP, ~70 columns)
-│   └── entsoe/data/year=YYYY/            # Re-partitioned ENTSO-E
-│
-└── processed/                            # Phase 3 final output
-    ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~91 columns)
-    └── data_quality.json                 # Comprehensive quality report
+└── knmi/                                 # KNMI meteorological data
 ```

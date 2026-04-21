@@ -15,7 +15,7 @@ flowchart TD
         E_RAW["⚡ ENTSO-E\n8 XLSX files\nHourly load\n2006–2024"]
     end
 
-    subgraph P1["PHASE 1 — EXTRACTION  ·  phase1_extract.py"]
+    subgraph P1["PHASE 1 — EXTRACTION  ·  src/pipeline/phase1_extract.py"]
         direction TB
         VA2_1["🔬 VIIRS A2 Processor\n· Gap_Filled_DNB_BRDF-Corrected_NTL\n· Mandatory_Quality_Flag (uint8)\n· Crop to NL bbox: 672×937 pixels\n· 1 row per pixel per day"]
         VA1_1["🔬 VIIRS A1 Processor\n· DNB_At_Sensor_Radiance\n· QF_DNB bits 0-1 → uint8 quality\n· Crop to NL bbox: 672×937 pixels\n· 1 row per pixel per day"]
@@ -37,7 +37,7 @@ flowchart TD
         E1_O["entsoe/\n~150K rows\n📁 by year"]
     end
 
-    subgraph P2["PHASE 2 — AGGREGATION  ·  phase2_aggregate.py"]
+    subgraph P2["PHASE 2 — AGGREGATION  ·  src/pipeline/phase2_aggregate.py"]
         direction TB
         VA2_2["📐 VIIRS A2 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
         VA1_2["📐 VIIRS A1 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
@@ -53,7 +53,7 @@ flowchart TD
         E2_O["entsoe/\n~150K rows\n📁 by year"]
     end
 
-    subgraph P3["PHASE 3 — MERGE  ·  phase3_merge.py"]
+    subgraph P3["PHASE 3 — MERGE  ·  src/pipeline/phase3_merge.py"]
         direction TB
         SPINE["🕐 Hourly UTC Spine\n2012-01-01 → today\n~126,000 rows\n+ 9 temporal features"]
         JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A1 on date → ntl_a1_*\n4. CBS on year,month (broadcast)"]
@@ -124,10 +124,10 @@ flowchart TD
 #### 1A. VIIRS VNP46A2 and VNP46A1 — Satellite Nighttime Light
 
 ```
-Input A2:  data/viirs/A2/*.h5  (~5,080 files — gap-filled BRDF-corrected NTL)
+Input A2:  /projects/prjs2061/data/viirs/A2/*.h5  (~5,080 files — gap-filled BRDF-corrected NTL)
 Output A2: data/processing_1/viirs_a2/data/  (partitioned by year)
 
-Input A1:  data/viirs/A1/*.h5  (~5,080 files — at-sensor raw radiance)
+Input A1:  /projects/prjs2061/data/viirs/A1/*.h5  (~5,080 files — at-sensor raw radiance)
 Output A1: data/processing_1/viirs_a1/data/  (partitioned by year)
 ```
 
@@ -183,8 +183,8 @@ Fill pixels are **retained** (not discarded) so Phase 2 can count them.
 #### 1B. CBS Consumer Energy Tariffs (Harmonized)
 
 ```
-Input:  data/cbs/Average_energy_prices_for_consumers__2018*.csv  (old schema)
-        data/cbs/Average_energy_prices_for_consumers_2*.csv      (new schema)
+Input:  /projects/prjs2061/data/cbs/Average_energy_prices_for_consumers__2018*.csv  (old schema)
+        /projects/prjs2061/data/cbs/Average_energy_prices_for_consumers_2*.csv      (new schema)
 Output: data/processing_1/cbs_energy/data/  (99 monthly rows)
 ```
 
@@ -227,8 +227,8 @@ The two CBS consumer tariff files use **different schemas** due to a methodology
 #### 1C. CBS GDP / Quarterly National Accounts + Population
 
 ```
-Input:  data/cbs/GDP__output_and_expenditures__changes__*.csv
-        data/cbs/Population (x million).csv
+Input:  /projects/prjs2061/data/cbs/GDP__output_and_expenditures__changes__*.csv
+        /projects/prjs2061/data/cbs/Population (x million).csv
 Output: data/processing_1/cbs_gdp/data/  (360 monthly rows)
 ```
 
@@ -284,7 +284,7 @@ Annual population from `Population (x million).csv` is left-joined on `year`, re
 #### 1D. CBS Consumer Price Index (CPI) — Energy
 
 ```
-Input:  data/cbs/Consumentenprijzen__prijsindex_2015_100__*.csv
+Input:  /projects/prjs2061/data/cbs/Consumentenprijzen__prijsindex_2015_100__*.csv
 Output: data/processing_1/cbs_cpi/data/  (360 monthly rows)
 ```
 
@@ -307,7 +307,7 @@ The CBS CPI file contains three monthly price-index series, all normalised to **
 #### 1E. CBS Gas & Electricity Prices (GEP)
 
 ```
-Input:  data/cbs/Prices_of_natural_gas_and_electricity_*.csv
+Input:  /projects/prjs2061/data/cbs/Prices_of_natural_gas_and_electricity_*.csv
 Output: data/processing_1/cbs_gep/data/  (~204 monthly rows)
 ```
 
@@ -339,7 +339,7 @@ Coverage: H1 2009 – H2 2025 (~204 monthly rows).
 #### 1F. ENTSO-E Electricity Load
 
 ```
-Input:  data/entso-e/*.xlsx  (8 files)
+Input:  /projects/prjs2061/data/entso-e/*.xlsx  (8 files)
 Output: data/processing_1/entsoe/data/  (partitioned by year, ~150K rows)
 ```
 
@@ -420,7 +420,7 @@ Both products are aggregated by the same `aggregate_viirs()` function (with `pro
 #### 2B. CBS Combined
 
 ```
-Input:  processing_1/cbs_energy/ + processing_1/cbs_gdp/ + processing_1/cbs_cpi/ + processing_1/cbs_gep/
+Input:  data/processing_1/cbs_energy/ + data/processing_1/cbs_gdp/ + data/processing_1/cbs_cpi/ + data/processing_1/cbs_gep/
 Output: data/processing_2/cbs_combined/data/  (~400 rows)
 ```
 

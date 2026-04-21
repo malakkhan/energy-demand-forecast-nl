@@ -207,8 +207,10 @@ marimo/_lsp/
 __marimo__/
 
 # ────────────────────────────────────────────────────────────────────────────
-# Project-specific: pipeline outputs (large binary data — never commit)
+# Project-specific ignores
 # ────────────────────────────────────────────────────────────────────────────
+
+# Pipeline processed outputs — large Parquet/binary data, do not commit
 data/processing_1/
 data/processing_2/
 data/processed/
