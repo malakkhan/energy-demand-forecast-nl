@@ -232,3 +232,6 @@ metastore_db/
 .venv/
 venv/
 env/
+
+# Generated analysis figures (run via run_analysis.slurm)
+analysis/figures/
