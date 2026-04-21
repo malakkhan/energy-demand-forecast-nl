@@ -11,7 +11,11 @@
 #   # After changing requirements.in (re-pins and re-installs)
 #   bash setup_env.sh --update
 #
-# The script must be run AFTER loading an appropriate Python module, e.g.:
+# On Snellius, Python modules require its toolchain year to be loaded first.
+# Check what is available:  module spider Python
+#
+# Correct two-step load:
+#   module load 2023
 #   module load Python/3.11.3-GCCcore-12.3.0
 #   bash setup_env.sh
 #
