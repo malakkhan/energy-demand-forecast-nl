@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --partition=thin
+#SBATCH --partition=rome
 #SBATCH --output=logs/jupyter-lab-%j.out
 
 # =============================================================================
@@ -21,12 +21,14 @@ module load 2023
 module load Python/3.11.3-GCCcore-12.3.0
 
 # ── Activate project virtual environment ─────────────────────────────────────
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Use absolute path — BASH_SOURCE is unreliable inside SLURM scripts
+REPO_ROOT="/projects/prjs2061/energy-demand-forecast-nl"
 source "${REPO_ROOT}/.venv/bin/activate"
 
 # ── Pick a random port (5000–5999) to avoid clashes with other users ──────────
 PORT=$(shuf -i 5000-5999 -n 1)
-LOGIN_HOST="${SLURM_SUBMIT_HOST}-pub.snellius.surf.nl"
+# SLURM_SUBMIT_HOST is the internal hostname; build the public-facing address manually
+LOGIN_HOST="int6-pub.snellius.surf.nl"
 BATCH_HOST=$(hostname)
 
 echo "============================================================"
@@ -41,7 +43,7 @@ echo "Step 2 — Open this URL in your local browser:"
 echo ""
 echo "  http://localhost:${PORT}"
 echo ""
-echo "  (The token will appear in the JupyterLab startup output below)"
+echo "  (The full URL including token will appear in the output below)"
 echo "============================================================"
 echo ""
 
