@@ -271,11 +271,12 @@ def combine_cbs(
     out_dir: str,
     force: bool = False,
 ) -> None:
-    """Combine CBS energy (monthly) and CBS macro (annual) into one table.
+    """Combine CBS energy (monthly) and CBS GDP (monthly, from quarterly) into one table.
 
-    The annual GDP/population values are broadcast-joined to each month of
-    their respective year, yielding a single monthly-resolution table with
-    all CBS indicators.
+    Both sources are at monthly resolution: CBS energy prices are natively
+    monthly, and CBS GDP indicators have been forward-filled from quarterly
+    to monthly in Phase 1.  The join on ``(year, month)`` produces a clean
+    combined table with no orphaned rows.
     """
     logger.info("=== Phase 2: CBS combination ===")
     t0 = time.time()
@@ -288,17 +289,17 @@ def combine_cbs(
         _clear_output(out_dir)
 
     energy_path = os.path.join(p1_dir, "cbs_energy", "data")
-    macro_path = os.path.join(p1_dir, "cbs_macro", "data")
+    gdp_path = os.path.join(p1_dir, "cbs_gdp", "data")
 
     has_energy = os.path.exists(energy_path)
-    has_macro = os.path.exists(macro_path)
+    has_gdp = os.path.exists(gdp_path)
 
-    if not has_energy and not has_macro:
+    if not has_energy and not has_gdp:
         logger.warning("No CBS Phase 1 data found — skipping.")
         return
 
     energy_df = None
-    macro_df = None
+    gdp_df = None
 
     if has_energy:
         energy_df = spark.read.parquet(energy_path)
@@ -306,27 +307,24 @@ def combine_cbs(
     else:
         logger.warning("CBS Energy Phase 1 not found.")
 
-    if has_macro:
-        macro_df = spark.read.parquet(macro_path).select(
-            F.col("year"),
-            F.col("gdp_million_eur").alias("cbs_gdp_million_eur"),
-            F.col("population_million").alias("cbs_population_million"),
-        )
-        logger.info("CBS Macro loaded from %s.", macro_path)
+    if has_gdp:
+        gdp_df = spark.read.parquet(gdp_path)
+        logger.info("CBS GDP loaded from %s.", gdp_path)
     else:
-        logger.warning("CBS Macro Phase 1 not found.")
+        logger.warning("CBS GDP Phase 1 not found.")
 
-    if energy_df is not None and macro_df is not None:
-        combined = energy_df.join(F.broadcast(macro_df), on="year", how="outer")
+    if energy_df is not None and gdp_df is not None:
+        combined = energy_df.join(
+            F.broadcast(gdp_df), on=["year", "month"], how="outer"
+        )
     elif energy_df is not None:
         combined = energy_df
     else:
-        months = spark.range(1, 13).withColumnRenamed("id", "month")
-        combined = macro_df.crossJoin(months)
+        combined = gdp_df
 
     combined = combined.orderBy("year", "month")
 
-    # CBS combined is ~200 rows — one output file is plenty.
+    # CBS combined is ~400 rows — one output file is plenty.
     out_parquet = os.path.join(out_dir, "data")
     os.makedirs(out_dir, exist_ok=True)
     combined.coalesce(1).write.mode("overwrite").parquet(out_parquet)

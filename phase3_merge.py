@@ -4,25 +4,21 @@
 Final stage of the three-phase NL energy demand data pipeline. Reads the
 aggregated/combined Parquet files from ``data/processing_2/`` and joins
 them onto a canonical hourly UTC timestamp spine spanning
-2012-01-01 to today.
+2012-01-01 to 2025-12-31.
 
 The final dataset is written to ``data/processed/nl_hourly_dataset.parquet``,
 partitioned by year, with a comprehensive ``data_quality.json``.
 
-Join strategy:
-    - **ENTSO-E** (hourly): Equi-join on ``timestamp`` (broadcast — small).
-    - **VIIRS A2 daily** (daily): Broadcast-join on ``date``.
-    - **CBS Combined** (monthly): Broadcast-join on ``(year, month)``.
-
-Optimised for Snellius: AQE, node-local scratch, UTC session timezone,
-single-pass quality stats, pandas-based quality metrics, and
-checkpointing via Spark's ``_SUCCESS`` marker.
+Join strategy (pure pandas — the total dataset is ~122K rows):
+    - **ENTSO-E** (hourly): Left-join on ``timestamp``.
+    - **VIIRS A2 daily** (daily): Left-join on ``date``.
+    - **CBS Combined** (monthly): Left-join on ``(year, month)``.
 
 Usage::
 
     python phase3_merge.py [--data-root /path/to/data]
                             [--start YYYY-MM-DD] [--end YYYY-MM-DD]
-                            [--workers N] [--force]
+                            [--force]
 """
 
 import argparse
@@ -34,10 +30,10 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+import numpy as np
 import pandas as pd
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,28 +48,24 @@ logger = logging.getLogger("phase3_merge")
 # ---------------------------------------------------------------------------
 
 
-def _stage_done(parquet_path: str) -> bool:
-    """Return True if a previous Spark write completed successfully."""
-    return os.path.exists(os.path.join(parquet_path, "_SUCCESS"))
+def _output_done(parquet_dir: str) -> bool:
+    """Return True if a previous write completed (check for _SUCCESS marker
+    or the existence of at least one year-partition directory)."""
+    if os.path.exists(os.path.join(parquet_dir, "_SUCCESS")):
+        return True
+    if os.path.isdir(parquet_dir):
+        return any(d.startswith("year=") for d in os.listdir(parquet_dir))
+    return False
 
 
 def _clear_path(path: str) -> None:
-    """Remove a Parquet directory (used under --force)."""
+    """Remove a Parquet directory tree (used under --force)."""
     if os.path.isdir(path):
         shutil.rmtree(path)
 
 
-def _scratch_dir() -> str:
-    """Return the best node-local scratch directory for Spark shuffle spill."""
-    for var in ("SLURM_TMPDIR", "TMPDIR"):
-        v = os.environ.get(var)
-        if v and os.path.isdir(v):
-            return v
-    return "/tmp"
-
-
 # ---------------------------------------------------------------------------
-# Data quality helpers — pandas-based (final dataset is ~115 k rows)
+# Data quality helpers
 # ---------------------------------------------------------------------------
 
 
@@ -83,11 +75,7 @@ def _compute_quality_metrics(
     phase: int,
     extra_metrics: Optional[dict] = None,
 ) -> dict:
-    """Compute data quality metrics for the final Parquet output.
-
-    Uses pandas — the full hourly dataset is ~115 k rows × ~20 columns,
-    which loads instantly and avoids a redundant Spark job.
-    """
+    """Compute data quality metrics for the final Parquet output."""
     df = pd.read_parquet(parquet_path)
     total_rows = len(df)
     columns = list(df.columns)
@@ -106,7 +94,7 @@ def _compute_quality_metrics(
     for root, _, files in os.walk(parquet_path):
         for fname in files:
             size_bytes += os.path.getsize(os.path.join(root, fname))
-            if fname.startswith("part-"):
+            if fname.startswith("part-") or fname.endswith(".parquet"):
                 part_files.append(fname)
 
     date_range = {}
@@ -147,75 +135,62 @@ def _write_quality_json(metrics: dict, out_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_hourly_spine(
-    spark: SparkSession, start_date: str, end_date: str
-) -> DataFrame:
+def build_hourly_spine(start_date: str, end_date: str) -> pd.DataFrame:
     """Generate a contiguous hourly UTC timestamp spine.
 
     Creates one row per hour for the closed interval
-    [start_date 00:00 UTC, end_date 23:00 UTC], providing a complete
-    temporal scaffold. Any missing source data appears as explicit nulls
-    after left-joining.
-
-    Timezone: the Spark session timezone is set to UTC in main() so the
-    ``F.to_timestamp`` calls below produce genuine UTC instants that match
-    the UTC-naive timestamps from the Phase 1/2 ENTSO-E extraction.
+    [start_date 00:00 UTC, end_date 23:00 UTC], with 9 temporal features
+    derived from each timestamp.
     """
     logger.info("Building hourly spine: %s → %s (UTC)", start_date, end_date)
 
-    start_ts = F.to_timestamp(F.lit(f"{start_date} 00:00:00"))
-    end_ts = F.to_timestamp(F.lit(f"{end_date} 23:00:00"))
-
-    spine = spark.range(1).select(
-        F.explode(
-            F.sequence(start_ts, end_ts, F.expr("INTERVAL 1 HOUR"))
-        ).alias("timestamp")
+    timestamps = pd.date_range(
+        start=f"{start_date} 00:00:00",
+        end=f"{end_date} 23:00:00",
+        freq="h",
+        tz=None,  # timezone-naive, represents UTC
     )
 
-    spine = (
-        spine
-        .withColumn("date",         F.to_date("timestamp"))
-        .withColumn("year",         F.year("timestamp"))
-        .withColumn("month",        F.month("timestamp"))
-        .withColumn("day",          F.dayofmonth("timestamp"))
-        .withColumn("hour",         F.hour("timestamp"))
-        .withColumn("day_of_week",  F.dayofweek("timestamp"))
-        .withColumn("is_weekend",   (F.dayofweek("timestamp").isin(1, 7)).cast(T.IntegerType()))
-        .withColumn("day_of_year",  F.dayofyear("timestamp"))
-        .withColumn("week_of_year", F.weekofyear("timestamp"))
-        .withColumn("quarter",      F.quarter("timestamp"))
-    )
+    spine = pd.DataFrame({"timestamp": timestamps})
+    spine["date"] = spine["timestamp"].dt.date
+    spine["year"] = spine["timestamp"].dt.year
+    spine["month"] = spine["timestamp"].dt.month
+    spine["day"] = spine["timestamp"].dt.day
+    spine["hour"] = spine["timestamp"].dt.hour
+    # dayofweek: Monday=0 in pandas; convert to 1=Sunday..7=Saturday
+    spine["day_of_week"] = (spine["timestamp"].dt.dayofweek + 2) % 7
+    spine["day_of_week"] = spine["day_of_week"].replace(0, 7)
+    spine["is_weekend"] = spine["timestamp"].dt.dayofweek.isin([5, 6]).astype(int)
+    spine["day_of_year"] = spine["timestamp"].dt.dayofyear
+    spine["week_of_year"] = spine["timestamp"].dt.isocalendar().week.astype(int)
+    spine["quarter"] = spine["timestamp"].dt.quarter
 
+    logger.info("  Spine: %d hourly rows.", len(spine))
     return spine
 
 
 # ---------------------------------------------------------------------------
-# Join functions — no intermediate .count() calls; stats computed once at end
+# Join functions
 # ---------------------------------------------------------------------------
 
 
-def join_entsoe(spine: DataFrame, p2_entsoe_path: str) -> DataFrame:
-    """Left-join ENTSO-E hourly load onto the timestamp spine.
-
-    ENTSO-E is broadcast-joined: at ~140 k rows × 2 columns (~3 MB
-    serialized), it fits comfortably under the autoBroadcast threshold,
-    but the explicit hint avoids a shuffle if AQE guesses wrong.
-    """
+def join_entsoe(spine: pd.DataFrame, p2_entsoe_path: str) -> pd.DataFrame:
+    """Left-join ENTSO-E hourly load onto the timestamp spine."""
     if not os.path.exists(p2_entsoe_path):
         logger.warning("ENTSO-E P2 not found — column will be null.")
-        return spine.withColumn("entsoe_load_mw", F.lit(None).cast(T.DoubleType()))
+        spine["entsoe_load_mw"] = np.nan
+        return spine
 
-    spark = spine.sparkSession
-    entsoe = spark.read.parquet(p2_entsoe_path).select(
-        F.col("timestamp_utc").alias("timestamp"),
-        "entsoe_load_mw",
-    )
-    logger.info("  Joining ENTSO-E (broadcast).")
-    return spine.join(F.broadcast(entsoe), on="timestamp", how="left")
+    entsoe = pd.read_parquet(p2_entsoe_path, columns=["timestamp_utc", "entsoe_load_mw"])
+    entsoe = entsoe.rename(columns={"timestamp_utc": "timestamp"})
+    # Ensure same dtype for join
+    entsoe["timestamp"] = pd.to_datetime(entsoe["timestamp"])
+    logger.info("  Joining ENTSO-E (%d rows).", len(entsoe))
+    return spine.merge(entsoe, on="timestamp", how="left")
 
 
-def join_viirs(spine: DataFrame, p2_viirs_path: str) -> DataFrame:
-    """Broadcast-left-join VIIRS daily aggregates onto the spine by date."""
+def join_viirs(spine: pd.DataFrame, p2_viirs_path: str) -> pd.DataFrame:
+    """Left-join VIIRS daily aggregates onto the spine by date."""
     viirs_cols = [
         "ntl_mean", "ntl_sum", "ntl_valid_count",
         "ntl_fill_count", "ntl_invalid_count",
@@ -223,33 +198,34 @@ def join_viirs(spine: DataFrame, p2_viirs_path: str) -> DataFrame:
     if not os.path.exists(p2_viirs_path):
         logger.warning("VIIRS P2 not found — columns will be null.")
         for c in viirs_cols:
-            dtype = T.DoubleType() if c in ("ntl_mean", "ntl_sum") else T.IntegerType()
-            spine = spine.withColumn(c, F.lit(None).cast(dtype))
+            spine[c] = np.nan
         return spine
 
-    spark = spine.sparkSession
-    viirs = spark.read.parquet(p2_viirs_path).drop("year")
-    logger.info("  Joining VIIRS daily (broadcast).")
-    return spine.join(F.broadcast(viirs), on="date", how="left")
+    viirs = pd.read_parquet(p2_viirs_path, columns=["date"] + viirs_cols)
+    viirs["date"] = pd.to_datetime(viirs["date"]).dt.date
+    logger.info("  Joining VIIRS daily (%d rows).", len(viirs))
+    return spine.merge(viirs, on="date", how="left")
 
 
-def join_cbs(spine: DataFrame, p2_cbs_path: str) -> DataFrame:
-    """Broadcast-left-join CBS combined (monthly) onto the spine."""
-    cbs_cols = [
-        "cbs_total_energy_price_idx", "cbs_natural_gas_price_idx",
-        "cbs_crude_oil_price_idx", "cbs_electricity_price_idx",
-        "cbs_gdp_million_eur", "cbs_population_million",
-    ]
+def join_cbs(spine: pd.DataFrame, p2_cbs_path: str) -> pd.DataFrame:
+    """Left-join CBS combined (monthly) onto the spine.
+
+    Dynamically discovers all ``cbs_*`` columns from the CBS combined
+    Parquet rather than hardcoding a fixed list.
+    """
     if not os.path.exists(p2_cbs_path):
-        logger.warning("CBS P2 not found — columns will be null.")
-        for c in cbs_cols:
-            spine = spine.withColumn(c, F.lit(None).cast(T.DoubleType()))
+        logger.warning("CBS P2 not found — adding null fallback columns.")
+        for c in [
+            "cbs_gas_total_tax", "cbs_gas_energy_tax",
+            "cbs_elec_total_tax", "cbs_elec_energy_tax",
+            "cbs_gdp_yy", "cbs_population_million",
+        ]:
+            spine[c] = np.nan
         return spine
 
-    spark = spine.sparkSession
-    cbs = spark.read.parquet(p2_cbs_path)
-    logger.info("  Joining CBS combined (broadcast).")
-    return spine.join(F.broadcast(cbs), on=["year", "month"], how="left")
+    cbs = pd.read_parquet(p2_cbs_path)
+    logger.info("  Joining CBS combined (%d rows × %d columns).", len(cbs), len(cbs.columns))
+    return spine.merge(cbs, on=["year", "month"], how="left")
 
 
 # ---------------------------------------------------------------------------
@@ -257,31 +233,63 @@ def join_cbs(spine: DataFrame, p2_cbs_path: str) -> DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _ordered_columns(df: DataFrame) -> list:
+def _ordered_columns(columns: list) -> list:
     """Return columns in a deterministic semantic order.
 
-    Order: timestamp → target → satellite → economic → temporal → internal.
+    Order: timestamp → target → satellite → CBS economic → temporal.
+    Any ``cbs_*`` columns not in the explicit list are appended in sorted
+    order after the known CBS columns, making this forward-compatible with
+    new CBS indicators added in Phase 1.
     """
-    preferred = [
+    existing = set(columns)
+
+    # Explicitly ordered prefix
+    preferred_head = [
         "timestamp",
         # Target
         "entsoe_load_mw",
         # VIIRS aggregates
         "ntl_mean", "ntl_sum",
         "ntl_valid_count", "ntl_fill_count", "ntl_invalid_count",
-        # CBS
-        "cbs_total_energy_price_idx", "cbs_natural_gas_price_idx",
-        "cbs_crude_oil_price_idx", "cbs_electricity_price_idx",
-        "cbs_gdp_million_eur", "cbs_population_million",
-        # Temporal
+        # CBS — energy tariffs (explicit order)
+        "cbs_gas_transport_rate", "cbs_gas_fixed_supply_rate",
+        "cbs_gas_ode_tax", "cbs_gas_energy_tax", "cbs_gas_total_tax",
+        "cbs_elec_transport_rate", "cbs_elec_fixed_supply_rate",
+        "cbs_elec_fixed_supply_rate_dynamic", "cbs_elec_variable_supply_rate_dynamic",
+        "cbs_elec_ode_tax", "cbs_elec_energy_tax", "cbs_elec_total_tax",
+        "cbs_elec_energy_tax_refund",
+        # CBS — GDP headline
+        "cbs_gdp_yy", "cbs_gdp_qq",
+        "cbs_gdp_wda_yy", "cbs_gdp_wda_qq",
+        # CBS — population
+        "cbs_population_million",
+    ]
+
+    # Temporal suffix
+    preferred_tail = [
         "year", "month", "day", "hour",
         "day_of_week", "is_weekend",
         "day_of_year", "week_of_year", "quarter",
-        # Internal join key
-        "date",
     ]
-    existing = set(df.columns)
-    return [c for c in preferred if c in existing]
+
+    used = set()
+    ordered: list[str] = []
+    for c in preferred_head:
+        if c in existing:
+            ordered.append(c)
+            used.add(c)
+
+    # Append any remaining cbs_* columns in sorted order
+    extra_cbs = sorted(c for c in existing if c.startswith("cbs_") and c not in used)
+    ordered.extend(extra_cbs)
+    used.update(extra_cbs)
+
+    for c in preferred_tail:
+        if c in existing and c not in used:
+            ordered.append(c)
+            used.add(c)
+
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -302,21 +310,16 @@ def _parse_args() -> argparse.Namespace:
         help="Spine start date, YYYY-MM-DD (default: 2012-01-01).",
     )
     parser.add_argument(
-        "--end", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        help="Spine end date, YYYY-MM-DD (default: today UTC).",
-    )
-    parser.add_argument(
-        "--workers", type=int, default=os.cpu_count() or 4,
-        help="Number of local Spark executor threads "
-             "(default: all available CPUs).",
-    )
-    parser.add_argument(
-        "--driver-memory", default="64g",
-        help="Spark driver memory in local mode (default: 64g).",
+        "--end", default="2025-12-31",
+        help="Spine end date, YYYY-MM-DD (default: 2025-12-31).",
     )
     parser.add_argument(
         "--force", action="store_true",
         help="Re-run even if the final output already exists.",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="Accepted for CLI compatibility; unused (merge is single-threaded).",
     )
     return parser.parse_args()
 
@@ -329,18 +332,13 @@ def main() -> None:
     out_dir = os.path.join(data_root, "processed")
     out_parquet = os.path.join(out_dir, "nl_hourly_dataset.parquet")
     os.makedirs(out_dir, exist_ok=True)
-    scratch = _scratch_dir()
 
     logger.info("Phase 2 input : %s", p2_dir)
     logger.info("Final output  : %s", out_parquet)
     logger.info("Spine range   : %s → %s", args.start, args.end)
-    logger.info("Workers       : %d (of %d CPUs)",
-                args.workers, os.cpu_count() or 0)
-    logger.info("Driver memory : %s", args.driver_memory)
-    logger.info("Spark scratch : %s", scratch)
     logger.info("Force rerun   : %s", args.force)
 
-    if _stage_done(out_parquet) and not args.force:
+    if _output_done(out_parquet) and not args.force:
         logger.info("Final output already present — nothing to do "
                     "(use --force to re-run).")
         return
@@ -350,121 +348,103 @@ def main() -> None:
 
     t_total = time.time()
 
-    # --- Spark config tuned for a single Snellius node ---
-    # - UTC session timezone: guarantees F.to_timestamp() produces UTC
-    #   instants that match ENTSO-E's UTC-naive timestamps.
-    # - AQE: auto-coalesces shuffle partitions, handles skew.
-    # - spark.local.dir on node-local SSD — shuffle on GPFS is disastrous.
-    # - autoBroadcastJoinThreshold raised to 50 MB so all three source
-    #   tables get auto-broadcast even without explicit hints.
-    spark = (
-        SparkSession.builder
-        .appName("NL_Energy_Phase3")
-        .master(f"local[{args.workers}]")
-        .config("spark.driver.memory", args.driver_memory)
-        .config("spark.local.dir", scratch)
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.adaptive.skewJoin.enabled", "true")
-        .config("spark.sql.shuffle.partitions", str(args.workers * 4))
-        .config("spark.default.parallelism", str(args.workers * 2))
-        .config("spark.sql.autoBroadcastJoinThreshold", str(50 * 1024 * 1024))
-        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-        .config("spark.sql.parquet.compression.codec", "snappy")
-        .config("spark.ui.showConsoleProgress", "false")
-        .getOrCreate()
+    # 1. Build the temporal scaffold
+    df = build_hourly_spine(args.start, args.end)
+
+    # 2. Join sources — all done in-memory with pandas merge.
+    df = join_entsoe(df, os.path.join(p2_dir, "entsoe", "data"))
+    df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_daily", "data"))
+    df = join_cbs(df, os.path.join(p2_dir, "cbs_combined", "data"))
+
+    # 3. Reorder columns, drop internal join key
+    ordered = _ordered_columns(df.columns.tolist())
+    df = df[[c for c in ordered if c != "date"]]
+
+    # 4. Sort by timestamp (should already be sorted, but make sure)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    logger.info("Merged dataset: %d rows × %d columns (%.1f MB in memory).",
+                len(df), len(df.columns),
+                df.memory_usage(deep=True).sum() / (1024 * 1024))
+
+    # 5. Write partitioned by year using PyArrow for efficient I/O
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    os.makedirs(out_parquet, exist_ok=True)
+    pq.write_to_dataset(
+        table,
+        root_path=out_parquet,
+        partition_cols=["year"],
     )
-    spark.sparkContext.setLogLevel("WARN")
+    # Write _SUCCESS marker for idempotency
+    with open(os.path.join(out_parquet, "_SUCCESS"), "w"):
+        pass
+    logger.info("Final dataset written → %s (%.1fs)",
+                out_parquet, time.time() - t_total)
 
-    try:
-        # 1. Build the temporal scaffold (lazy — no count() yet)
-        df = build_hourly_spine(spark, args.start, args.end)
+    # 6. Quality + coverage
+    total = len(df)
+    entsoe_nn = int(df["entsoe_load_mw"].notna().sum())
+    viirs_nn = int(df["ntl_mean"].notna().sum())
+    cbs_energy_nn = int(df["cbs_gas_total_tax"].notna().sum()) if "cbs_gas_total_tax" in df.columns else 0
+    cbs_gdp_nn = int(df["cbs_gdp_yy"].notna().sum()) if "cbs_gdp_yy" in df.columns else 0
+    load = df["entsoe_load_mw"].dropna()
 
-        # 2. Join sources — each is a broadcast join, no shuffle.
-        df = join_entsoe(df, os.path.join(p2_dir, "entsoe", "data"))
-        df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_daily", "data"))
-        df = join_cbs(df, os.path.join(p2_dir, "cbs_combined", "data"))
+    logger.info("Final: %d hourly rows.", total)
+    logger.info(
+        "Coverage — ENTSO-E: %.1f%% | VIIRS: %.1f%% | CBS Tariffs: %.1f%% | CBS GDP: %.1f%%",
+        100 * entsoe_nn / total, 100 * viirs_nn / total,
+        100 * cbs_energy_nn / total, 100 * cbs_gdp_nn / total,
+    )
 
-        # 3. Reorder columns, drop internal join key
-        df = df.select(_ordered_columns(df)).drop("date")
-
-        # 4. Write partitioned by year. Repartitioning by year yields one
-        #    file per year; sorting within partition lets Parquet's
-        #    row-group min/max indexes prune time-range queries downstream.
-        (
-            df.repartition("year")
-              .sortWithinPartitions("timestamp")
-              .write
-              .mode("overwrite")
-              .partitionBy("year")
-              .parquet(out_parquet)
+    # Coverage assertion for the target variable
+    entsoe_pct = entsoe_nn / total if total else 0
+    coverage_warning = None
+    if entsoe_pct < 0.85:
+        coverage_warning = (
+            f"ENTSO-E coverage below 85%: {100 * entsoe_pct:.1f}%"
         )
-        logger.info("Final dataset written → %s", out_parquet)
+        logger.error("%s — check source data.", coverage_warning)
 
-        # 5. Quality + coverage — pandas pass over the written output.
-        #    One read, one set of stats, no extra Spark jobs.
-        result = pd.read_parquet(out_parquet)
-        total = len(result)
-        entsoe_nn = int(result["entsoe_load_mw"].notna().sum())
-        viirs_nn = int(result["ntl_mean"].notna().sum())
-        cbs_nn = int(result["cbs_total_energy_price_idx"].notna().sum())
-        load = result["entsoe_load_mw"].dropna()
-
-        logger.info("Final: %d hourly rows.", total)
-        logger.info(
-            "Coverage — ENTSO-E: %.1f%% | VIIRS: %.1f%% | CBS: %.1f%%",
-            100 * entsoe_nn / total, 100 * viirs_nn / total, 100 * cbs_nn / total,
-        )
-
-        # Coverage assertion for the target variable
-        entsoe_pct = entsoe_nn / total if total else 0
-        coverage_warning = None
-        if entsoe_pct < 0.85:
-            coverage_warning = (
-                f"ENTSO-E coverage below 85%: {100 * entsoe_pct:.1f}%"
-            )
-            logger.error("%s — check source data.", coverage_warning)
-
-        extra = {
-            "spine": {
-                "start": args.start,
-                "end": args.end,
-                "total_hours": total,
+    extra = {
+        "spine": {
+            "start": args.start,
+            "end": args.end,
+            "total_hours": total,
+        },
+        "source_coverage": {
+            "entsoe_load_mw": {
+                "non_null": entsoe_nn,
+                "pct": round(100 * entsoe_nn / total, 2) if total else 0.0,
             },
-            "source_coverage": {
-                "entsoe_load_mw": {
-                    "non_null": entsoe_nn,
-                    "pct": round(100 * entsoe_nn / total, 2) if total else 0.0,
-                },
-                "ntl_mean": {
-                    "non_null": viirs_nn,
-                    "pct": round(100 * viirs_nn / total, 2) if total else 0.0,
-                },
-                "cbs_total_energy_price_idx": {
-                    "non_null": cbs_nn,
-                    "pct": round(100 * cbs_nn / total, 2) if total else 0.0,
-                },
+            "ntl_mean": {
+                "non_null": viirs_nn,
+                "pct": round(100 * viirs_nn / total, 2) if total else 0.0,
             },
-            "load_statistics": {
-                "min_mw": round(float(load.min()), 1) if len(load) else None,
-                "max_mw": round(float(load.max()), 1) if len(load) else None,
-                "mean_mw": round(float(load.mean()), 1) if len(load) else None,
-                "stddev_mw": round(float(load.std()), 1) if len(load) else None,
+            "cbs_gas_total_tax": {
+                "non_null": cbs_energy_nn,
+                "pct": round(100 * cbs_energy_nn / total, 2) if total else 0.0,
             },
-            "stage_elapsed_seconds": round(time.time() - t_total, 1),
-        }
-        if coverage_warning:
-            extra["warnings"] = [coverage_warning]
+            "cbs_gdp_yy": {
+                "non_null": cbs_gdp_nn,
+                "pct": round(100 * cbs_gdp_nn / total, 2) if total else 0.0,
+            },
+        },
+        "load_statistics": {
+            "min_mw": round(float(load.min()), 1) if len(load) else None,
+            "max_mw": round(float(load.max()), 1) if len(load) else None,
+            "mean_mw": round(float(load.mean()), 1) if len(load) else None,
+            "stddev_mw": round(float(load.std()), 1) if len(load) else None,
+        },
+        "stage_elapsed_seconds": round(time.time() - t_total, 1),
+    }
+    if coverage_warning:
+        extra["warnings"] = [coverage_warning]
 
-        metrics = _compute_quality_metrics(
-            out_parquet, "nl_hourly_merged", 3, extra
-        )
-        _write_quality_json(metrics, out_dir)
-        logger.info("=== Phase 3 complete in %.0fs. ===", time.time() - t_total)
-
-    finally:
-        spark.stop()
+    metrics = _compute_quality_metrics(
+        out_parquet, "nl_hourly_merged", 3, extra
+    )
+    _write_quality_json(metrics, out_dir)
+    logger.info("=== Phase 3 complete in %.0fs. ===", time.time() - t_total)
 
 
 if __name__ == "__main__":

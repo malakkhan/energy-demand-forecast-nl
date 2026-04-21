@@ -461,143 +461,391 @@ def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
 
 
 # ---------------------------------------------------------------------------
-# Phase 1B: CBS Energy Prices
+# Phase 1B: CBS Consumer Energy Tariffs (harmonized old + new schema)
 # ---------------------------------------------------------------------------
 
+# Column names for the two CBS consumer‑tariff CSV schemas.  The order must
+# match the semicolon‑delimited columns *after* skipping the 6‑line header.
+_CBS_TARIFF_OLD_COLS = [
+    "period_raw",
+    "gas_transport_rate", "gas_fixed_supply_rate", "gas_variable_delivery",
+    "gas_ode_tax", "gas_energy_tax",
+    "elec_transport_rate", "elec_fixed_supply_rate", "elec_variable_delivery",
+    "elec_ode_tax", "elec_energy_tax", "elec_energy_tax_refund",
+]
+_CBS_TARIFF_NEW_COLS = [
+    "period_raw",
+    "gas_transport_rate", "gas_fixed_supply_rate", "gas_variable_contract",
+    "gas_energy_tax",
+    "elec_transport_rate", "elec_fixed_supply_rate", "elec_variable_contract",
+    "elec_fixed_supply_rate_dynamic", "elec_variable_supply_rate_dynamic",
+    "elec_energy_tax", "elec_energy_tax_refund",
+]
 
-def _parse_cbs_period(period_str: str) -> Optional[Tuple[int, int]]:
-    """Parse a CBS period string into a (year, month) tuple."""
-    s = str(period_str).strip().replace("*", "")
-    if re.fullmatch(r"\d{4}", s):
+_ENGLISH_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june",
+     "july", "august", "september", "october", "november", "december"],
+    start=1,
+)}
+
+
+def _read_cbs_tariff(path: str, colnames: list) -> pd.DataFrame:
+    """Read a CBS semicolon export with 6 header lines and a footer."""
+    df = pd.read_csv(
+        path, sep=";", skiprows=6, header=None, names=colnames,
+        encoding="utf-8-sig", na_values=["", ".", " "],
+        skipfooter=1, engine="python", dtype=str,
+    )
+    df["period_raw"] = df["period_raw"].str.strip()
+    for c in df.columns:
+        if c != "period_raw":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def _parse_tariff_period(raw: str) -> Optional[Tuple[int, Optional[int]]]:
+    """Parse ``'2022 March'``, ``'2026 March*'``, or ``'2025'``.
+
+    Returns ``(year, month)`` for monthly rows, ``(year, None)`` for
+    annual rows, or ``None`` if the label can't be parsed.
+    """
+    s = str(raw).strip().rstrip("*").strip()
+    m = re.fullmatch(r"(\d{4})(?:\s+(\w+))?", s)
+    if not m:
         return None
-    qtr = re.match(r"(\d{4})\s+(\d)(?:st|nd|rd|th)\s+quarter", s, re.I)
-    if qtr:
-        return (int(qtr.group(1)), (int(qtr.group(2)) - 1) * 3 + 1)
-    months = {
-        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
-        "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
-        "november": 11, "december": 12,
-    }
-    mth = re.match(r"(\d{4})\s+([a-zA-Z]+)", s)
-    if mth:
-        m = months.get(mth.group(2).lower())
-        if m:
-            return (int(mth.group(1)), m)
-    return None
+    year = int(m.group(1))
+    month_name = m.group(2)
+    if month_name is None:
+        return (year, None)
+    month = _ENGLISH_MONTHS.get(month_name.lower())
+    return (year, month) if month else None
 
 
 def extract_cbs_energy(cbs_dir: str, out_dir: str) -> None:
-    """Extract CBS energy price CSV to monthly Parquet (pandas only)."""
-    logger.info("=== Phase 1: CBS Energy extraction ===")
-    pattern = os.path.join(cbs_dir, "Energy__consumption*")
-    matches = glob.glob(pattern)
-    if not matches:
-        logger.warning("No CBS energy file found — skipping.")
+    """Harmonize CBS consumer energy tariff tables into monthly Parquet.
+
+    Reads two CBS CSVs — the *old schema* (2018–2023) and the *new schema*
+    (2021+) — and splices them at the 2020/2021 boundary:
+
+    * Old file contributes 2018‑01 through 2020‑12.
+    * New file contributes 2021‑01 onward.
+
+    Design decisions (per the user's analysis):
+
+    * **Variable supply rates dropped** — the methodology break between
+      old 'delivery rate' and new 'contract prices' makes them
+      non‑comparable, so they are excluded from the output.
+    * **ODE levy + energy tax → total_tax** — summed for ≤2022; from 2023
+      CBS merged ODE into the energy‑tax line, so ``energy_tax`` alone is
+      used.
+    * **Dynamic‑contract columns** from the new schema are kept; ``NULL``
+      before 2025‑01 (the product category wasn't separately tracked).
+    * **Annual rows dropped** — downstream joins on ``(year, month)`` so
+      only monthly rows are written.
+    """
+    logger.info("=== Phase 1: CBS Consumer Energy Tariffs extraction ===")
+
+    # ---- locate files (glob for date‑stamped suffixes) ----
+    old_matches = glob.glob(os.path.join(cbs_dir, "Average_energy_prices_for_consumers__2018*"))
+    new_matches = glob.glob(os.path.join(cbs_dir, "Average_energy_prices_for_consumers_2*"))
+    # new_matches may also catch the old file; filter it out
+    new_matches = [p for p in new_matches if "2018" not in os.path.basename(p)]
+
+    if not old_matches and not new_matches:
+        logger.warning("No CBS consumer tariff files found — skipping.")
         return
 
-    filepath = matches[0]
-    logger.info("Reading: %s", filepath)
+    frames = []
 
-    raw = pd.read_csv(filepath, sep=";", header=3, encoding="utf-8",
-                       quotechar='"', dtype=str)
-    id_cols = raw.columns[:3].tolist()
-    period_cols = raw.columns[3:].tolist()
-    raw = raw.rename(columns={
-        id_cols[0]: "metric", id_cols[1]: "commodity", id_cols[2]: "unit",
-    })
+    # ---- old schema: 2018–2020 ----
+    if old_matches:
+        old_path = old_matches[0]
+        logger.info("Reading OLD tariff schema: %s", old_path)
+        old = _read_cbs_tariff(old_path, _CBS_TARIFF_OLD_COLS)
+        # parse periods
+        parsed = old["period_raw"].apply(_parse_tariff_period)
+        old["year"] = parsed.apply(lambda x: x[0] if x else None)
+        old["month"] = parsed.apply(lambda x: x[1] if x else None)
+        old = old.dropna(subset=["year"])
+        old["year"] = old["year"].astype(int)
+        # Keep the full old DataFrame for ODE tax lookup (2021/2022 ODE
+        # values are in the old file but not in the new schema).
+        old_full = old.copy()
+        # For the data contribution, only use ≤2020 from old file
+        old = old[old["year"] <= 2020].copy()
+        frames.append(old)
+        logger.info("  Old schema: %d rows (≤2020).", len(old))
+    else:
+        logger.warning("Old tariff file not found.")
+        old_full = pd.DataFrame()
 
-    price_df = raw[raw["metric"].str.contains("Price index", na=False)].copy()
-    melted = price_df.melt(
-        id_vars=["metric", "commodity", "unit"],
-        value_vars=period_cols, var_name="period", value_name="value",
+    # ---- new schema: 2021+ ----
+    if new_matches:
+        new_path = new_matches[0]
+        logger.info("Reading NEW tariff schema: %s", new_path)
+        new = _read_cbs_tariff(new_path, _CBS_TARIFF_NEW_COLS)
+        parsed = new["period_raw"].apply(_parse_tariff_period)
+        new["year"] = parsed.apply(lambda x: x[0] if x else None)
+        new["month"] = parsed.apply(lambda x: x[1] if x else None)
+        new = new.dropna(subset=["year"])
+        new["year"] = new["year"].astype(int)
+        # Keep only ≥2021 from new file
+        new = new[new["year"] >= 2021].copy()
+
+        # Merge ODE tax from old file into 2021–2022 rows of new file
+        # (ODE was abolished in 2023, so only 2021/2022 need it).
+        if not old_full.empty:
+            old_monthly = old_full[old_full["month"].notna()].copy()
+            old_monthly["month"] = old_monthly["month"].astype(int)
+            ode_cols = old_monthly[["year", "month", "gas_ode_tax", "elec_ode_tax"]].copy()
+            new = new.merge(ode_cols, on=["year", "month"], how="left",
+                            suffixes=("", "_old"))
+        else:
+            new["gas_ode_tax"] = pd.NA
+            new["elec_ode_tax"] = pd.NA
+
+        frames.append(new)
+        logger.info("  New schema: %d rows (≥2021).", len(new))
+    else:
+        logger.warning("New tariff file not found.")
+
+    if not frames:
+        logger.warning("No tariff data parsed — skipping.")
+        return
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    # ---- Drop annual rows (month is None) — we only need monthly ----
+    combined = combined[combined["month"].notna()].copy()
+    combined["month"] = combined["month"].astype(int)
+
+    # ---- Compute continuous total‑tax columns ----
+    #   ≤2022: ODE + energy_tax   |   ≥2023: energy_tax alone (ODE merged)
+    def _total_tax(row: pd.Series, ode_col: str, tax_col: str):
+        tax = row[tax_col]
+        if pd.isna(tax):
+            return pd.NA
+        if row["year"] <= 2022:
+            ode = row.get(ode_col)
+            if pd.isna(ode):
+                return pd.NA
+            return ode + tax
+        return tax
+
+    combined["gas_total_tax"] = combined.apply(
+        lambda r: _total_tax(r, "gas_ode_tax", "gas_energy_tax"), axis=1,
+    )
+    combined["elec_total_tax"] = combined.apply(
+        lambda r: _total_tax(r, "elec_ode_tax", "elec_energy_tax"), axis=1,
     )
 
-    commodity_map = {
-        "Total energy commodities": "total_energy",
-        "Natural gas": "natural_gas",
-        "Crude and petroleum products": "crude_oil",
-        "Electricity": "electricity",
+    # ---- Select and rename output columns (cbs_ prefix) ----
+    output_col_map = {
+        # Gas
+        "gas_transport_rate":                "cbs_gas_transport_rate",
+        "gas_fixed_supply_rate":             "cbs_gas_fixed_supply_rate",
+        "gas_ode_tax":                       "cbs_gas_ode_tax",
+        "gas_energy_tax":                    "cbs_gas_energy_tax",
+        "gas_total_tax":                     "cbs_gas_total_tax",
+        # Electricity
+        "elec_transport_rate":               "cbs_elec_transport_rate",
+        "elec_fixed_supply_rate":            "cbs_elec_fixed_supply_rate",
+        "elec_fixed_supply_rate_dynamic":    "cbs_elec_fixed_supply_rate_dynamic",
+        "elec_variable_supply_rate_dynamic": "cbs_elec_variable_supply_rate_dynamic",
+        "elec_ode_tax":                      "cbs_elec_ode_tax",
+        "elec_energy_tax":                   "cbs_elec_energy_tax",
+        "elec_total_tax":                    "cbs_elec_total_tax",
+        "elec_energy_tax_refund":            "cbs_elec_energy_tax_refund",
     }
-    melted["col_name"] = melted["commodity"].map(commodity_map)
-    melted = melted.dropna(subset=["col_name"])
-    melted["ym"] = melted["period"].apply(_parse_cbs_period)
-    melted = melted.dropna(subset=["ym"])
-    melted["year"] = melted["ym"].apply(lambda x: x[0])
-    melted["month"] = melted["ym"].apply(lambda x: x[1])
-    melted["value"] = pd.to_numeric(melted["value"], errors="coerce")
 
-    pivot = melted.pivot_table(
-        index=["year", "month"], columns="col_name",
-        values="value", aggfunc="mean",
-    ).reset_index()
-    pivot.columns.name = None
+    # Ensure all source columns exist (some may be absent depending on schema)
+    for src in output_col_map:
+        if src not in combined.columns:
+            combined[src] = pd.NA
 
-    expanded_rows = []
-    for _, row in pivot.iterrows():
-        m = int(row["month"])
-        y = int(row["year"])
-        fill_months = [m, m + 1, m + 2] if m in {1, 4, 7, 10} else [m]
-        for em in fill_months:
-            nr = row.copy()
-            nr["month"] = em
-            expanded_rows.append(nr)
-    expanded = pd.DataFrame(expanded_rows)
-    expanded = expanded.drop_duplicates(subset=["year", "month"], keep="first")
-    expanded = expanded.sort_values(["year", "month"]).reset_index(drop=True)
+    combined = combined.rename(columns=output_col_map)
+    out_cols = ["year", "month"] + list(output_col_map.values())
+    result = combined[out_cols].copy()
 
-    rename = {
-        "total_energy": "cbs_total_energy_price_idx",
-        "natural_gas": "cbs_natural_gas_price_idx",
-        "crude_oil": "cbs_crude_oil_price_idx",
-        "electricity": "cbs_electricity_price_idx",
-    }
-    expanded = expanded.rename(columns=rename)
-    expanded["year"] = expanded["year"].astype(int)
-    expanded["month"] = expanded["month"].astype(int)
-    cols = ["year", "month"] + [c for c in expanded.columns if c.startswith("cbs_")]
-    expanded = expanded[cols]
+    result = result.sort_values(["year", "month"]).reset_index(drop=True)
+    result["year"] = result["year"].astype(int)
+    result["month"] = result["month"].astype(int)
 
+    logger.info(
+        "CBS Energy Tariffs: %d monthly rows, %d columns (years %d–%d).",
+        len(result),
+        len([c for c in result.columns if c.startswith("cbs_")]),
+        int(result["year"].min()),
+        int(result["year"].max()),
+    )
+
+    # ---- Write Parquet ----
     os.makedirs(out_dir, exist_ok=True)
     parquet_path = os.path.join(out_dir, "data")
     os.makedirs(parquet_path, exist_ok=True)
-    expanded.to_parquet(os.path.join(parquet_path, "cbs_energy.parquet"),
-                         index=False, engine="pyarrow")
-    logger.info("CBS Energy: %d monthly records → %s", len(expanded), parquet_path)
+    result.to_parquet(
+        os.path.join(parquet_path, "cbs_energy.parquet"),
+        index=False, engine="pyarrow",
+    )
+    logger.info("CBS Energy Tariffs written → %s", parquet_path)
 
     metrics = _compute_parquet_quality(parquet_path, "cbs_energy", 1)
     _write_quality_json(metrics, out_dir)
 
 
 # ---------------------------------------------------------------------------
-# Phase 1C: CBS Macro (GDP + Population)
+# Phase 1C: CBS GDP / Quarterly National Accounts + Population
 # ---------------------------------------------------------------------------
 
+# Mapping from CBS topic strings (pipe-separated hierarchy) to clean
+# snake_case column base names.  Each gets a ``_yy`` and ``_qq`` suffix
+# for year-over-year and quarter-over-quarter volume changes respectively.
+_CBS_GDP_TOPIC_MAP: list[tuple[str, str]] = [
+    ("Disposable for final expenditure|Total", "disposable_total"),
+    ("Disposable for final expenditure|Gross domestic product", "gdp"),
+    ("Disposable for final expenditure|GDP, working days adjusted", "gdp_wda"),
+    ("Disposable for final expenditure|Imports of goods and services|Total", "imports_total"),
+    ("Disposable for final expenditure|Imports of goods and services|Imports of goods", "imports_goods"),
+    ("Disposable for final expenditure|Imports of goods and services|Imports of services", "imports_services"),
+    ("Final expenditure|Total", "final_exp_total"),
+    ("Final expenditure|National final expenditure|Total", "natl_final_exp"),
+    ("Final expenditure|National final expenditure|Final consumption expenditure|Total", "consumption_total"),
+    ("Final expenditure|National final expenditure|Final consumption expenditure|Households including NPISHs", "consumption_hh"),
+    ("Final expenditure|National final expenditure|Final consumption expenditure|General government", "consumption_gov"),
+    ("Final expenditure|National final expenditure|Gross fixed capital formation|Total", "capform_total"),
+    ("Final expenditure|National final expenditure|Gross fixed capital formation|Enterprises and households", "capform_enterprise"),
+    ("Final expenditure|National final expenditure|Gross fixed capital formation|General government", "capform_gov"),
+    ("Final expenditure|National final expenditure|Changes in inventories incl. valuables", "inventories"),
+    ("Final expenditure|Exports of goods and services|Total", "exports_total"),
+    ("Final expenditure|Exports of goods and services|Exports of goods", "exports_goods"),
+    ("Final expenditure|Exports of goods and services|Exports of services", "exports_services"),
+]
 
-def extract_cbs_macro(cbs_dir: str, out_dir: str) -> None:
-    """Extract CBS GDP and population CSVs into annual Parquet (pandas only)."""
-    logger.info("=== Phase 1: CBS Macro extraction ===")
+# Quarter number → first month of that quarter (for forward-fill)
+_QUARTER_TO_MONTHS = {1: [1, 2, 3], 2: [4, 5, 6], 3: [7, 8, 9], 4: [10, 11, 12]}
 
-    # GDP
-    gdp_path = os.path.join(cbs_dir, "table__84087ENG.csv")
-    if os.path.exists(gdp_path):
-        raw_gdp = pd.read_csv(gdp_path, sep=",", quotechar='"', dtype=str)
-        raw_gdp = raw_gdp[~raw_gdp.iloc[:, 0].str.startswith("Bron", na=True)]
-        raw_gdp["year"] = raw_gdp.iloc[:, 0].str.extract(r"(\d{4})").astype(int)
-        gdp_col = [c for c in raw_gdp.columns if "Gross domestic product" in c]
-        if gdp_col:
-            raw_gdp["gdp_million_eur"] = pd.to_numeric(
-                raw_gdp[gdp_col[0]].str.replace(".", "", regex=False)
-                                    .str.replace(",", ".", regex=False),
-                errors="coerce",
-            )
-        else:
-            raw_gdp["gdp_million_eur"] = float("nan")
-        gdp_df = raw_gdp[["year", "gdp_million_eur"]].dropna(subset=["year"])
-    else:
-        logger.warning("GDP file not found: %s", gdp_path)
-        gdp_df = pd.DataFrame(columns=["year", "gdp_million_eur"])
 
-    # Population
+def _match_topic(topic_str: str) -> Optional[str]:
+    """Match a raw CBS topic string to its clean column base name."""
+    for suffix, col_name in _CBS_GDP_TOPIC_MAP:
+        if topic_str.strip().endswith(suffix):
+            return col_name
+    return None
+
+
+def _parse_cbs_quarter_period(period_str: str) -> Optional[Tuple[int, int]]:
+    """Parse a CBS period string into ``(year, quarter)`` or ``None``.
+
+    Accepts formats like ``"2015 1st quarter"``, ``"2023 3rd quarter*"``.
+    Annual-only periods (``"2015"``, ``"2024*"``) return ``None`` because
+    the quarterly values already cover the full year.
+    """
+    s = str(period_str).strip().replace("*", "")
+    m = re.match(r"(\d{4})\s+(\d)(?:st|nd|rd|th)\s+quarter", s, re.I)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def extract_cbs_gdp(cbs_dir: str, out_dir: str) -> None:
+    """Extract CBS Quarterly National Accounts + Population into monthly Parquet.
+
+    Reads the wide-format CBS GDP CSV containing 18 economic indicators at
+    quarterly resolution, with two metric types each (year-over-year volume
+    change and quarter-over-quarter volume change).  Quarterly values are
+    forward-filled to monthly granularity (Q1 → Jan/Feb/Mar, etc.) so they
+    align with the monthly CBS energy prices in Phase 2.
+
+    Population data from a separate CSV is merged as an annual column,
+    forward-filled across all 12 months of each year.
+    """
+    logger.info("=== Phase 1: CBS GDP / Quarterly National Accounts extraction ===")
+
+    # --- Locate the GDP file (glob for the varying date suffix) ---
+    gdp_pattern = os.path.join(cbs_dir, "GDP__output_and_expenditures__changes__*")
+    gdp_matches = glob.glob(gdp_pattern)
+    if not gdp_matches:
+        logger.warning("No CBS GDP file found matching %s — skipping.", gdp_pattern)
+        return
+
+    gdp_path = gdp_matches[0]
+    logger.info("Reading CBS GDP: %s", gdp_path)
+
+    # The CSV has 4 header rows above the data header.  Row index 4
+    # (0-based) contains "Topic ; Periods ; <period1> ; <period2> ; ..."
+    raw = pd.read_csv(
+        gdp_path, sep=";", header=4, encoding="utf-8",
+        quotechar='"', dtype=str,
+    )
+    # Drop the footer row ("Source: CBS")
+    raw = raw[~raw.iloc[:, 0].astype(str).str.startswith("Source", na=True)]
+
+    topic_col = raw.columns[0]   # "Topic"
+    # unit_col  = raw.columns[1]   # "Periods" (actually contains the unit)
+    period_cols = raw.columns[2:].tolist()
+
+    # The period columns are split into two halves of equal size:
+    # first half = year-over-year (y/y), second half = quarter-over-quarter (q/q).
+    n_periods = len(period_cols) // 2
+    yy_period_cols = period_cols[:n_periods]
+    qq_period_cols = period_cols[n_periods:]
+
+    # Build a clean period label list from the y/y half (both halves share
+    # the same period labels, pandas just suffixes the duplicates with ".1").
+    yy_labels = [str(c).split(".")[0].strip() for c in yy_period_cols]
+
+    # --- Parse each indicator row × each metric type → long format ---
+    records: list[dict] = []
+
+    for _, row in raw.iterrows():
+        topic_raw = str(row[topic_col]).strip()
+        col_base = _match_topic(topic_raw)
+        if col_base is None:
+            continue
+
+        for metric_suffix, cols in [("_yy", yy_period_cols), ("_qq", qq_period_cols)]:
+            col_name = f"cbs_{col_base}{metric_suffix}"
+            for pcol, label in zip(cols, yy_labels):
+                parsed = _parse_cbs_quarter_period(label)
+                if parsed is None:
+                    continue  # skip annual-total columns
+                year, quarter = parsed
+                val = pd.to_numeric(
+                    str(row[pcol]).strip().replace(",", "."),
+                    errors="coerce",
+                )
+                # Forward-fill: each quarterly value fills 3 months.
+                for month in _QUARTER_TO_MONTHS[quarter]:
+                    records.append({
+                        "year": year,
+                        "month": month,
+                        "column": col_name,
+                        "value": val,
+                    })
+
+    if not records:
+        logger.warning("No quarterly records parsed from CBS GDP file.")
+        return
+
+    long_df = pd.DataFrame(records)
+
+    # Pivot: one row per (year, month), one column per indicator.
+    pivot = long_df.pivot_table(
+        index=["year", "month"], columns="column",
+        values="value", aggfunc="first",
+    ).reset_index()
+    pivot.columns.name = None
+    pivot = pivot.sort_values(["year", "month"]).reset_index(drop=True)
+
+    logger.info(
+        "CBS GDP: %d monthly rows × %d indicator columns (years %d–%d).",
+        len(pivot),
+        len([c for c in pivot.columns if c.startswith("cbs_")]),
+        int(pivot["year"].min()),
+        int(pivot["year"].max()),
+    )
+
+    # --- Population (from separate CSV, annual → forward-filled monthly) ---
     pop_path = os.path.join(cbs_dir, "Population (x million).csv")
     if os.path.exists(pop_path):
         raw_pop = pd.read_csv(pop_path, sep=";", quotechar='"', dtype=str)
@@ -606,32 +854,38 @@ def extract_cbs_macro(cbs_dir: str, out_dir: str) -> None:
         pop_col = [c for c in raw_pop.columns if "pop" in c.lower() or "bev" in c.lower()]
         if year_col and pop_col:
             raw_pop["year"] = pd.to_numeric(raw_pop[year_col[0]], errors="coerce")
-            raw_pop["population_million"] = pd.to_numeric(
+            raw_pop["cbs_population_million"] = pd.to_numeric(
                 raw_pop[pop_col[0]].str.replace(",", ".", regex=False), errors="coerce",
             )
         else:
             raw_pop["year"] = pd.to_numeric(raw_pop.iloc[:, 0], errors="coerce")
-            raw_pop["population_million"] = pd.to_numeric(
+            raw_pop["cbs_population_million"] = pd.to_numeric(
                 raw_pop.iloc[:, 1].astype(str).str.replace(",", ".", regex=False),
                 errors="coerce",
             )
-        pop_df = raw_pop[["year", "population_million"]].dropna(subset=["year"])
+        pop_df = raw_pop[["year", "cbs_population_million"]].dropna(subset=["year"])
         pop_df["year"] = pop_df["year"].astype(int)
+
+        # Merge annual population onto the monthly GDP table.
+        pivot = pd.merge(pivot, pop_df, on="year", how="left")
+        logger.info("Population merged (%d annual records).", len(pop_df))
     else:
         logger.warning("Population file not found: %s", pop_path)
-        pop_df = pd.DataFrame(columns=["year", "population_million"])
 
-    merged = pd.merge(gdp_df, pop_df, on="year", how="outer").sort_values("year")
-    merged["year"] = merged["year"].astype(int)
+    # --- Write output ---
+    pivot["year"] = pivot["year"].astype(int)
+    pivot["month"] = pivot["month"].astype(int)
 
     os.makedirs(out_dir, exist_ok=True)
     parquet_path = os.path.join(out_dir, "data")
     os.makedirs(parquet_path, exist_ok=True)
-    merged.to_parquet(os.path.join(parquet_path, "cbs_macro.parquet"),
-                       index=False, engine="pyarrow")
-    logger.info("CBS Macro: %d annual records → %s", len(merged), parquet_path)
+    pivot.to_parquet(
+        os.path.join(parquet_path, "cbs_gdp.parquet"),
+        index=False, engine="pyarrow",
+    )
+    logger.info("CBS GDP: %d monthly records → %s", len(pivot), parquet_path)
 
-    metrics = _compute_parquet_quality(parquet_path, "cbs_macro", 1)
+    metrics = _compute_parquet_quality(parquet_path, "cbs_gdp", 1)
     _write_quality_json(metrics, out_dir)
 
 
@@ -647,7 +901,9 @@ def _read_entsoe_long(filepath: str) -> pd.DataFrame:
     for sheet in xl.sheet_names:
         try:
             df = xl.parse(sheet)
-        except Exception:
+        except Exception as exc:
+            logger.warning("  Could not parse sheet %r in %s: %s",
+                           sheet, os.path.basename(filepath), exc)
             continue
         if "CountryCode" not in df.columns or "DateUTC" not in df.columns:
             continue
@@ -655,7 +911,14 @@ def _read_entsoe_long(filepath: str) -> pd.DataFrame:
         if nl.empty:
             continue
         nl["timestamp_utc"] = pd.to_datetime(nl["DateUTC"], utc=True, errors="coerce")
-        val_col = "Value" if nl["Value"].notna().any() else "Value_ScaleTo100"
+        if "Value" in nl.columns and nl["Value"].notna().any():
+            val_col = "Value"
+        elif "Value_ScaleTo100" in nl.columns:
+            val_col = "Value_ScaleTo100"
+        else:
+            logger.warning("  No value column found in sheet %r of %s — skipping sheet.",
+                           sheet, os.path.basename(filepath))
+            continue
         nl["entsoe_load_mw"] = pd.to_numeric(nl[val_col], errors="coerce")
         frames.append(nl[["timestamp_utc", "entsoe_load_mw"]])
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
@@ -663,14 +926,16 @@ def _read_entsoe_long(filepath: str) -> pd.DataFrame:
     )
 
 
-def _read_entsoe_wide(filepath: str) -> pd.DataFrame:
+def _read_entsoe_wide(filepath: str, header_row: int = 3) -> pd.DataFrame:
     """Read legacy ENTSO-E XLSX (wide format, 2006–2015)."""
     xl = pd.ExcelFile(filepath)
     frames = []
     for sheet in xl.sheet_names:
         try:
-            raw = xl.parse(sheet, header=2)
-        except Exception:
+            raw = xl.parse(sheet, header=header_row)
+        except Exception as exc:
+            logger.warning("  Could not parse sheet %r in %s: %s",
+                           sheet, os.path.basename(filepath), exc)
             continue
         raw.columns = [str(c).strip() for c in raw.columns]
         if "Country" not in raw.columns:
@@ -678,7 +943,7 @@ def _read_entsoe_wide(filepath: str) -> pd.DataFrame:
         nl = raw[raw["Country"].astype(str).str.strip() == _NL_COUNTRY_CODE].copy()
         if nl.empty:
             continue
-        hour_cols = [c for c in nl.columns if re.fullmatch(r"\d+\.0", c)]
+        hour_cols = [c for c in nl.columns if re.fullmatch(r"\d+(?:\.0)?", c)]
         if not hour_cols:
             continue
         id_vars = [c for c in ["Country", "Year", "Month", "Day"] if c in nl.columns]
@@ -702,21 +967,35 @@ def _read_entsoe_wide(filepath: str) -> pd.DataFrame:
 
 
 def _read_one_entsoe_file(fpath: str) -> pd.DataFrame:
-    """Dispatch to wide/long reader based on the first sheet's columns."""
+    """Dispatch to wide/long reader based on the first sheet's columns.
+
+    The legacy 2006–2015 file has 3 metadata header rows before the real
+    column names, so the probe tries multiple header offsets to find the
+    ``Country`` column that identifies the wide format.
+    """
     try:
         xl = pd.ExcelFile(fpath)
-        probe = xl.parse(xl.sheet_names[0], nrows=5)
-        cols = [str(c).strip() for c in probe.columns]
+        sheet = xl.sheet_names[0]
+        # Try header offsets 0–4 to detect the wide-format signature.
+        is_wide = False
+        for h in range(5):
+            probe = xl.parse(sheet, header=h, nrows=2)
+            cols = [str(c).strip() for c in probe.columns]
+            if "Country" in cols and any(re.fullmatch(r"\d+(?:\.0)?", c) for c in cols):
+                is_wide = True
+                break
     except Exception as exc:
         logger.warning("  Could not probe %s: %s", os.path.basename(fpath), exc)
         return pd.DataFrame(columns=["timestamp_utc", "entsoe_load_mw"])
 
-    if "Country" in cols and any(re.fullmatch(r"\d+\.0", c) for c in cols):
-        df = _read_entsoe_wide(fpath)
+    if is_wide:
+        df = _read_entsoe_wide(fpath, header_row=h)
     else:
         df = _read_entsoe_long(fpath)
     if not df.empty:
         logger.info("  %s → %d NL rows.", os.path.basename(fpath), len(df))
+    else:
+        logger.warning("  %s returned 0 NL rows.", os.path.basename(fpath))
     return df
 
 
@@ -770,9 +1049,14 @@ def extract_entsoe(entsoe_dir: str, out_dir: str, workers: int = 1) -> None:
     for year, group in combined.groupby("year"):
         year_dir = os.path.join(data_dir, f"year={year}")
         os.makedirs(year_dir, exist_ok=True)
-        group.drop(columns=["year"]).to_parquet(
-            os.path.join(year_dir, "entsoe.parquet"),
-            index=False, engine="pyarrow",
+        tbl = pa.Table.from_pandas(
+            group.drop(columns=["year"]), preserve_index=False
+        )
+        pq.write_table(
+            tbl, os.path.join(year_dir, "entsoe.parquet"),
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
         )
 
     extra = {
@@ -851,9 +1135,9 @@ def main() -> None:
         os.path.join(data_root, "cbs"),
         os.path.join(p1_dir, "cbs_energy"),
     )
-    extract_cbs_macro(
+    extract_cbs_gdp(
         os.path.join(data_root, "cbs"),
-        os.path.join(p1_dir, "cbs_macro"),
+        os.path.join(p1_dir, "cbs_gdp"),
     )
     extract_entsoe(
         os.path.join(data_root, "entso-e"),
