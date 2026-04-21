@@ -1045,7 +1045,163 @@ def extract_cbs_cpi(cbs_dir: str, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1E: ENTSO-E Load
+# Phase 1E: CBS Gas & Electricity Prices (semi-annual GEP)
+# ---------------------------------------------------------------------------
+
+# Maps the raw CBS component label (lowercase) to the short tag used in column names.
+_GEP_COMPONENT_MAP = {
+    "total price":   "total",
+    "supply price":  "supply",
+    "network price": "network",
+}
+
+# Maps semester number to the calendar months it covers.
+_SEMESTER_TO_MONTHS = {1: [1, 2, 3, 4, 5, 6], 2: [7, 8, 9, 10, 11, 12]}
+
+# Ordered list of value-column short names matching the CSV column order.
+_GEP_VALUE_COLS = [
+    "gas_hh", "gas_nnh_med", "gas_nnh_lrg",
+    "elec_hh", "elec_nnh_med", "elec_nnh_lrg",
+]
+
+
+def _parse_gep_period(raw: str) -> Optional[Tuple[int, int]]:
+    """Parse a CBS GEP period string into ``(year, semester)`` or ``None``.
+
+    Accepts ``"2009 1st semester"`` or ``"2025 2nd semester*"``.
+    Annual-only rows like ``"2009"`` return ``None`` and are dropped.
+    """
+    s = str(raw).strip().rstrip("*").strip()
+    m = re.match(r"^(\d{4})\s+(\d)(?:st|nd|rd|th)\s+semester", s, re.I)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def extract_cbs_gep(cbs_dir: str, out_dir: str) -> None:
+    """Extract CBS Gas & Electricity Prices (semi-annual) into monthly Parquet.
+
+    Reads the CBS ``Prices of natural gas and electricity`` file, which
+    contains semi-annual prices for six consumption-band segments across
+    three price components:
+
+    * **Total price** — combined supply + network tariff (incl. VAT/taxes).
+    * **Supply price** — commodity and supply charges only.
+    * **Network price** — distribution/transport tariff only.
+
+    Six consumption bands:
+
+    * ``gas_hh``       — gas household (569–5 687 m³/yr)
+    * ``gas_nnh_med``  — gas non-household medium (28 433–284 333 m³/yr)
+    * ``gas_nnh_lrg``  — gas non-household large (≥28 433 324 m³/yr)
+    * ``elec_hh``      — electricity household (2.5–5 MWh/yr)
+    * ``elec_nnh_med`` — electricity non-household medium (500–2 000 MWh/yr)
+    * ``elec_nnh_lrg`` — electricity non-household large (≥150 000 MWh/yr)
+
+    The file is semi-annual (H1 = Jan–Jun, H2 = Jul–Dec).  Each semester is
+    expanded to six monthly rows so the output aligns with all other CBS
+    monthly sources.  Annual-average rows (one per year) are dropped.
+
+    Produces 18 ``cbs_gep_{band}_{component}`` columns.
+    Coverage: H1 2009 – H2 2025 (~204 monthly rows).
+    """
+    logger.info("=== Phase 1: CBS Gas & Electricity Prices (GEP) extraction ===")
+
+    gep_matches = glob.glob(
+        os.path.join(cbs_dir, "Prices_of_natural_gas_and_electricity_*")
+    )
+    if not gep_matches:
+        logger.warning("No CBS GEP file found in %s — skipping.", cbs_dir)
+        return
+
+    path = gep_matches[0]
+    logger.info("Reading CBS GEP: %s", path)
+
+    # 5-line header: title · VAT note · blank topic row · band labels · units
+    colnames = ["period_raw", "component"] + _GEP_VALUE_COLS
+    df = pd.read_csv(
+        path, sep=";", skiprows=5, header=None, names=colnames,
+        encoding="utf-8-sig", skipfooter=1, engine="python", dtype=str,
+    )
+
+    df["period_raw"] = df["period_raw"].str.strip()
+    df["component"] = df["component"].str.strip()
+
+    # Parse semi-annual periods; drop annual rows (None)
+    parsed = df["period_raw"].apply(_parse_gep_period)
+    df["year"] = parsed.apply(lambda x: x[0] if x else None)
+    df["semester"] = parsed.apply(lambda x: x[1] if x else None)
+    df = df.dropna(subset=["year", "semester"]).copy()
+    df["year"] = df["year"].astype(int)
+    df["semester"] = df["semester"].astype(int)
+
+    # Normalise component label → "total" / "supply" / "network"
+    df["component"] = df["component"].str.lower().map(_GEP_COMPONENT_MAP)
+    df = df.dropna(subset=["component"]).copy()
+
+    # Convert value columns to float (decimal point, strip trailing asterisks)
+    for col in _GEP_VALUE_COLS:
+        df[col] = (
+            df[col].str.strip().str.rstrip("*")
+            .pipe(pd.to_numeric, errors="coerce")
+        )
+
+    # Melt bands into long format then construct the final column name
+    long = df.melt(
+        id_vars=["year", "semester", "component"],
+        value_vars=_GEP_VALUE_COLS,
+        var_name="band",
+        value_name="price",
+    )
+    long["col_name"] = "cbs_gep_" + long["band"] + "_" + long["component"]
+
+    # Pivot: one row per (year, semester), one column per cbs_gep_*
+    pivot = long.pivot_table(
+        index=["year", "semester"],
+        columns="col_name",
+        values="price",
+        aggfunc="first",
+    ).reset_index()
+    pivot.columns.name = None
+
+    # Expand each semester to six monthly rows
+    gep_cols_found = sorted([c for c in pivot.columns if c.startswith("cbs_gep_")])
+    records = []
+    for _, row in pivot.iterrows():
+        for month in _SEMESTER_TO_MONTHS[int(row["semester"])]:
+            rec = {"year": int(row["year"]), "month": month}
+            for col in gep_cols_found:
+                rec[col] = row[col]
+            records.append(rec)
+
+    result = (
+        pd.DataFrame(records)
+        .sort_values(["year", "month"])
+        .reset_index(drop=True)
+    )
+    result = result[["year", "month"] + gep_cols_found]
+
+    logger.info(
+        "CBS GEP: %d monthly rows, %d price columns (years %d–%d).",
+        len(result), len(gep_cols_found),
+        int(result["year"].min()), int(result["year"].max()),
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+    parquet_path = os.path.join(out_dir, "data")
+    os.makedirs(parquet_path, exist_ok=True)
+    result.to_parquet(
+        os.path.join(parquet_path, "cbs_gep.parquet"),
+        index=False, engine="pyarrow",
+    )
+    logger.info("CBS GEP written → %s", parquet_path)
+
+    metrics = _compute_parquet_quality(parquet_path, "cbs_gep", 1)
+    _write_quality_json(metrics, out_dir)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1F: ENTSO-E Load
 # ---------------------------------------------------------------------------
 
 
@@ -1156,7 +1312,7 @@ def _read_one_entsoe_file(fpath: str) -> pd.DataFrame:
 
 def extract_entsoe(entsoe_dir: str, out_dir: str, workers: int = 1) -> None:
     """Extract ENTSO-E XLSX files to deduplicated hourly NL Parquet."""
-    logger.info("=== Phase 1: ENTSO-E extraction ===")
+    logger.info("=== Phase 1F: ENTSO-E extraction ===")
     xlsx_files = sorted(glob.glob(os.path.join(entsoe_dir, "*.xlsx")))
     if not xlsx_files:
         logger.warning("No XLSX files found — skipping.")
@@ -1231,12 +1387,22 @@ def extract_entsoe(entsoe_dir: str, out_dir: str, workers: int = 1) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
+    # Default out-root: <repo_root>/data — two directories up from src/pipeline/
+    _default_out_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data",
+    )
     parser = argparse.ArgumentParser(
         description="Phase 1: Extract raw sources to Parquet (multiprocessing)."
     )
     parser.add_argument(
         "--data-root", default="/projects/prjs2061/data",
-        help="Root data directory.",
+        help="Root directory for raw input data (VIIRS HDF5, CBS CSVs, ENTSO-E XLSXs).",
+    )
+    parser.add_argument(
+        "--out-root", default=_default_out_root,
+        help="Root directory for pipeline output data (processing_1/, etc.). "
+             "Defaults to <repo>/data/ relative to this script.",
     )
     parser.add_argument(
         "--workers", type=int, default=os.cpu_count() or 4,
@@ -1267,12 +1433,14 @@ def main() -> None:
     except RuntimeError:
         pass  # already set; harmless
 
-    data_root = args.data_root
-    p1_dir = os.path.join(data_root, "processing_1")
+    data_root = args.data_root   # raw input data (VIIRS, CBS, ENTSO-E)
+    out_root = args.out_root     # pipeline output data (inside repo)
+    p1_dir = os.path.join(out_root, "processing_1")
     workers = args.workers
 
-    logger.info("Data root     : %s", data_root)
-    logger.info("Output        : %s", p1_dir)
+    logger.info("Raw data root : %s", data_root)
+    logger.info("Output root   : %s", out_root)
+    logger.info("Phase 1 output: %s", p1_dir)
     logger.info("Workers       : %d (of %d available CPUs)",
                 workers, os.cpu_count() or 0)
     logger.info("Start method  : %s", args.start_method)
@@ -1305,6 +1473,10 @@ def main() -> None:
     extract_cbs_cpi(
         os.path.join(data_root, "cbs"),
         os.path.join(p1_dir, "cbs_cpi"),
+    )
+    extract_cbs_gep(
+        os.path.join(data_root, "cbs"),
+        os.path.join(p1_dir, "cbs_gep"),
     )
     extract_entsoe(
         os.path.join(data_root, "entso-e"),

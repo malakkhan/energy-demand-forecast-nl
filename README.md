@@ -1,6 +1,6 @@
 # Energy Demand Forecast — Netherlands
 
-A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests both VIIRS VNP46A1 (at-sensor raw radiance) and VNP46A2 (gap-filled BRDF-corrected NTL) satellite nighttime-lights imagery, CBS consumer energy tariffs and quarterly economic statistics, and ENTSO-E electricity load data, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
+A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests both VIIRS VNP46A1 (at-sensor raw radiance) and VNP46A2 (gap-filled BRDF-corrected NTL) satellite nighttime-lights imagery, CBS consumer energy tariffs, CBS Consumer Price Index, CBS gas and electricity prices by consumption band, CBS quarterly economic statistics, and ENTSO-E electricity load data, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
 
 ---
 
@@ -159,6 +159,7 @@ The CBS and ENTSO-E source files are downloaded manually from their respective p
 | **CBS Consumer Tariffs (old)** | `data/cbs/Average_energy_prices_for_consumers__2018*.csv` | Semicolon CSV, 6-line header | Old schema 2018–2023 |
 | **CBS Consumer Tariffs (new)** | `data/cbs/Average_energy_prices_for_consumers_2*.csv` | Semicolon CSV, 6-line header | New schema 2021+ |
 | **CBS Consumer Price Index** | `data/cbs/Consumentenprijzen__prijsindex_2015_100__*.csv` | Semicolon CSV, Dutch, 6-line header | CPI 2015=100 for energy/electricity/gas, monthly 1996–2025 |
+| **CBS Gas & Electricity Prices** | `data/cbs/Prices_of_natural_gas_and_electricity_*.csv` | Semicolon CSV, 5-line header, long format | Semi-annual: 6 consumption bands × 3 price components, 2009–2025 |
 | **CBS GDP Quarterly** | `data/cbs/GDP__output_and_expenditures__changes__*.csv` | Semicolon CSV, 4-line header | Wide-format: 18 indicators × 2 metrics, quarterly 1995–2025 |
 | **CBS Population** | `data/cbs/Population (x million).csv` | Semicolon CSV | Annual population in millions |
 | **ENTSO-E Load** | `data/entso-e/*.xlsx` | Excel workbooks | Wide format (2006–2015) + long format (2015+) |
@@ -185,7 +186,7 @@ data/entso-e/*.xlsx ─┘    (Extract)     (source-level           (Aggregate) 
 
 **Script:** `phase1_extract.py`
 
-Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **six sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + ENTSO-E):
+Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **seven sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + CBS GEP + ENTSO-E):
 
 #### 1A: VIIRS A2 and A1 Extraction
 
@@ -304,7 +305,31 @@ Reads the CBS CPI file (`Consumentenprijzen; prijsindex 2015=100`) and extracts 
 | `cbs_cpi_electricity` | `float64` | Electricity CPI (2015 = 100) |
 | `cbs_cpi_gas` | `float64` | Gas CPI (2015 = 100) |
 
-#### 1E: ENTSO-E Load Extraction
+#### 1E: CBS Gas & Electricity Prices (GEP)
+
+Reads the CBS "Prices of natural gas and electricity" CSV and extracts semi-annual prices for six consumption-band segments across three price components (total/supply/network), all including VAT and taxes.
+
+**Six consumption bands:**
+
+| Band tag | Segment | Unit |
+|---|---|---|
+| `gas_hh` | Gas household (569–5 687 m³/yr) | €/m³ |
+| `gas_nnh_med` | Gas non-household medium (28 433–284 333 m³/yr) | €/m³ |
+| `gas_nnh_lrg` | Gas non-household large (≥28 433 324 m³/yr) | €/m³ |
+| `elec_hh` | Electricity household (2.5–5 MWh/yr) | €/kWh |
+| `elec_nnh_med` | Electricity non-household medium (500–2 000 MWh/yr) | €/kWh |
+| `elec_nnh_lrg` | Electricity non-household large (≥150 000 MWh/yr) | €/kWh |
+
+**Parsing logic.** The file is in long format with 3 rows per period (Total/Supply/Network price). Each semester period is expanded to 6 monthly rows (H1→Jan–Jun, H2→Jul–Dec). Annual-average rows are dropped.
+
+**Output schema** — `data/processing_1/cbs_gep/data/cbs_gep.parquet` (~204 monthly rows × 20 columns):
+
+- `year`, `month` — temporal keys
+- 18 columns named `cbs_gep_{band}_{component}` where `component` ∈ `{total, supply, network}` — e.g. `cbs_gep_gas_hh_total`, `cbs_gep_elec_hh_supply`
+
+Coverage: H1 2009 – H2 2025.
+
+#### 1F: ENTSO-E Load Extraction
 
 Reads ENTSO-E Excel workbooks (both legacy wide format and modern long format), filters to Netherlands (`NL`), deduplicates to hourly resolution, and writes year-partitioned Parquet.
 
@@ -359,7 +384,7 @@ The same `aggregate_viirs()` function (parameterised by `product`) is run for bo
 
 #### 2B: CBS Combined
 
-Outer-joins all three CBS monthly sources on `(year, month)` via a broadcast-join loop. The result spans 1996–2026 with source-appropriate nulls outside each source's coverage window.
+Outer-joins all four CBS monthly sources on `(year, month)` via a broadcast-join loop. The result spans 1996–2026 with source-appropriate nulls outside each source's coverage window.
 
 **Output schema** — `data/processing_2/cbs_combined/data/part-*.parquet`:
 
@@ -368,6 +393,7 @@ Outer-joins all three CBS monthly sources on `(year, month)` via a broadcast-joi
 | CBS Energy | 13 `cbs_gas_*` / `cbs_elec_*` tariff columns | 2018–2026 |
 | CBS GDP | 35 `cbs_*_yy` / `cbs_*_qq` indicator columns + `cbs_population_million` | 1996–2025 |
 | CBS CPI | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` | 1996–2025 |
+| CBS GEP | 18 `cbs_gep_{band}_{component}` price columns | 2009–2025 |
 
 #### 2C: ENTSO-E Pass-through
 
@@ -415,7 +441,7 @@ All source tables are small enough to be broadcast; no shuffles occur.
 
 **Final output** — `data/processed/nl_hourly_dataset.parquet/year=YYYY/part-*.parquet`:
 
-The final dataset contains ~73 columns. Column ordering is deterministic:
+The final dataset contains ~91 columns. Column ordering is deterministic:
 
 1. `timestamp` — hourly UTC timestamp (primary key)
 2. `entsoe_load_mw` — **target variable** (electricity load in MW)
@@ -425,10 +451,10 @@ The final dataset contains ~73 columns. Column ordering is deterministic:
 6. CBS electricity tariff columns (8 columns: transport rate, fixed supply rate, dynamic rates, ODE tax, energy tax, total tax, tax refund)
 7. CBS GDP headline indicators (`cbs_gdp_yy`, `cbs_gdp_qq`, `cbs_gdp_wda_yy`, `cbs_gdp_wda_qq`)
 8. CBS population (`cbs_population_million`)
-9. All remaining `cbs_*` columns in sorted order — includes `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` and any future indicators (forward-compatible)
+9. All remaining `cbs_*` columns in sorted order — includes `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas`, all 18 `cbs_gep_*` price columns, and any future indicators (forward-compatible)
 10. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
 
-**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, and CBS GDP, and writes them all to `data_quality.json`.
+**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, CBS GDP, CBS CPI, and CBS GEP, and writes them all to `data_quality.json`.
 
 #### CLI Options
 
@@ -549,6 +575,7 @@ cat /projects/prjs2061/data/processing_1/viirs_a1/data_quality.json
 cat /projects/prjs2061/data/processing_1/cbs_energy/data_quality.json
 cat /projects/prjs2061/data/processing_1/cbs_gdp/data_quality.json
 cat /projects/prjs2061/data/processing_1/cbs_cpi/data_quality.json
+cat /projects/prjs2061/data/processing_1/cbs_gep/data_quality.json
 cat /projects/prjs2061/data/processing_1/entsoe/data_quality.json
 
 # Phase 2 quality reports
@@ -600,6 +627,8 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 ├── cbs/                                  # CBS CSV source files
 │   ├── Average_energy_prices_for_consumers__2018*.csv   # Old tariff schema
 │   ├── Average_energy_prices_for_consumers_2*.csv       # New tariff schema
+│   ├── Consumentenprijzen__prijsindex_2015_100__*.csv   # Consumer Price Index
+│   ├── Prices_of_natural_gas_and_electricity_*.csv      # Gas & Elec. Prices by band
 │   ├── GDP__output_and_expenditures__changes__*.csv     # Quarterly national accounts
 │   └── Population (x million).csv                       # Annual population
 ├── entso-e/                              # ENTSO-E Excel workbooks
@@ -611,15 +640,16 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   ├── cbs_energy/data/                  # Monthly consumer tariffs (harmonized)
 │   ├── cbs_gdp/data/                     # Monthly GDP/economic indicators + population
 │   ├── cbs_cpi/data/                     # Monthly energy CPI (2015=100)
+│   ├── cbs_gep/data/                     # Monthly gas & electricity prices by band
 │   └── entsoe/data/year=YYYY/            # Hourly NL load
 │
 ├── processing_2/                         # Phase 2 output
 │   ├── viirs_a2_daily/data/year=YYYY/    # Daily VNP46A2 aggregates
 │   ├── viirs_a1_daily/data/year=YYYY/    # Daily VNP46A1 aggregates
-│   ├── cbs_combined/data/                # Merged CBS (tariffs + GDP, ~50 columns)
+│   ├── cbs_combined/data/                # Merged CBS (tariffs + GDP + CPI + GEP, ~70 columns)
 │   └── entsoe/data/year=YYYY/            # Re-partitioned ENTSO-E
 │
 └── processed/                            # Phase 3 final output
-    ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~60 columns)
+    ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~91 columns)
     └── data_quality.json                 # Comprehensive quality report
 ```

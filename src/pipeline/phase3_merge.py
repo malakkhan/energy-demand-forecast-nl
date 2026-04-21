@@ -311,12 +311,23 @@ def _ordered_columns(columns: list) -> list:
 
 
 def _parse_args() -> argparse.Namespace:
+    # Default out-root: <repo_root>/data — two directories up from src/pipeline/
+    _default_out_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data",
+    )
     parser = argparse.ArgumentParser(
         description="Phase 3: Merge all sources into a unified hourly Parquet dataset."
     )
     parser.add_argument(
         "--data-root", default="/projects/prjs2061/data",
-        help="Root data directory.",
+        help="Root directory for raw input data (kept for CLI consistency; "
+             "not used by Phase 3 itself).",
+    )
+    parser.add_argument(
+        "--out-root", default=_default_out_root,
+        help="Root directory for pipeline output data (processing_2/, processed/). "
+             "Defaults to <repo>/data/ relative to this script.",
     )
     parser.add_argument(
         "--start", default="2012-01-01",
@@ -340,9 +351,9 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     """Build the final hourly dataset from Phase 2 outputs."""
     args = _parse_args()
-    data_root = args.data_root
-    p2_dir = os.path.join(data_root, "processing_2")
-    out_dir = os.path.join(data_root, "processed")
+    out_root = args.out_root
+    p2_dir = os.path.join(out_root, "processing_2")
+    out_dir = os.path.join(out_root, "processed")
     out_parquet = os.path.join(out_dir, "nl_hourly_dataset.parquet")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -402,15 +413,18 @@ def main() -> None:
     viirs_a1_nn = int(df["ntl_a1_mean"].notna().sum()) if "ntl_a1_mean" in df.columns else 0
     cbs_energy_nn = int(df["cbs_gas_total_tax"].notna().sum()) if "cbs_gas_total_tax" in df.columns else 0
     cbs_gdp_nn = int(df["cbs_gdp_yy"].notna().sum()) if "cbs_gdp_yy" in df.columns else 0
+    cbs_cpi_nn = int(df["cbs_cpi_energy"].notna().sum()) if "cbs_cpi_energy" in df.columns else 0
+    cbs_gep_nn = int(df["cbs_gep_gas_hh_total"].notna().sum()) if "cbs_gep_gas_hh_total" in df.columns else 0
     load = df["entsoe_load_mw"].dropna()
 
     logger.info("Final: %d hourly rows.", total)
     logger.info(
         "Coverage — ENTSO-E: %.1f%% | VIIRS A2: %.1f%% | VIIRS A1: %.1f%% "
-        "| CBS Tariffs: %.1f%% | CBS GDP: %.1f%%",
+        "| CBS Tariffs: %.1f%% | CBS GDP: %.1f%% | CBS CPI: %.1f%% | CBS GEP: %.1f%%",
         100 * entsoe_nn / total, 100 * viirs_a2_nn / total,
         100 * viirs_a1_nn / total,
         100 * cbs_energy_nn / total, 100 * cbs_gdp_nn / total,
+        100 * cbs_cpi_nn / total, 100 * cbs_gep_nn / total,
     )
 
     # Coverage assertion for the target variable
@@ -448,6 +462,14 @@ def main() -> None:
             "cbs_gdp_yy": {
                 "non_null": cbs_gdp_nn,
                 "pct": round(100 * cbs_gdp_nn / total, 2) if total else 0.0,
+            },
+            "cbs_cpi_energy": {
+                "non_null": cbs_cpi_nn,
+                "pct": round(100 * cbs_cpi_nn / total, 2) if total else 0.0,
+            },
+            "cbs_gep_gas_hh_total": {
+                "non_null": cbs_gep_nn,
+                "pct": round(100 * cbs_gep_nn / total, 2) if total else 0.0,
             },
         },
         "load_statistics": {

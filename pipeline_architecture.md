@@ -10,6 +10,7 @@ flowchart TD
         VA1_RAW["🛰️ VIIRS VNP46A1\n~5,080 HDF5 files\n2400×2400 px each\nAt-sensor raw radiance"]
         C1_RAW["📊 CBS Energy Tariffs\n2 semicolon CSVs\nOld schema 2018–2023\nNew schema 2021–2026"]
         C3_RAW["📈 CBS Energy CPI\nConsumer Price Index\n2015=100 base year\n1996–2025"]
+        C4_RAW["💶 CBS Gas & Elec. Prices\nSemi-annual GEP CSV\nEuro/m³ · Euro/kWh\n2009–2025"]
         C2_RAW["🏛️ CBS GDP/Pop\nQuarterly CSV + Pop CSV\n18 indicators × 2 metrics\n1995–2025"]
         E_RAW["⚡ ENTSO-E\n8 XLSX files\nHourly load\n2006–2024"]
     end
@@ -20,6 +21,7 @@ flowchart TD
         VA1_1["🔬 VIIRS A1 Processor\n· DNB_At_Sensor_Radiance\n· QF_DNB bits 0-1 → uint8 quality\n· Crop to NL bbox: 672×937 pixels\n· 1 row per pixel per day"]
         C1_1["📋 CBS Tariff Harmonizer\n· Read old schema (2018–2023)\n· Read new schema (2021+)\n· Splice at 2020/2021 boundary\n· ODE + energy tax → total_tax\n· Drop non-comparable variable rates"]
         C3_1["📋 CBS CPI Parser\n· Parse Dutch month names\n· Drop annual summary rows\n· Convert comma decimals\n· 3 index series (energy/elec/gas)"]
+        C4_1["📋 CBS GEP Parser\n· Parse semester periods\n· Drop annual rows\n· Pivot 3 components × 6 bands\n· Expand semester → 6 monthly rows\n· 18 price columns"]
         C2_1["📋 CBS GDP Parser\n· Read quarterly wide-format CSV\n· 18 indicators × 2 metrics (y/y, q/q)\n· Forward-fill quarterly → monthly\n· Population merged from annual CSV"]
         E1["📋 ENTSO-E Parser\n· Detect wide vs long schema\n· Filter CountryCode = NL\n· Normalize CET/CEST → UTC\n· Deduplicate overlaps"]
     end
@@ -30,6 +32,7 @@ flowchart TD
         VA1_1_O["viirs_a1/\n~3.2B rows\n📁 by year"]
         C1_O["cbs_energy/\n99 rows\n13 tariff columns"]
         C3_O["cbs_cpi/\n360 rows\n3 index columns"]
+        C4_O["cbs_gep/\n~204 rows\n18 price columns"]
         C2_O["cbs_gdp/\n360 rows\n36 indicator columns"]
         E1_O["entsoe/\n~150K rows\n📁 by year"]
     end
@@ -38,7 +41,7 @@ flowchart TD
         direction TB
         VA2_2["📐 VIIRS A2 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
         VA1_2["📐 VIIRS A1 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
-        C2_2["🔗 CBS Combiner\n· Outer-join energy + GDP + CPI\n· on (year, month)\n· All sources monthly\n· Year gap detection"]
+        C2_2["🔗 CBS Combiner\n· Outer-join energy + GDP\n· + CPI + GEP\n· on (year, month)\n· Year gap detection"]
         E2["✅ ENTSO-E Validator\n· Re-partition by year\n· Per-year hour coverage\n· Load statistics"]
     end
 
@@ -46,7 +49,7 @@ flowchart TD
         direction LR
         VA2_2_O["viirs_a2_daily/\n~5,080 rows\n📁 by year"]
         VA1_2_O["viirs_a1_daily/\n~5,080 rows\n📁 by year"]
-        C2_O2["cbs_combined/\n~400 rows\n~50 columns"]
+        C2_O2["cbs_combined/\n~400 rows\n~70 columns"]
         E2_O["entsoe/\n~150K rows\n📁 by year"]
     end
 
@@ -57,13 +60,14 @@ flowchart TD
     end
 
     subgraph FINAL["📦 FINAL OUTPUT"]
-        OUT["nl_hourly_dataset.parquet\n~70 columns · ~126K rows\nPartitioned by year"]
+        OUT["nl_hourly_dataset.parquet\n~91 columns · ~126K rows\nPartitioned by year"]
     end
 
     VA2_RAW --> VA2_1
     VA1_RAW --> VA1_1
     C1_RAW --> C1_1
     C3_RAW --> C3_1
+    C4_RAW --> C4_1
     C2_RAW --> C2_1
     E_RAW --> E1
 
@@ -71,6 +75,7 @@ flowchart TD
     VA1_1 --> VA1_1_O
     C1_1 --> C1_O
     C3_1 --> C3_O
+    C4_1 --> C4_O
     C2_1 --> C2_O
     E1 --> E1_O
 
@@ -78,6 +83,7 @@ flowchart TD
     VA1_1_O --> VA1_2
     C1_O --> C2_2
     C3_O --> C2_2
+    C4_O --> C2_2
     C2_O --> C2_2
     E1_O --> E2
 
@@ -298,7 +304,39 @@ The CBS CPI file contains three monthly price-index series, all normalised to **
 
 ---
 
-#### 1E. ENTSO-E Electricity Load
+#### 1E. CBS Gas & Electricity Prices (GEP)
+
+```
+Input:  data/cbs/Prices_of_natural_gas_and_electricity_*.csv
+Output: data/processing_1/cbs_gep/data/  (~204 monthly rows)
+```
+
+The CBS GEP file contains semi-annual prices for **six consumption-band segments** across **three price components**, including VAT and all taxes:
+
+| Output column prefix | Consumption band | Unit |
+|---|---|---|
+| `cbs_gep_gas_hh_*` | Gas household (569–5 687 m³/yr) | €/m³ |
+| `cbs_gep_gas_nnh_med_*` | Gas non-household medium (28 433–284 333 m³/yr) | €/m³ |
+| `cbs_gep_gas_nnh_lrg_*` | Gas non-household large (≥28 433 324 m³/yr) | €/m³ |
+| `cbs_gep_elec_hh_*` | Electricity household (2.5–5 MWh/yr) | €/kWh |
+| `cbs_gep_elec_nnh_med_*` | Electricity non-household medium (500–2 000 MWh/yr) | €/kWh |
+| `cbs_gep_elec_nnh_lrg_*` | Electricity non-household large (≥150 000 MWh/yr) | €/kWh |
+
+Each prefix gets three `_{component}` suffixes: `_total`, `_supply`, `_network` → **18 columns total**.
+
+**Parsing logic.**
+The file is in long format with 3 rows per period (Total/Supply/Network price) and 6 value columns. The extractor:
+1. Skips the 5-line header and drops the footer row.
+2. Parses period strings (`"2009 1st semester"`, `"2025 2nd semester*"`) and drops annual-average rows.
+3. Maps component labels to short tags via `_GEP_COMPONENT_MAP`.
+4. Melts the 6 value columns into long format, constructs `cbs_gep_{band}_{component}` column names, and pivots to wide.
+5. Expands each semester to 6 monthly rows (H1→Jan-Jun, H2→Jul-Dec).
+
+Coverage: H1 2009 – H2 2025 (~204 monthly rows).
+
+---
+
+#### 1F. ENTSO-E Electricity Load
 
 ```
 Input:  data/entso-e/*.xlsx  (8 files)
@@ -382,19 +420,20 @@ Both products are aggregated by the same `aggregate_viirs()` function (with `pro
 #### 2B. CBS Combined
 
 ```
-Input:  processing_1/cbs_energy/ + processing_1/cbs_gdp/ + processing_1/cbs_cpi/
+Input:  processing_1/cbs_energy/ + processing_1/cbs_gdp/ + processing_1/cbs_cpi/ + processing_1/cbs_gep/
 Output: data/processing_2/cbs_combined/data/  (~400 rows)
 ```
 
-Outer-joins all three monthly CBS sources on `(year, month)` via a broadcast-join loop:
+Outer-joins all four monthly CBS sources on `(year, month)` via a broadcast-join loop:
 
 | Source | Coverage | Columns added |
 |---|---|---|
 | CBS Energy | 2018–2026 | 13 `cbs_gas_*` / `cbs_elec_*` tariff columns |
 | CBS GDP | 1996–2025 | 35 `cbs_*_yy` / `cbs_*_qq` + `cbs_population_million` |
 | CBS CPI | 1996–2025 | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` |
+| CBS GEP | 2009–2025 | 18 `cbs_gep_{band}_{component}` price columns |
 
-The outer join preserves all months present in any source (effectively 1996–2026). Tariff columns are null before 2018; CPI and GDP columns are null before 1996. A year-gap check detects any missing calendar years.
+The outer join preserves all months present in any source (effectively 1996–2026). Tariff columns are null before 2018; GEP columns are null before 2009; CPI and GDP columns are null before 1996. A year-gap check detects any missing calendar years.
 
 ---
 
@@ -507,6 +546,7 @@ data/processed/nl_hourly_dataset.parquet/
 | GDP (q/q) | `cbs_gdp_qq`, `cbs_imports_total_qq`, ... (17 cols) | CBS | Quarterly→Monthly | 1996–2025, forward-filled |
 | Population | `cbs_population_million` | CBS | Annual→Monthly | Replicated to all months |
 | Energy CPI | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` | CBS | Monthly | Index (2015=100), 1996–2025 |
+| Gas & Elec. Prices | `cbs_gep_{gas_hh,gas_nnh_med,gas_nnh_lrg,elec_hh,elec_nnh_med,elec_nnh_lrg}_{total,supply,network}` (18 cols) | CBS GEP | Semi-annual→Monthly | €/m³ or €/kWh, incl. VAT/taxes, 2009–2025 |
 | Temporal | `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter` | Derived | Hourly | From timestamp |
 
 ---
@@ -522,7 +562,8 @@ flowchart LR
         Q1B["CBS Energy: non-null counts per\ntariff column, period coverage"]
         Q1C["CBS GDP: indicator column count,\nyear range, null percentages"]
         Q1D["CBS CPI: 3 index series,\nyear range, null percentages"]
-        Q1E["ENTSO-E: file count, year range,\nhourly record count"]
+        Q1E["CBS GEP: 18 price columns,\nyear range, null percentages"]
+        Q1F["ENTSO-E: file count, year range,\nhourly record count"]
     end
     subgraph P2_QC["Phase 2 Quality Checks"]
         Q2A["VIIRS A2 + A1: pixel-count consistency\n(valid+fill+invalid = 629,664),\nvalid pixel fraction stats"]
@@ -530,7 +571,7 @@ flowchart LR
         Q2C["ENTSO-E: per-year hour coverage\nvs expected, load min/max/σ"]
     end
     subgraph P3_QC["Phase 3 Quality Checks"]
-        Q3["Source coverage % (A1 + A2 separately),\nENTSO-E ≥ 85% assertion,\nCBS tariffs + GDP coverage,\nload statistics,\nspine completeness"]
+        Q3["Source coverage % (A1 + A2 separately),\nENTSO-E ≥ 85% assertion,\nCBS tariffs + GDP + CPI + GEP coverage,\nload statistics,\nspine completeness"]
     end
 
     P1_QC --> P2_QC --> P3_QC

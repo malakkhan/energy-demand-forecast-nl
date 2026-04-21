@@ -276,7 +276,7 @@ def combine_cbs(
 ) -> None:
     """Combine all CBS monthly tables into one wide table.
 
-    Outer-joins three Phase 1 CBS sources on ``(year, month)``:
+    Outer-joins four Phase 1 CBS sources on ``(year, month)``:
 
     * **cbs_energy** — tariff components (transport, supply, taxes).
       Coverage: 2018–2026.
@@ -284,11 +284,14 @@ def combine_cbs(
       Coverage: 1996–2025.
     * **cbs_cpi** — Consumer Price Index for energy (electricity + gas).
       Coverage: 1996–2025.
+    * **cbs_gep** — semi-annual gas & electricity prices by consumption band
+      and price component (total/supply/network), 18 columns.
+      Coverage: 2009–2025.
 
     An outer join preserves all months present in any source, so the result
     spans 1996–2026 with source-appropriate nulls outside each source's
-    coverage window.  All three sources are small (~400 rows each), so
-    broadcast joins are used throughout.
+    coverage window.  All sources are small (~400 rows each), so broadcast
+    joins are used throughout.
     """
     logger.info("=== Phase 2: CBS combination ===")
     t0 = time.time()
@@ -302,9 +305,10 @@ def combine_cbs(
 
     # Ordered list of (label, path) — each is outer-joined if present.
     sources = [
-        ("CBS Energy",       os.path.join(p1_dir, "cbs_energy", "data")),
-        ("CBS GDP",          os.path.join(p1_dir, "cbs_gdp",    "data")),
-        ("CBS CPI",          os.path.join(p1_dir, "cbs_cpi",    "data")),
+        ("CBS Energy",                os.path.join(p1_dir, "cbs_energy", "data")),
+        ("CBS GDP",                   os.path.join(p1_dir, "cbs_gdp",    "data")),
+        ("CBS CPI",                   os.path.join(p1_dir, "cbs_cpi",    "data")),
+        ("CBS Gas & Elec. Prices",    os.path.join(p1_dir, "cbs_gep",    "data")),
     ]
 
     frames = []
@@ -430,12 +434,23 @@ def passthrough_entsoe(
 
 
 def _parse_args() -> argparse.Namespace:
+    # Default out-root: <repo_root>/data — two directories up from src/pipeline/
+    _default_out_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data",
+    )
     parser = argparse.ArgumentParser(
         description="Phase 2: Aggregate and combine Phase 1 outputs."
     )
     parser.add_argument(
         "--data-root", default="/projects/prjs2061/data",
-        help="Root data directory.",
+        help="Root directory for raw input data (kept for CLI consistency; "
+             "not used by Phase 2 itself).",
+    )
+    parser.add_argument(
+        "--out-root", default=_default_out_root,
+        help="Root directory for pipeline output data (processing_1/, processing_2/). "
+             "Defaults to <repo>/data/ relative to this script.",
     )
     parser.add_argument(
         "--workers", type=int, default=os.cpu_count() or 4,
@@ -456,9 +471,9 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run all Phase 2 aggregation stages."""
     args = _parse_args()
-    data_root = args.data_root
-    p1_dir = os.path.join(data_root, "processing_1")
-    p2_dir = os.path.join(data_root, "processing_2")
+    out_root = args.out_root
+    p1_dir = os.path.join(out_root, "processing_1")
+    p2_dir = os.path.join(out_root, "processing_2")
     scratch = _scratch_dir()
 
     logger.info("Phase 1 input : %s", p1_dir)
