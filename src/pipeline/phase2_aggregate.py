@@ -14,6 +14,8 @@ Operations:
       into a single aligned table.
     - **ENTSO-E**: Pass-through with consistent year-partitioning and a
       fresh quality report.
+    - **KNMI**: Pass-through with consistent year-partitioning and a
+      fresh quality report (hourly meteorological observations).
 
 Optimised for Snellius: column-pruned reads, AQE-enabled shuffles, scratch
 spill on node-local fast storage, and stage-level checkpointing so reruns
@@ -429,6 +431,95 @@ def passthrough_entsoe(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2D: KNMI (pass-through with quality check)
+# ---------------------------------------------------------------------------
+
+
+def passthrough_knmi(
+    spark: SparkSession,
+    p1_dir: str,
+    out_dir: str,
+    force: bool = False,
+) -> None:
+    """Re-partition KNMI data by year and generate a Phase 2 quality report.
+
+    Semantically a pass-through — the data is already at its native hourly
+    resolution from Phase 1. We re-write it with one file per year partition
+    (instead of one file per year from Phase 1) and produce a Phase 2 quality
+    JSON covering per-year hour coverage and meteorological statistics.
+    """
+    logger.info("=== Phase 2D: KNMI pass-through ===")
+    t0 = time.time()
+
+    if _stage_done(out_dir) and not force:
+        logger.info("KNMI output already present — skipping (use --force to re-run).")
+        return
+
+    if force:
+        _clear_output(out_dir)
+
+    parquet_path = os.path.join(p1_dir, "data")
+    if not os.path.exists(parquet_path):
+        logger.warning("KNMI Phase 1 data not found at %s — skipping.", parquet_path)
+        return
+
+    df = spark.read.parquet(parquet_path)
+    logger.info("KNMI loaded from %s.", parquet_path)
+
+    out_parquet = os.path.join(out_dir, "data")
+    os.makedirs(out_dir, exist_ok=True)
+    (
+        df.repartition("year")
+          .sortWithinPartitions("timestamp_utc")
+          .write.mode("overwrite")
+          .partitionBy("year")
+          .parquet(out_parquet)
+    )
+    logger.info("KNMI re-partitioned → %s (%.1fs)", out_parquet, time.time() - t0)
+
+    # --- Pandas-side quality analysis ---
+    result = pd.read_parquet(out_parquet)
+    year_coverage = {}
+    for y, grp in result.groupby("year"):
+        is_leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0)
+        expected = 8784 if is_leap else 8760
+        actual = len(grp)
+        year_coverage[str(int(y))] = {
+            "expected_hours": expected,
+            "actual_hours": int(actual),
+            "coverage_pct": round(100.0 * actual / expected, 1),
+        }
+
+    # Temperature statistics for sanity checking
+    temp_col = "knmi_temp_c"
+    temp_stats = {}
+    if temp_col in result.columns:
+        temp = result[temp_col].dropna()
+        temp_stats = {
+            "min_c": round(float(temp.min()), 1) if len(temp) else None,
+            "max_c": round(float(temp.max()), 1) if len(temp) else None,
+            "mean_c": round(float(temp.mean()), 1) if len(temp) else None,
+            "stddev_c": round(float(temp.std()), 1) if len(temp) else None,
+        }
+
+    # Per-variable null percentages
+    knmi_vars = [c for c in result.columns if c.startswith("knmi_") and c != "knmi_station_count"]
+    var_null_pct = {}
+    for v in knmi_vars:
+        nn = int(result[v].notna().sum())
+        var_null_pct[v] = round(100.0 * (len(result) - nn) / len(result), 2) if len(result) > 0 else 0.0
+
+    extra = {
+        "year_coverage": year_coverage,
+        "temperature_statistics": temp_stats,
+        "variable_null_pct": var_null_pct,
+        "stage_elapsed_seconds": round(time.time() - t0, 1),
+    }
+    metrics = _compute_quality_metrics(out_parquet, "knmi", 2, extra)
+    _write_quality_json(metrics, out_dir)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -537,6 +628,12 @@ def main() -> None:
             spark,
             p1_dir=os.path.join(p1_dir, "entsoe"),
             out_dir=os.path.join(p2_dir, "entsoe"),
+            force=args.force,
+        )
+        passthrough_knmi(
+            spark,
+            p1_dir=os.path.join(p1_dir, "knmi"),
+            out_dir=os.path.join(p2_dir, "knmi"),
             force=args.force,
         )
         logger.info("=== Phase 2 complete in %.0fs. ===", time.time() - t_total)

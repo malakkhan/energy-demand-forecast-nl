@@ -14,6 +14,7 @@ Join strategy (pure pandas — the total dataset is ~122K rows):
     - **VIIRS A2 daily** (daily): Left-join on ``date``; columns prefixed ``ntl_a2_``.
     - **VIIRS A1 daily** (daily): Left-join on ``date``; columns prefixed ``ntl_a1_``.
     - **CBS Combined** (monthly): Left-join on ``(year, month)``.
+    - **KNMI** (hourly): Left-join on ``timestamp``; 8 weather variables + station count.
 
 Usage::
 
@@ -238,6 +239,37 @@ def join_cbs(spine: pd.DataFrame, p2_cbs_path: str) -> pd.DataFrame:
     return spine.merge(cbs, on=["year", "month"], how="left")
 
 
+def join_knmi(spine: pd.DataFrame, p2_knmi_path: str) -> pd.DataFrame:
+    """Left-join KNMI hourly meteorological data onto the timestamp spine.
+
+    KNMI data is at native hourly resolution, so the join is on
+    ``timestamp`` (same as ENTSO-E).  This adds 8 weather columns
+    (``knmi_*``) and a station-count column.
+    """
+    knmi_cols = [
+        "knmi_temp_c", "knmi_dewpoint_c",
+        "knmi_wind_speed_ms", "knmi_wind_speed_hourly_ms",
+        "knmi_wind_gust_ms", "knmi_solar_rad_jcm2",
+        "knmi_sunshine_h", "knmi_humidity_pct",
+        "knmi_station_count",
+    ]
+
+    if not os.path.exists(p2_knmi_path):
+        logger.warning("KNMI P2 not found — columns will be null.")
+        for c in knmi_cols:
+            spine[c] = np.nan
+        return spine
+
+    knmi = pd.read_parquet(p2_knmi_path)
+    knmi = knmi.rename(columns={"timestamp_utc": "timestamp"})
+    knmi["timestamp"] = pd.to_datetime(knmi["timestamp"])
+    # Select only known columns + timestamp for the merge
+    merge_cols = ["timestamp"] + [c for c in knmi_cols if c in knmi.columns]
+    knmi = knmi[merge_cols]
+    logger.info("  Joining KNMI hourly (%d rows).", len(knmi))
+    return spine.merge(knmi, on="timestamp", how="left")
+
+
 # ---------------------------------------------------------------------------
 # Column ordering
 # ---------------------------------------------------------------------------
@@ -278,6 +310,15 @@ def _ordered_columns(columns: list) -> list:
         "cbs_population_million",
     ]
 
+    # KNMI meteorological (between CBS and temporal)
+    preferred_knmi = [
+        "knmi_temp_c", "knmi_dewpoint_c",
+        "knmi_wind_speed_ms", "knmi_wind_speed_hourly_ms",
+        "knmi_wind_gust_ms", "knmi_solar_rad_jcm2",
+        "knmi_sunshine_h", "knmi_humidity_pct",
+        "knmi_station_count",
+    ]
+
     # Temporal suffix
     preferred_tail = [
         "year", "month", "day", "hour",
@@ -296,6 +337,17 @@ def _ordered_columns(columns: list) -> list:
     extra_cbs = sorted(c for c in existing if c.startswith("cbs_") and c not in used)
     ordered.extend(extra_cbs)
     used.update(extra_cbs)
+
+    # Append KNMI columns in preferred order
+    for c in preferred_knmi:
+        if c in existing and c not in used:
+            ordered.append(c)
+            used.add(c)
+
+    # Append any remaining knmi_* columns in sorted order
+    extra_knmi = sorted(c for c in existing if c.startswith("knmi_") and c not in used)
+    ordered.extend(extra_knmi)
+    used.update(extra_knmi)
 
     for c in preferred_tail:
         if c in existing and c not in used:
@@ -380,6 +432,7 @@ def main() -> None:
     df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_daily", "data"), product="a2")
     df = join_viirs(df, os.path.join(p2_dir, "viirs_a1_daily", "data"), product="a1")
     df = join_cbs(df, os.path.join(p2_dir, "cbs_combined", "data"))
+    df = join_knmi(df, os.path.join(p2_dir, "knmi", "data"))
 
     # 3. Reorder columns, drop internal join key
     ordered = _ordered_columns(df.columns.tolist())
@@ -415,16 +468,19 @@ def main() -> None:
     cbs_gdp_nn = int(df["cbs_gdp_yy"].notna().sum()) if "cbs_gdp_yy" in df.columns else 0
     cbs_cpi_nn = int(df["cbs_cpi_energy"].notna().sum()) if "cbs_cpi_energy" in df.columns else 0
     cbs_gep_nn = int(df["cbs_gep_gas_hh_total"].notna().sum()) if "cbs_gep_gas_hh_total" in df.columns else 0
+    knmi_nn = int(df["knmi_temp_c"].notna().sum()) if "knmi_temp_c" in df.columns else 0
     load = df["entsoe_load_mw"].dropna()
 
     logger.info("Final: %d hourly rows.", total)
     logger.info(
         "Coverage — ENTSO-E: %.1f%% | VIIRS A2: %.1f%% | VIIRS A1: %.1f%% "
-        "| CBS Tariffs: %.1f%% | CBS GDP: %.1f%% | CBS CPI: %.1f%% | CBS GEP: %.1f%%",
+        "| CBS Tariffs: %.1f%% | CBS GDP: %.1f%% | CBS CPI: %.1f%% "
+        "| CBS GEP: %.1f%% | KNMI: %.1f%%",
         100 * entsoe_nn / total, 100 * viirs_a2_nn / total,
         100 * viirs_a1_nn / total,
         100 * cbs_energy_nn / total, 100 * cbs_gdp_nn / total,
         100 * cbs_cpi_nn / total, 100 * cbs_gep_nn / total,
+        100 * knmi_nn / total,
     )
 
     # Coverage assertion for the target variable
@@ -470,6 +526,10 @@ def main() -> None:
             "cbs_gep_gas_hh_total": {
                 "non_null": cbs_gep_nn,
                 "pct": round(100 * cbs_gep_nn / total, 2) if total else 0.0,
+            },
+            "knmi_temp_c": {
+                "non_null": knmi_nn,
+                "pct": round(100 * knmi_nn / total, 2) if total else 0.0,
             },
         },
         "load_statistics": {

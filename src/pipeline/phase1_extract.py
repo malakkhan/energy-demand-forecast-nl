@@ -2,9 +2,10 @@
 """Phase 1: Extract raw data sources into cleaned, source-level Parquet files.
 
 Optimised for high-core-count nodes (e.g. Snellius interactive, 96 cores,
-251 GB RAM). Uses ``multiprocessing`` for VIIRS HDF5 extraction (bypassing
-Spark's JVM overhead for this embarrassingly-parallel I/O workload) and
-plain ``pandas`` + ``pyarrow`` for the small CBS and ENTSO-E sources.
+251 GB RAM). Uses ``multiprocessing`` for VIIRS HDF5 and KNMI NetCDF
+extraction (bypassing Spark's JVM overhead for this embarrassingly-parallel
+I/O workload) and plain ``pandas`` + ``pyarrow`` for the small CBS and
+ENTSO-E sources.
 
 Outputs are written to ``data/processing_1/<source>/`` with a
 ``data_quality.json`` report alongside each.
@@ -13,6 +14,13 @@ Usage::
 
     python phase1_extract.py [--data-root /path/to/data] [--workers N]
                              [--force] [--start-method fork|spawn]
+
+Supported raw sources:
+
+* VIIRS VNP46A1 / VNP46A2 — satellite nighttime light (HDF5)
+* CBS — consumer energy tariffs, GDP, CPI, GEP (CSV)
+* ENTSO-E — electricity load (XLSX)
+* KNMI — hourly in-situ meteorological observations (NetCDF)
 """
 
 import argparse
@@ -1382,6 +1390,243 @@ def extract_entsoe(entsoe_dir: str, out_dir: str, workers: int = 1) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 1G: KNMI Hourly Meteorological Observations
+# ---------------------------------------------------------------------------
+
+# KNMI NetCDF files are HDF5-based, so h5py reads them natively. Each file
+# contains one hour of observations from 61 stations.  We average across
+# stations to produce national-mean hourly scalars.
+
+# Variables to extract and their output column names.  Only the 8 most
+# energy-relevant fields are selected (temperature, wind, solar, humidity).
+_KNMI_VAR_MAP: list[tuple[str, str]] = [
+    ("T",   "knmi_temp_c"),               # Temperature at 1.5m (°C)
+    ("TD",  "knmi_dewpoint_c"),            # Dew point temperature (°C)
+    ("FF",  "knmi_wind_speed_ms"),         # 10-min mean wind speed (m/s)
+    ("FH",  "knmi_wind_speed_hourly_ms"),  # Hourly mean wind speed (m/s)
+    ("FX",  "knmi_wind_gust_ms"),          # Max wind gust (m/s)
+    ("Q",   "knmi_solar_rad_jcm2"),        # Global solar radiation (J/cm²)
+    ("SQ",  "knmi_sunshine_h"),            # Sunshine duration (h)
+    ("U",   "knmi_humidity_pct"),          # Relative humidity (%)
+]
+
+# Reference epoch for the KNMI time variable (seconds since 1950-01-01).
+_KNMI_EPOCH = datetime(1950, 1, 1)
+
+
+def _parse_knmi_timestamp_from_file(filepath: str) -> Optional[datetime]:
+    """Parse the UTC timestamp from a KNMI NetCDF filename.
+
+    Filename format: ``hourly-observations-YYYYMMDD-HH.nc``
+    Returns a timezone-naive datetime (represents UTC) or ``None``.
+    """
+    match = re.search(
+        r"hourly-observations-(\d{4})(\d{2})(\d{2})-(\d{2})\.nc$",
+        os.path.basename(filepath),
+    )
+    if not match:
+        return None
+    return datetime(
+        int(match.group(1)), int(match.group(2)),
+        int(match.group(3)), int(match.group(4)),
+    )
+
+
+def _process_one_knmi_file(filepath: str) -> dict:
+    """Read a single KNMI NetCDF file and compute station-mean values.
+
+    Runs in a child process. Opens the file with ``h5py`` (NetCDF4 files
+    are HDF5-based), reads 8 meteorological variables each of shape
+    ``(n_stations, 1)``, and computes the mean across all reporting
+    stations (ignoring NaN).
+
+    Returns a dict with the timestamp and averaged meteorological values,
+    plus metadata for progress tracking.
+    """
+    ts = _parse_knmi_timestamp_from_file(filepath)
+    if ts is None:
+        return {"file": filepath, "status": "skip", "reason": "no timestamp"}
+
+    try:
+        with _open_h5_with_retry(filepath) as hf:
+            record: dict = {"timestamp_utc": ts}
+
+            # Count reporting stations from the temperature field
+            station_count = 0
+
+            for nc_var, col_name in _KNMI_VAR_MAP:
+                if nc_var in hf:
+                    data = hf[nc_var][:].ravel().astype(np.float64)
+                    valid = data[~np.isnan(data)]
+                    record[col_name] = float(np.mean(valid)) if len(valid) > 0 else np.nan
+                    if nc_var == "T":
+                        station_count = len(valid)
+                else:
+                    record[col_name] = np.nan
+
+            record["knmi_station_count"] = station_count
+
+    except Exception as exc:
+        return {"file": filepath, "status": "error", "reason": str(exc)}
+
+    return {
+        "file": os.path.basename(filepath),
+        "status": "ok",
+        "record": record,
+    }
+
+
+def extract_knmi(
+    knmi_dir: str,
+    out_dir: str,
+    workers: int,
+    force: bool = False,
+) -> None:
+    """Extract KNMI hourly meteorological NetCDF files to Parquet.
+
+    Reads all ``hourly-observations-*.nc`` files from the KNMI download
+    directory.  Each file contains one hour of observations from ~61
+    weather stations across the Netherlands.  For each meteorological
+    variable, the mean across all reporting stations is computed to
+    produce one national-level hourly value.
+
+    Uses ``multiprocessing`` for parallelism — each NetCDF file is
+    fully independent (embarrassingly parallel). The ``h5py`` library
+    reads NetCDF4 files natively (they are HDF5-based), so no extra
+    dependencies are required.
+
+    Output is written as year-partitioned Parquet files.
+    """
+    logger.info("=== Phase 1G: KNMI hourly meteorological extraction ===")
+    t0 = time.time()
+
+    nc_files = sorted(glob.glob(os.path.join(knmi_dir, "*.nc")))
+    if not nc_files:
+        logger.warning("No .nc files found in %s — skipping.", knmi_dir)
+        return
+
+    logger.info(
+        "Found %d KNMI NetCDF files. Using %d workers. force=%s",
+        len(nc_files), workers, force,
+    )
+
+    data_dir = os.path.join(out_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # --- Checkpoint: if year-partitioned output exists, skip unless --force ---
+    existing_years = [
+        d for d in os.listdir(data_dir)
+        if d.startswith("year=") and os.path.isdir(os.path.join(data_dir, d))
+    ] if os.path.isdir(data_dir) else []
+
+    if existing_years and not force:
+        logger.info(
+            "KNMI output already present (%d year partitions) — skipping "
+            "(use --force to re-run).", len(existing_years),
+        )
+        return
+
+    # --- Parallel extraction ---
+    records: list[dict] = []
+    ok_count = 0
+    err_count = 0
+    skip_count = 0
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_process_one_knmi_file, f): f for f in nc_files}
+
+        for i, future in enumerate(as_completed(futures), 1):
+            result = future.result()
+            status = result["status"]
+            if status == "ok":
+                ok_count += 1
+                records.append(result["record"])
+            elif status == "skip":
+                skip_count += 1
+            else:
+                err_count += 1
+                if err_count <= 10:
+                    logger.warning(
+                        "  File %s: %s — %s",
+                        result.get("file", "?"),
+                        status,
+                        result.get("reason", ""),
+                    )
+
+            if i % 5000 == 0 or i == len(nc_files):
+                elapsed = time.time() - t0
+                rate = i / elapsed if elapsed > 0 else 0
+                eta = (len(nc_files) - i) / rate if rate > 0 else 0
+                logger.info(
+                    "  Progress: %d/%d files (%.0f files/s, ETA %.0fs) | "
+                    "%d OK, %d skip, %d err",
+                    i, len(nc_files), rate, eta,
+                    ok_count, skip_count, err_count,
+                )
+
+    if not records:
+        logger.warning("No valid KNMI records extracted — skipping.")
+        return
+
+    # --- Build DataFrame, deduplicate, write year-partitioned Parquet ---
+    df = pd.DataFrame(records)
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+    df = (
+        df.sort_values("timestamp_utc")
+          .drop_duplicates(subset=["timestamp_utc"], keep="last")
+          .reset_index(drop=True)
+    )
+    df["year"] = df["timestamp_utc"].dt.year
+    df["knmi_station_count"] = df["knmi_station_count"].astype(np.int32)
+
+    elapsed = time.time() - t0
+    logger.info(
+        "KNMI: %d unique hourly records from %d files "
+        "(%d errors, %d skipped) in %.0fs.",
+        len(df), ok_count, err_count, skip_count, elapsed,
+    )
+
+    # Write partitioned Parquet
+    for year, group in df.groupby("year"):
+        year_dir = os.path.join(data_dir, f"year={year}")
+        os.makedirs(year_dir, exist_ok=True)
+        tbl = pa.Table.from_pandas(
+            group.drop(columns=["year"]), preserve_index=False,
+        )
+        pq.write_table(
+            tbl, os.path.join(year_dir, "knmi.parquet"),
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
+
+    logger.info("KNMI written → %s", data_dir)
+
+    # --- Quality report ---
+    extra = {
+        "completeness": {
+            "total_nc_files": len(nc_files),
+            "processed_ok": ok_count,
+            "processed_error": err_count,
+            "processed_skip": skip_count,
+            "total_hourly_records": len(df),
+            "year_range": [int(df["year"].min()), int(df["year"].max())],
+            "station_count_range": [
+                int(df["knmi_station_count"].min()),
+                int(df["knmi_station_count"].max()),
+            ],
+        },
+        "performance": {
+            "elapsed_seconds": round(elapsed, 1),
+            "files_per_second": round(ok_count / elapsed, 1) if elapsed > 0 else 0,
+            "workers": workers,
+        },
+    }
+    metrics = _compute_parquet_quality(data_dir, "knmi", 1, extra)
+    _write_quality_json(metrics, out_dir)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1397,7 +1642,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data-root", default="/projects/prjs2061/data",
-        help="Root directory for raw input data (VIIRS HDF5, CBS CSVs, ENTSO-E XLSXs).",
+        help="Root directory for raw input data (VIIRS HDF5, CBS CSVs, "
+             "ENTSO-E XLSXs, KNMI NetCDFs).",
     )
     parser.add_argument(
         "--out-root", default=_default_out_root,
@@ -1433,7 +1679,7 @@ def main() -> None:
     except RuntimeError:
         pass  # already set; harmless
 
-    data_root = args.data_root   # raw input data (VIIRS, CBS, ENTSO-E)
+    data_root = args.data_root   # raw input data (VIIRS, CBS, ENTSO-E, KNMI)
     out_root = args.out_root     # pipeline output data (inside repo)
     p1_dir = os.path.join(out_root, "processing_1")
     workers = args.workers
@@ -1482,6 +1728,12 @@ def main() -> None:
         os.path.join(data_root, "entso-e"),
         os.path.join(p1_dir, "entsoe"),
         workers=workers,
+    )
+    extract_knmi(
+        os.path.join(data_root, "knmi"),
+        os.path.join(p1_dir, "knmi"),
+        workers=workers,
+        force=args.force,
     )
 
     logger.info(

@@ -13,6 +13,7 @@ flowchart TD
         C4_RAW["💶 CBS Gas & Elec. Prices\nSemi-annual GEP CSV\nEuro/m³ · Euro/kWh\n2009–2025"]
         C2_RAW["🏛️ CBS GDP/Pop\nQuarterly CSV + Pop CSV\n18 indicators × 2 metrics\n1995–2025"]
         E_RAW["⚡ ENTSO-E\n8 XLSX files\nHourly load\n2006–2024"]
+        K_RAW["🌤️ KNMI\n~25K NetCDF files\nHourly in-situ meteo\n61 stations · 2015–2018+"]
     end
 
     subgraph P1["PHASE 1 — EXTRACTION  ·  src/pipeline/phase1_extract.py"]
@@ -24,6 +25,7 @@ flowchart TD
         C4_1["📋 CBS GEP Parser\n· Parse semester periods\n· Drop annual rows\n· Pivot 3 components × 6 bands\n· Expand semester → 6 monthly rows\n· 18 price columns"]
         C2_1["📋 CBS GDP Parser\n· Read quarterly wide-format CSV\n· 18 indicators × 2 metrics (y/y, q/q)\n· Forward-fill quarterly → monthly\n· Population merged from annual CSV"]
         E1["📋 ENTSO-E Parser\n· Detect wide vs long schema\n· Filter CountryCode = NL\n· Normalize CET/CEST → UTC\n· Deduplicate overlaps"]
+        K1["🌤️ KNMI Extractor\n· Read NetCDF via h5py\n· Mean across 61 stations\n· 8 weather variables\n· Hourly UTC timestamps"]
     end
 
     subgraph P1_OUT["processing_1/ outputs"]
@@ -35,6 +37,7 @@ flowchart TD
         C4_O["cbs_gep/\n~204 rows\n18 price columns"]
         C2_O["cbs_gdp/\n360 rows\n36 indicator columns"]
         E1_O["entsoe/\n~150K rows\n📁 by year"]
+        K1_O["knmi/\n~25K rows\n📁 by year"]
     end
 
     subgraph P2["PHASE 2 — AGGREGATION  ·  src/pipeline/phase2_aggregate.py"]
@@ -43,6 +46,7 @@ flowchart TD
         VA1_2["📐 VIIRS A1 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
         C2_2["🔗 CBS Combiner\n· Outer-join energy + GDP\n· + CPI + GEP\n· on (year, month)\n· Year gap detection"]
         E2["✅ ENTSO-E Validator\n· Re-partition by year\n· Per-year hour coverage\n· Load statistics"]
+        K2["✅ KNMI Validator\n· Re-partition by year\n· Per-year hour coverage\n· Temperature statistics"]
     end
 
     subgraph P2_OUT["processing_2/ outputs"]
@@ -51,16 +55,17 @@ flowchart TD
         VA1_2_O["viirs_a1_daily/\n~5,080 rows\n📁 by year"]
         C2_O2["cbs_combined/\n~400 rows\n~70 columns"]
         E2_O["entsoe/\n~150K rows\n📁 by year"]
+        K2_O["knmi/\n~25K rows\n📁 by year"]
     end
 
     subgraph P3["PHASE 3 — MERGE  ·  src/pipeline/phase3_merge.py"]
         direction TB
         SPINE["🕐 Hourly UTC Spine\n2012-01-01 → today\n~126,000 rows\n+ 9 temporal features"]
-        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A1 on date → ntl_a1_*\n4. CBS on year,month (broadcast)"]
+        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A1 on date → ntl_a1_*\n4. CBS on year,month (broadcast)\n5. KNMI on timestamp → knmi_*"]
     end
 
     subgraph FINAL["📦 FINAL OUTPUT"]
-        OUT["nl_hourly_dataset.parquet\n~91 columns · ~126K rows\nPartitioned by year"]
+        OUT["nl_hourly_dataset.parquet\n~100 columns · ~126K rows\nPartitioned by year"]
     end
 
     VA2_RAW --> VA2_1
@@ -70,6 +75,7 @@ flowchart TD
     C4_RAW --> C4_1
     C2_RAW --> C2_1
     E_RAW --> E1
+    K_RAW --> K1
 
     VA2_1 --> VA2_1_O
     VA1_1 --> VA1_1_O
@@ -78,6 +84,7 @@ flowchart TD
     C4_1 --> C4_O
     C2_1 --> C2_O
     E1 --> E1_O
+    K1 --> K1_O
 
     VA2_1_O --> VA2_2
     VA1_1_O --> VA1_2
@@ -86,16 +93,19 @@ flowchart TD
     C4_O --> C2_2
     C2_O --> C2_2
     E1_O --> E2
+    K1_O --> K2
 
     VA2_2 --> VA2_2_O
     VA1_2 --> VA1_2_O
     C2_2 --> C2_O2
     E2 --> E2_O
+    K2 --> K2_O
 
     E2_O --> JOIN
     VA2_2_O --> JOIN
     VA1_2_O --> JOIN
     C2_O2 --> JOIN
+    K2_O --> JOIN
     SPINE --> JOIN
 
     JOIN --> OUT
@@ -387,6 +397,36 @@ Final: truncate to whole hours with `floor("h")`, drop NaT/NaN rows.
 
 ---
 
+#### 1G. KNMI Hourly Meteorological Observations
+
+```
+Input:  /projects/prjs2061/data/knmi/hourly-observations-*.nc  (~25K files)
+Output: data/processing_1/knmi/data/  (partitioned by year, ~25K rows)
+```
+
+The KNMI Open Data API provides hourly in-situ meteorological observations from **61 weather stations** across the Netherlands in NetCDF4 format (which is HDF5-based, so `h5py` reads them natively — no extra dependency needed).
+
+Each file contains one hour of observations. The extractor uses `ProcessPoolExecutor` (same pattern as VIIRS) to read all files in parallel. For each file, it reads 8 meteorological variables and computes the **mean across all reporting stations** (ignoring NaN) to produce one national-level hourly value.
+
+**Output schema** — one row per hour:
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `timestamp_utc` | datetime64 | — | Observation hour (UTC) |
+| `knmi_temp_c` | float64 | °C | Temperature at 1.5m |
+| `knmi_dewpoint_c` | float64 | °C | Dew point temperature |
+| `knmi_wind_speed_ms` | float64 | m/s | 10-min mean wind speed |
+| `knmi_wind_speed_hourly_ms` | float64 | m/s | Hourly mean wind speed |
+| `knmi_wind_gust_ms` | float64 | m/s | Maximum wind gust |
+| `knmi_solar_rad_jcm2` | float64 | J/cm² | Global solar radiation |
+| `knmi_sunshine_h` | float64 | h | Sunshine duration |
+| `knmi_humidity_pct` | float64 | % | Relative humidity |
+| `knmi_station_count` | int32 | — | Number of reporting stations |
+
+Coverage: 2015-01 – 2018 (partial; download may still be running).
+
+---
+
 ### Phase 2 — Aggregation (`phase2_aggregate.py`)
 
 > **Goal**: Reduce spatial VIIRS data to daily scalars, combine CBS tables, validate ENTSO-E.
@@ -454,6 +494,18 @@ Pass-through re-partition with a detailed per-year coverage report:
 
 Also computes load statistics (min/max/mean/stddev) for sanity checking.
 
+#### 2D. KNMI Validation
+
+```
+Input:  data/processing_1/knmi/data/
+Output: data/processing_2/knmi/data/  (partitioned by year)
+```
+
+Pass-through re-partition with a detailed quality report:
+- Per-year hour coverage vs expected (8760/8784)
+- Temperature statistics (min/max/mean/stddev) for sanity checking
+- Per-variable null percentages
+
 ---
 
 ### Phase 3 — Merge (`phase3_merge.py`)
@@ -468,6 +520,7 @@ flowchart LR
     VA2["🛰️ VIIRS A2 Daily\n~5K rows\ndaily"]
     VA1["🛰️ VIIRS A1 Daily\n~5K rows\ndaily"]
     C["📊 CBS Combined\n~400 rows\nmonthly\n~50 columns"]
+    K["🌤️ KNMI\n~25K rows\nhourly"]
 
     SPINE -->|"LEFT JOIN\non timestamp"| J1
     E --> J1
@@ -481,7 +534,10 @@ flowchart LR
     J3 -->|"LEFT JOIN\non (year,month)\n(broadcast)"| J4
     C --> J4
 
-    J4 --> OUT["📦 Final Dataset\n~70 columns\n~126K rows"]
+    J4 -->|"LEFT JOIN\non timestamp"| J5
+    K --> J5
+
+    J5 --> OUT["📦 Final Dataset\n~100 columns\n~126K rows"]
 ```
 
 #### Join Details
@@ -492,6 +548,7 @@ flowchart LR
 | 2 | VIIRS A2 | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Left + broadcast |
 | 3 | VIIRS A1 | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Left + broadcast |
 | 4 | CBS | `(year, month)` | All `cbs_*` columns | Left + broadcast |
+| 5 | KNMI | `timestamp` | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | Left equi-join |
 
 #### Temporal Feature Generation
 
@@ -520,9 +577,11 @@ Phase 3 arranges columns in a deterministic semantic order:
 5. CBS GDP headline indicators (`cbs_gdp_yy`, `cbs_gdp_qq`, etc.)
 6. CBS population
 7. Any additional `cbs_*` columns (auto-appended in sorted order)
-8. Temporal features (`year`, `month`, `day`, `hour`, etc.)
+8. KNMI meteorological (`knmi_temp_c`, `knmi_wind_speed_ms`, etc.)
+9. Any additional `knmi_*` columns (auto-appended in sorted order)
+10. Temporal features (`year`, `month`, `day`, `hour`, etc.)
 
-This ordering is forward-compatible: new `cbs_*` columns added in Phase 1 are automatically included without modifying Phase 3 code.
+This ordering is forward-compatible: new `cbs_*` or `knmi_*` columns added in Phase 1 are automatically included without modifying Phase 3 code.
 
 #### Final Output Schema
 
@@ -547,6 +606,7 @@ data/processed/nl_hourly_dataset.parquet/
 | Population | `cbs_population_million` | CBS | Annual→Monthly | Replicated to all months |
 | Energy CPI | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` | CBS | Monthly | Index (2015=100), 1996–2025 |
 | Gas & Elec. Prices | `cbs_gep_{gas_hh,gas_nnh_med,gas_nnh_lrg,elec_hh,elec_nnh_med,elec_nnh_lrg}_{total,supply,network}` (18 cols) | CBS GEP | Semi-annual→Monthly | €/m³ or €/kWh, incl. VAT/taxes, 2009–2025 |
+| Meteorology | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | KNMI | Hourly | National mean across 61 stations, 2015–2018+ |
 | Temporal | `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter` | Derived | Hourly | From timestamp |
 
 ---
@@ -564,14 +624,16 @@ flowchart LR
         Q1D["CBS CPI: 3 index series,\nyear range, null percentages"]
         Q1E["CBS GEP: 18 price columns,\nyear range, null percentages"]
         Q1F["ENTSO-E: file count, year range,\nhourly record count"]
+        Q1G["KNMI: file count, year range,\nstation count range,\nhourly record count"]
     end
     subgraph P2_QC["Phase 2 Quality Checks"]
         Q2A["VIIRS A2 + A1: pixel-count consistency\n(valid+fill+invalid = 629,664),\nvalid pixel fraction stats"]
         Q2B["CBS: year gap detection,\nmissing year list"]
         Q2C["ENTSO-E: per-year hour coverage\nvs expected, load min/max/σ"]
+        Q2D["KNMI: per-year hour coverage,\ntemperature stats, per-variable\nnull percentages"]
     end
     subgraph P3_QC["Phase 3 Quality Checks"]
-        Q3["Source coverage % (A1 + A2 separately),\nENTSO-E ≥ 85% assertion,\nCBS tariffs + GDP + CPI + GEP coverage,\nload statistics,\nspine completeness"]
+        Q3["Source coverage % (A1 + A2 separately),\nENTSO-E ≥ 85% assertion,\nCBS tariffs + GDP + CPI + GEP coverage,\nKNMI temperature coverage,\nload statistics,\nspine completeness"]
     end
 
     P1_QC --> P2_QC --> P3_QC
