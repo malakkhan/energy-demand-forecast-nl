@@ -1,12 +1,22 @@
 """
 NL Energy Demand — Time Series Analysis (batch script)
 =======================================================
-Produces all figures from 01_time_series_analysis.ipynb and saves them to
-analysis/figures/.  Designed to be run as an sbatch job so that:
+Produces all EDA figures and saves them to analysis/figures/.
+Designed to be run as an sbatch job so that:
 
   - matplotlib uses the non-interactive Agg backend (no SSH rendering overhead)
   - CCF uses scipy.signal.correlate (FFT-based, O(n log n) vs O(n²))
-  - ACF/PACF explicitly uses FFT
+  - ACF/PACF uses FFT-accelerated ACF and Yule-Walker PACF on the full dataset
+  - VIF is computed on a 50K-row subsample
+
+Sections:
+  1. Data loading (ENTSO-E, VIIRS, CBS, KNMI)
+  2. ENTSO-E hourly load analysis (time series, STL, ACF/PACF, subseries)
+  3. VIIRS A2 daily NTL analysis
+  4. VIIRS A1 daily NTL analysis + A1/A2 comparison
+  5. CBS monthly indicators
+  6. Multicollinearity (correlation, VIF, CCF, pair plot)
+  7. KNMI meteorological analysis (time series, STL, ACF/PACF, weather–load)
 
 Run interactively:
     source .venv/bin/activate
@@ -16,6 +26,7 @@ Run via SLURM:
     sbatch src/pipeline/run_analysis.slurm
 """
 
+import json
 import time
 import warnings
 from pathlib import Path
@@ -62,6 +73,7 @@ P_FINAL  = REPO / "data" / "processed" / "nl_hourly_dataset.parquet"
 P_P2_A2  = REPO / "data" / "processing_2" / "viirs_a2_daily" / "data"
 P_P2_A1  = REPO / "data" / "processing_2" / "viirs_a1_daily" / "data"
 P_P2_CBS = REPO / "data" / "processing_2" / "cbs_combined"   / "data"
+P_P2_KNMI= REPO / "data" / "processing_2" / "knmi"           / "data"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -87,6 +99,9 @@ def ccf_fft(x: np.ndarray, y: np.ndarray, max_lag: int):
     return lags, full[mid - max_lag: mid + max_lag + 1]
 
 
+# ── Results accumulator (written to JSON at the end) ─────────────────────────
+R = {}   # all numerical outputs collected here
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1  LOAD DATA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,6 +120,8 @@ _want = [
     "cbs_gep_gas_hh_total", "cbs_gep_elec_hh_total",
     "cbs_gas_total_tax", "cbs_elec_total_tax",
     "cbs_gdp_yy", "cbs_consumption_hh_yy", "cbs_population_million",
+    "knmi_temp_c", "knmi_humidity_pct", "knmi_wind_speed_ms",
+    "knmi_solar_rad_jcm2",
     "year", "month", "day", "hour", "day_of_week", "is_weekend",
 ]
 hourly = pd.read_parquet(P_FINAL, columns=[c for c in _want if c in _avail])
@@ -127,6 +144,18 @@ cbs = pd.read_parquet(P_P2_CBS)
 cbs["date"] = pd.to_datetime(cbs[["year","month"]].assign(day=1))
 cbs = cbs.sort_values("date").set_index("date")
 print(f"  CBS     : {len(cbs):,} rows, {len(cbs.columns)} columns")
+
+_knmi_cols = ["timestamp_utc","knmi_temp_c","knmi_dewpoint_c",
+              "knmi_wind_speed_ms","knmi_wind_speed_hourly_ms","knmi_wind_gust_ms",
+              "knmi_solar_rad_jcm2","knmi_sunshine_h","knmi_humidity_pct"]
+if P_P2_KNMI.exists():
+    knmi = pd.read_parquet(P_P2_KNMI, columns=[c for c in _knmi_cols])
+    knmi["timestamp_utc"] = pd.to_datetime(knmi["timestamp_utc"])
+    knmi = knmi.sort_values("timestamp_utc").set_index("timestamp_utc")
+    print(f"  KNMI    : {len(knmi):,} rows  ({knmi.index.min()} → {knmi.index.max()})")
+else:
+    knmi = pd.DataFrame()
+    print("  KNMI    : not found — skipping KNMI analysis")
 print(f"  data loaded in {elapsed(t0)}")
 
 
@@ -159,6 +188,8 @@ axes[1].set_ylabel("Load (MW)"); axes[1].set_title("Annual mean ± 1 std")
 axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 axes[1].legend(fontsize=10)
 plt.tight_layout(); savefig(fig, "entsoe_01_timeseries"); print(elapsed(t1))
+R["entsoe_annual"] = {str(y): {"mean_mw": round(float(m), 1), "std_mw": round(float(s), 1)}
+                      for y, m, s in zip(ann_mean.index, ann_mean.values, ann_std.values)}
 
 # 2.2 ── STL
 print("[2.2] ENTSOE STL …", end=" ", flush=True)
@@ -176,15 +207,19 @@ for ax, (label, data, color) in zip(axes, [
 axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 plt.tight_layout(); savefig(fig, "entsoe_02_stl"); print(elapsed(t1))
 obs_var = float(np.var(stl_in.values))
+_stl_pct = {}
 for name, comp in [("Trend",stl_e.trend),("Seasonal",stl_e.seasonal),("Residual",stl_e.resid)]:
-    print(f"  {name}: {100*float(np.var(comp))/obs_var:.1f}%")
+    pct = round(100*float(np.var(comp))/obs_var, 1)
+    _stl_pct[name.lower()] = pct
+    print(f"  {name}: {pct}%")
+R["entsoe_stl_variance_pct"] = _stl_pct
 
 # 2.3 ── ACF / PACF
 print("[2.3] ENTSOE ACF/PACF …", end=" ", flush=True)
 t1 = time.time()
 MAX_H = 24 * 7
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 9))
-fig.suptitle("ENTSO-E Hourly Load — ACF and PACF  (max lag = 168 h)")
+fig.suptitle(f"ENTSO-E Hourly Load — ACF and PACF  (max lag = {MAX_H} h)")
 plot_acf( entsoe, lags=MAX_H, ax=ax1, alpha=0.05, fft=True, title="ACF")
 plot_pacf(entsoe, lags=MAX_H, ax=ax2, alpha=0.05, method="ywm", title="PACF")
 for ax in (ax1, ax2):
@@ -193,7 +228,9 @@ for ax in (ax1, ax2):
         ax.axvline(lag, color="firebrick", lw=1.2, ls="--", alpha=0.7)
 plt.tight_layout(); savefig(fig, "entsoe_03_acf_pacf"); print(elapsed(t1))
 acf_vals = acf(entsoe.dropna(), nlags=MAX_H, fft=True)
+R["entsoe_acf"] = {int(i): round(float(v), 6) for i, v in enumerate(acf_vals)}
 top10 = np.argsort(np.abs(acf_vals[1:]))[::-1][:10] + 1
+R["entsoe_acf_top10"] = [{"lag_h": int(lag), "r": round(float(acf_vals[lag]), 4)} for lag in top10]
 print("  Top-10 ACF lags:")
 for lag in top10:
     d, h = divmod(int(lag), 24)
@@ -217,12 +254,20 @@ sns.heatmap(pivot, ax=axes[1,1], cmap="YlOrRd", linewidths=0,
             cbar_kws={"label":"Median load (MW)","shrink":0.8})
 axes[1,1].set_title("Median load: day × hour"); axes[1,1].set_xlabel("Hour (UTC)")
 plt.tight_layout(); savefig(fig, "entsoe_04_subseries"); print(elapsed(t1))
+R["entsoe_subseries"] = {
+    "hourly_median_mw": {int(h): round(float(v), 1) for h, v in e_df.groupby("hour")["load"].median().items()},
+    "dow_median_mw": {DOW_SUN_FIRST[i]: round(float(v), 1) for i, (_, v) in enumerate(e_df.groupby("day_of_week")["load"].median().sort_index().items())},
+    "monthly_median_mw": {MONTH_NAMES[int(m)-1]: round(float(v), 1) for m, v in e_df.groupby("month")["load"].median().items()},
+    "dow_hour_heatmap_mw": {row: {int(c): round(float(pivot.loc[row, c]), 1) for c in pivot.columns} for row in pivot.index},
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3  VIIRS A2 DAILY
 # ══════════════════════════════════════════════════════════════════════════════
-def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> None:
+def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> dict:
+    """Analyse a VIIRS product and return numerical results."""
+    vr = {}  # results for this product
     a_mean   = viirs["ntl_mean"]
     total_px = viirs[["ntl_valid_count","ntl_fill_count","ntl_invalid_count"]].sum(axis=1)
     vpct     = viirs["ntl_valid_count"].div(total_px.replace(0, np.nan)) * 100
@@ -247,6 +292,9 @@ def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> None
                  vpct.rolling(30,center=True).mean().values, color=color, lw=1.8)
     axes[2].set_ylabel("Valid pixel (%)"); axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     plt.tight_layout(); savefig(fig, f"{tag.lower()}_01_timeseries"); print(elapsed(t1))
+    vr["overall_stats"] = {"mean": round(float(a_mean.mean()), 4), "std": round(float(a_mean.std()), 4),
+                           "min": round(float(a_mean.min()), 4), "max": round(float(a_mean.max()), 4),
+                           "valid_pixel_pct_mean": round(float(vpct.mean()), 2)}
 
     # 3/4.2 ── STL (last 5 years, period=365, non-robust for speed)
     print(f"[{tag}.2] {label} STL …", end=" ", flush=True)
@@ -265,8 +313,12 @@ def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> None
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     plt.tight_layout(); savefig(fig, f"{tag.lower()}_02_stl"); print(elapsed(t1))
     obs_var = float(np.var(a_full.values))
+    _vpct = {}
     for n, c in [("Trend",stl_a.trend),("Seasonal",stl_a.seasonal),("Residual",stl_a.resid)]:
-        print(f"  {n}: {100*float(np.var(c))/obs_var:.1f}%")
+        pct = round(100*float(np.var(c))/obs_var, 1)
+        _vpct[n.lower()] = pct
+        print(f"  {n}: {pct}%")
+    vr["stl_variance_pct"] = _vpct
 
     # 3/4.3 ── ACF / PACF
     print(f"[{tag}.3] {label} ACF/PACF …", end=" ", flush=True)
@@ -280,6 +332,8 @@ def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> None
         for lag, lbl in [(7,"7d"),(30,"30d"),(91,"~Q")]:
             ax.axvline(lag, color=color, lw=0.9, ls="--", alpha=0.6)
     plt.tight_layout(); savefig(fig, f"{tag.lower()}_03_acf_pacf"); print(elapsed(t1))
+    _acf_v = acf(a_full.dropna(), nlags=100, fft=True)
+    vr["acf"] = {int(i): round(float(v), 6) for i, v in enumerate(_acf_v)}
 
     # 3/4.4 ── Subseries
     print(f"[{tag}.4] {label} subseries …", end=" ", flush=True)
@@ -293,18 +347,21 @@ def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> None
     sns.boxplot(data=df.dropna(), x="dayofwk", y="ntl_mean", ax=axes[1], color=color, showfliers=False, linewidth=0.7)
     axes[1].set_title("By day of week"); axes[1].set_xticklabels(DOW_MON_FIRST)
     hmap = df.dropna().groupby([df.dropna().index.year,"month"])["ntl_mean"].mean().unstack("month")
-    hmap.columns = MONTH_NAMES
+    hmap.columns = [MONTH_NAMES[int(m)-1] for m in hmap.columns]
     sns.heatmap(hmap, ax=axes[2], cmap="YlOrRd", cbar_kws={"label":"Mean NTL","shrink":0.8},
                 linewidths=0.3, linecolor="white")
     axes[2].set_title("Year × month heatmap")
     plt.tight_layout(); savefig(fig, f"{tag.lower()}_04_subseries"); print(elapsed(t1))
+    vr["subseries_monthly_mean"] = {MONTH_NAMES[int(m)-1]: round(float(v), 4)
+                                    for m, v in df.dropna().groupby("month")["ntl_mean"].mean().items()}
+    return vr
 
 
 print("\n[3] VIIRS A2")
-analyse_viirs(viirs_a2, "viirs_a2", "VIIRS VNP46A2", "steelblue")
+R["viirs_a2"] = analyse_viirs(viirs_a2, "viirs_a2", "VIIRS VNP46A2", "steelblue")
 
 print("\n[4] VIIRS A1")
-analyse_viirs(viirs_a1, "viirs_a1", "VIIRS VNP46A1", "mediumpurple")
+R["viirs_a1"] = analyse_viirs(viirs_a1, "viirs_a1", "VIIRS VNP46A1", "mediumpurple")
 
 # A1 vs A2 comparison
 print("[4.5] A1 vs A2 comparison …", end=" ", flush=True)
@@ -322,6 +379,10 @@ axes[1].plot(ratio.index, ratio.rolling(30, center=True).mean().values, color="d
 axes[1].axhline(1.0, color="black", lw=0.8, ls="--", alpha=0.5)
 axes[1].set_ylabel("A1/A2 ratio"); axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 plt.tight_layout(); savefig(fig, "viirs_a1a2_comparison"); print(elapsed(t1))
+_ratio_clean = ratio.dropna()
+R["viirs_a1a2_ratio"] = {"mean": round(float(_ratio_clean.mean()), 4),
+                         "median": round(float(_ratio_clean.median()), 4),
+                         "std": round(float(_ratio_clean.std()), 4)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -379,6 +440,11 @@ for col, label, color in stl_targets:
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     slug = col.replace("cbs_","")
     plt.tight_layout(); savefig(fig, f"cbs_02_stl_{slug}"); print(elapsed(t1))
+    _obs_v = float(np.var(s.values))
+    R.setdefault("cbs_stl_variance_pct", {})[col] = {
+        n.lower(): round(100*float(np.var(c))/_obs_v, 1)
+        for n, c in [("Trend",stl_c.trend),("Seasonal",stl_c.seasonal),("Residual",stl_c.resid)]
+    }
 
 # 5.3 ── ACF/PACF
 acf_cbs = [
@@ -402,6 +468,11 @@ for row, (col, label, color) in enumerate(acf_cbs):
         ax.set_xlabel("Lag (months)")
         ax.axvline(12, color="firebrick", lw=1.2, ls="--", alpha=0.6)
 plt.tight_layout(); savefig(fig, "cbs_03_acf_pacf"); print(elapsed(t1))
+for col, label, color in acf_cbs:
+    s = cbs[col].dropna()
+    if len(s) > 41:
+        _av = acf(s, nlags=36, fft=True)
+        R.setdefault("cbs_acf", {})[col] = {int(i): round(float(v), 6) for i, v in enumerate(_av)}
 
 # 5.4 ── Subseries
 print("[5.4] CBS subseries …", end=" ", flush=True)
@@ -435,6 +506,7 @@ _feat_want = [
     "cbs_gep_gas_hh_total","cbs_gep_elec_hh_total",
     "cbs_gas_total_tax","cbs_elec_total_tax",
     "cbs_gdp_yy","cbs_consumption_hh_yy","cbs_population_million",
+    "knmi_temp_c","knmi_humidity_pct","knmi_wind_speed_ms","knmi_solar_rad_jcm2",
 ]
 feat = hourly[[c for c in _feat_want if c in hourly.columns]].copy()
 
@@ -442,6 +514,7 @@ feat = hourly[[c for c in _feat_want if c in hourly.columns]].copy()
 print("[6.2] Pearson correlation heat-map …", end=" ", flush=True)
 t1 = time.time()
 corr = feat.corr(method="pearson")
+R["pearson_correlation"] = {r: {c: round(float(corr.loc[r, c]), 4) for c in corr.columns} for r in corr.index}
 fig, ax = plt.subplots(figsize=(14, 12))
 sns.heatmap(corr, ax=ax, annot=True, fmt=".2f", annot_kws={"size":8},
             cmap="RdBu_r", center=0, vmin=-1, vmax=1,
@@ -456,7 +529,10 @@ plt.tight_layout(); savefig(fig, "multi_01_correlation_heatmap"); print(elapsed(
 print("[6.3] VIF …", end=" ", flush=True)
 t1 = time.time()
 X = feat.drop(columns=["entsoe_load_mw"]).dropna()
-print(f"({len(X):,} complete rows) …", end=" ", flush=True)
+# Subsample for speed — VIF on 50 K random rows is statistically equivalent.
+if len(X) > 50_000:
+    X = X.sample(50_000, random_state=42)
+print(f"({len(X):,} rows) …", end=" ", flush=True)
 X_vals = X.values.astype(float)
 vif = pd.DataFrame({
     "Feature": X.columns,
@@ -472,6 +548,7 @@ ax.legend(fontsize=10); ax.invert_yaxis()
 ax.set_xlim(0, min(float(vif["VIF"].max())*1.1, 200))
 plt.tight_layout(); savefig(fig, "multi_02_vif"); print(elapsed(t1))
 print(vif.to_string(index=False))
+R["vif"] = {row["Feature"]: round(float(row["VIF"]), 2) for _, row in vif.iterrows()}
 
 # 6.4 ── CCF  (FFT-based — O(n log n))
 print("[6.4] Cross-correlation (FFT) …", end=" ", flush=True)
@@ -499,6 +576,9 @@ for i, col in enumerate(ccf_features):
     ax.annotate(f"{lags[peak_i]:+d}h  r={r[peak_i]:.2f}",
                 xy=(lags[peak_i],r[peak_i]),xytext=(0,10),textcoords="offset points",
                 ha="center",fontsize=7.5,color="firebrick")
+    R.setdefault("ccf_peaks", {})[col] = {"peak_lag_h": int(lags[peak_i]),
+                                           "peak_r": round(float(r[peak_i]), 4),
+                                           "r_at_lag0": round(float(r[len(r)//2]), 4)}
 for j in range(i+1, len(flat)): flat[j].set_visible(False)
 for ax in flat[:len(ccf_features)]: ax.set_xlabel("Lag (hours)",fontsize=8)
 plt.tight_layout(); savefig(fig, "multi_03_ccf"); print(elapsed(t1))
@@ -507,7 +587,8 @@ plt.tight_layout(); savefig(fig, "multi_03_ccf"); print(elapsed(t1))
 print("[6.5] Pair plot …", end=" ", flush=True)
 t1 = time.time()
 pp_cols = [c for c in ["entsoe_load_mw","ntl_a2_mean","cbs_cpi_energy",
-                        "cbs_gep_gas_hh_total","cbs_gdp_yy","cbs_population_million"]
+                        "cbs_gep_gas_hh_total","cbs_gdp_yy","knmi_temp_c",
+                        "cbs_population_million"]
            if c in feat.columns]
 pp_df = feat[pp_cols].dropna()
 if len(pp_df) > 5000:
@@ -518,9 +599,166 @@ g = sns.pairplot(pp_df, diag_kind="kde",
 g.figure.suptitle(f"Pair Plot — Key Feature Subset  (n={len(pp_df):,} rows)", y=1.02, fontsize=12)
 plt.tight_layout(); savefig(g.figure, "multi_04_pairplot"); print(elapsed(t1))
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7  KNMI METEOROLOGICAL
+# ══════════════════════════════════════════════════════════════════════════════
+if len(knmi) > 0:
+    print("\n[7] KNMI Meteorological")
+
+    _knmi_display = {
+        "knmi_temp_c":               ("Temperature (°C)",       "steelblue"),
+        "knmi_dewpoint_c":           ("Dew point (°C)",         "teal"),
+        "knmi_wind_speed_ms":        ("Wind speed 10-min (m/s)","seagreen"),
+        "knmi_wind_speed_hourly_ms": ("Wind speed hourly (m/s)","mediumseagreen"),
+        "knmi_wind_gust_ms":         ("Wind gust max (m/s)",    "darkorange"),
+        "knmi_solar_rad_jcm2":       ("Solar radiation (J/cm²)","goldenrod"),
+        "knmi_sunshine_h":           ("Sunshine duration (h)",  "gold"),
+        "knmi_humidity_pct":         ("Humidity (%)",           "mediumpurple"),
+    }
+
+    # 7.1 ── Time series overview (all variables)
+    print("[7.1] KNMI time series …", end=" ", flush=True)
+    t1 = time.time()
+    plot_vars = [c for c in _knmi_display if c in knmi.columns]
+    n_v = len(plot_vars)
+    fig, axes = plt.subplots(n_v, 1, figsize=(18, 3*n_v), sharex=True)
+    if n_v == 1: axes = [axes]
+    fig.suptitle("KNMI Hourly Meteorological Observations — Netherlands (national mean)")
+    for ax, col in zip(axes, plot_vars):
+        label, color = _knmi_display[col]
+        s = knmi[col].dropna()
+        ax.plot(s.index, s.values, lw=0.15, color=color, alpha=0.4)
+        roll = s.rolling(24*30, center=True, min_periods=24*7).mean()
+        ax.plot(roll.index, roll.values, color=color, lw=1.8, label="30-day mean")
+        ax.set_ylabel(label, fontsize=9)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    plt.tight_layout(); savefig(fig, "knmi_01_timeseries"); print(elapsed(t1))
+
+    # 7.2 ── STL decomposition — Temperature (period = 24 h, 1-year sample)
+    print("[7.2] KNMI STL (temperature) …", end=" ", flush=True)
+    t1 = time.time()
+    temp = knmi["knmi_temp_c"].dropna()
+    # Take last full year of data for STL
+    stl_knmi_in = temp.iloc[-8760:].asfreq("h").ffill()
+    if len(stl_knmi_in) >= 24*7*2:
+        stl_k = STL(stl_knmi_in, period=24, seasonal=13).fit()
+        fig, axes = plt.subplots(4, 1, figsize=(18, 12), sharex=True)
+        fig.suptitle("STL Decomposition — KNMI Temperature  (period = 24 h, 1-year sample)")
+        for ax, (lbl, data, clr) in zip(axes, [
+            ("Observed", stl_knmi_in.values, "steelblue"),
+            ("Trend", stl_k.trend, "firebrick"),
+            ("Seasonal", stl_k.seasonal, "seagreen"),
+            ("Residual", stl_k.resid, "darkorange"),
+        ]):
+            ax.plot(stl_knmi_in.index, data, color=clr,
+                    lw=0.3 if lbl in ("Observed","Residual") else 1.4)
+            ax.set_ylabel(lbl, fontsize=10)
+            ax.axhline(0, color="black", lw=0.4, ls="--")
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        plt.tight_layout(); savefig(fig, "knmi_02_stl_temp"); print(elapsed(t1))
+        obs_var = float(np.var(stl_knmi_in.values))
+        _kstl = {}
+        for n, c in [("Trend",stl_k.trend),("Seasonal",stl_k.seasonal),("Residual",stl_k.resid)]:
+            pct = round(100*float(np.var(c))/obs_var, 1)
+            _kstl[n.lower()] = pct
+            print(f"  {n}: {pct}%")
+        R["knmi_stl_variance_pct"] = _kstl
+    else:
+        print("insufficient data for STL")
+
+    # 7.3 ── ACF / PACF — Temperature (168 lags)
+    print("[7.3] KNMI ACF/PACF …", end=" ", flush=True)
+    t1 = time.time()
+    MAX_H_K = 24 * 7
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 9))
+    fig.suptitle(f"KNMI Temperature — ACF and PACF  (max lag = {MAX_H_K} h)")
+    plot_acf( temp, lags=MAX_H_K, ax=ax1, alpha=0.05, fft=True, title="ACF")
+    plot_pacf(temp, lags=MAX_H_K, ax=ax2, alpha=0.05, method="ywm", title="PACF")
+    for ax in (ax1, ax2):
+        ax.set_xlabel("Lag (hours)")
+        for lag, lbl in [(24, "24 h"), (168, "168 h")]:
+            ax.axvline(lag, color="steelblue", lw=1.2, ls="--", alpha=0.7)
+    plt.tight_layout(); savefig(fig, "knmi_03_acf_pacf"); print(elapsed(t1))
+    _kacf = acf(temp.dropna(), nlags=MAX_H_K, fft=True)
+    R["knmi_temp_acf"] = {int(i): round(float(v), 6) for i, v in enumerate(_kacf)}
+
+    # 7.4 ── Subseries — Temperature by hour, day-of-week, month
+    print("[7.4] KNMI subseries …", end=" ", flush=True)
+    t1 = time.time()
+    kdf = knmi[["knmi_temp_c"]].dropna().copy()
+    kdf["hour"] = kdf.index.hour
+    kdf["dow"]  = kdf.index.dayofweek  # Mon=0
+    kdf["month"]= kdf.index.month
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("KNMI Temperature — Seasonal Subseries")
+    sns.boxplot(data=kdf, x="hour",  y="knmi_temp_c", ax=axes[0],
+                color="steelblue", showfliers=False, linewidth=0.7)
+    axes[0].set_title("By hour (UTC)"); axes[0].set_ylabel("Temperature (°C)")
+    sns.boxplot(data=kdf, x="dow",   y="knmi_temp_c", ax=axes[1],
+                color="seagreen", showfliers=False, linewidth=0.7)
+    axes[1].set_title("By day of week"); axes[1].set_xticklabels(DOW_MON_FIRST)
+    axes[1].set_ylabel("Temperature (°C)")
+    sns.boxplot(data=kdf, x="month", y="knmi_temp_c", ax=axes[2],
+                color="darkorange", showfliers=False, linewidth=0.7)
+    axes[2].set_title("By calendar month"); axes[2].set_xticklabels(MONTH_NAMES)
+    axes[2].set_ylabel("Temperature (°C)")
+    plt.tight_layout(); savefig(fig, "knmi_04_subseries"); print(elapsed(t1))
+    R["knmi_temp_subseries"] = {
+        "hourly_mean_c": {int(h): round(float(v), 2) for h, v in kdf.groupby("hour")["knmi_temp_c"].mean().items()},
+        "monthly_mean_c": {MONTH_NAMES[int(m)-1]: round(float(v), 2) for m, v in kdf.groupby("month")["knmi_temp_c"].mean().items()},
+    }
+
+    # 7.5 ── Weather–Load correlation (the classic heating/cooling U-curve)
+    print("[7.5] KNMI weather–load scatter …", end=" ", flush=True)
+    t1 = time.time()
+    wl = hourly[["entsoe_load_mw"]].copy()
+    for c in ["knmi_temp_c","knmi_wind_speed_ms","knmi_solar_rad_jcm2","knmi_humidity_pct"]:
+        if c in hourly.columns:
+            wl[c] = hourly[c]
+    wl = wl.dropna()
+    if len(wl) > 0:
+        wl_cols = [c for c in wl.columns if c != "entsoe_load_mw"]
+        n_c = len(wl_cols)
+        fig, axes = plt.subplots(1, n_c, figsize=(6*n_c, 5))
+        if n_c == 1: axes = [axes]
+        fig.suptitle("Electricity Load vs Weather Variables (hourly)")
+        for ax, col in zip(axes, wl_cols):
+            label, color = _knmi_display.get(col, (col, "steelblue"))
+            # Subsample for scatter
+            sample = wl.sample(min(8000, len(wl)), random_state=42)
+            ax.scatter(sample[col], sample["entsoe_load_mw"],
+                       s=2, alpha=0.15, color=color, rasterized=True)
+            # Binned mean curve
+            bins = pd.cut(wl[col], bins=30)
+            binned = wl.groupby(bins, observed=True)["entsoe_load_mw"].mean()
+            bin_centers = [(b.left+b.right)/2 for b in binned.index]
+            ax.plot(bin_centers, binned.values, color="firebrick", lw=2.5, label="Binned mean")
+            ax.set_xlabel(label); ax.set_ylabel("Load (MW)")
+            ax.legend(fontsize=9)
+            r = float(wl[col].corr(wl["entsoe_load_mw"]))
+            ax.set_title(f"r = {r:.3f}")
+            R.setdefault("knmi_weather_load_r", {})[col] = round(r, 4)
+            R.setdefault("knmi_weather_load_binned", {})[col] = {
+                round(float(bc), 3): round(float(bv), 1) for bc, bv in zip(bin_centers, binned.values)}
+        plt.tight_layout(); savefig(fig, "knmi_05_weather_load"); print(elapsed(t1))
+    else:
+        print("no overlapping data")
+else:
+    print("\n[7] KNMI: skipped (no data)")
+
+
+# ── Write machine-readable results ────────────────────────────────────────────
+_results_path = REPO / "analysis" / "eda_results.json"
+with open(_results_path, "w") as f:
+    json.dump(R, f, indent=2, default=str)
+print(f"\n  Results JSON → {_results_path.relative_to(REPO)}")
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 total = elapsed(t0)
 print(f"\n{'='*60}")
 print(f"  All figures saved to: analysis/figures/")
+print(f"  Results JSON saved to: analysis/eda_results.json")
 print(f"  Total runtime: {total}")
 print(f"{'='*60}")

@@ -3,8 +3,8 @@
 #SBATCH --time=01:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
 #SBATCH --partition=rome
 #SBATCH --output=logs/analysis-%j.out
 #SBATCH --mail-type=END,FAIL
@@ -13,7 +13,7 @@
 # Run the full time series analysis as a batch job.
 # All figures are saved to analysis/figures/*.png — no display required.
 #
-# Submit:   sbatch src/pipeline/run_analysis.slurm
+# Submit:   sbatch analysis/run_analysis.slurm
 # Monitor:  tail -f logs/analysis-<jobid>.out
 # Figures:  ls analysis/figures/
 # =============================================================================
@@ -31,6 +31,9 @@ echo "  Started  : $(date)"
 echo "  Python   : $(python --version)"
 echo "========================================"
 echo ""
+
+# Let NumPy/BLAS use all available cores for FFT and matrix ops
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 python "${REPO}/analysis/run_analysis.py"
 

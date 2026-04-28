@@ -1,6 +1,6 @@
 # Energy Demand Forecast — Netherlands
 
-A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests both VIIRS VNP46A1 (at-sensor raw radiance) and VNP46A2 (gap-filled BRDF-corrected NTL) satellite nighttime-lights imagery, CBS consumer energy tariffs, CBS Consumer Price Index, CBS gas and electricity prices by consumption band, CBS quarterly economic statistics, and ENTSO-E electricity load data, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
+A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests VIIRS VNP46A1/A2 satellite nighttime-lights imagery, CBS consumer energy tariffs, CBS Consumer Price Index, CBS gas and electricity prices by consumption band, CBS quarterly economic statistics, ENTSO-E electricity load data, and KNMI hourly in-situ meteorological observations, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
 
 ---
 
@@ -12,8 +12,9 @@ A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherla
    - [Phase 1 — Extract](#phase-1--extract)
    - [Phase 2 — Aggregate](#phase-2--aggregate)
    - [Phase 3 — Merge](#phase-3--merge)
-4. [Running on SLURM (Snellius)](#running-on-slurm-snellius)
-5. [Observability — Logs, Jobs & Efficiency](#observability--logs-jobs--efficiency)
+4. [Exploratory Data Analysis](#exploratory-data-analysis)
+5. [Running on SLURM (Snellius)](#running-on-slurm-snellius)
+6. [Observability — Logs, Jobs & Efficiency](#observability--logs-jobs--efficiency)
 6. [Directory Layout](#directory-layout)
 
 ---
@@ -186,7 +187,7 @@ The pipeline is organized in three sequential phases. Each phase reads from the 
 
 **Script:** `src/pipeline/phase1_extract.py`
 
-Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **seven sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + CBS GEP + ENTSO-E):
+Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **eight sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + CBS GEP + ENTSO-E + KNMI):
 
 #### 1A: VIIRS A2 and A1 Extraction
 
@@ -340,6 +341,27 @@ Reads ENTSO-E Excel workbooks (both legacy wide format and modern long format), 
 | `timestamp_utc` | `datetime64[us]` | Hourly timestamp in UTC (timezone-naive) |
 | `entsoe_load_mw` | `float64` | Netherlands electricity load (MW) |
 
+#### 1G: KNMI Hourly Meteorological Observations
+
+Reads ~25,000 NetCDF4 files from the KNMI download directory using `h5py` (NetCDF4 files are HDF5-based, so no additional dependency is needed). Each file contains one hour of observations from **61 weather stations** across the Netherlands. For each of 8 energy-relevant meteorological variables, the mean across all reporting stations is computed to produce one national-level hourly value.
+
+Uses `ProcessPoolExecutor` for parallelism (same pattern as VIIRS — each file is fully independent).
+
+**Output schema** — `data/processing_1/knmi/data/year=YYYY/knmi.parquet`:
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `timestamp_utc` | `datetime64[us]` | — | Observation hour (UTC) |
+| `knmi_temp_c` | `float64` | °C | Temperature at 1.5m |
+| `knmi_dewpoint_c` | `float64` | °C | Dew point temperature |
+| `knmi_wind_speed_ms` | `float64` | m/s | 10-min mean wind speed |
+| `knmi_wind_speed_hourly_ms` | `float64` | m/s | Hourly mean wind speed |
+| `knmi_wind_gust_ms` | `float64` | m/s | Maximum wind gust |
+| `knmi_solar_rad_jcm2` | `float64` | J/cm² | Global solar radiation |
+| `knmi_sunshine_h` | `float64` | h | Sunshine duration |
+| `knmi_humidity_pct` | `float64` | % | Relative humidity |
+| `knmi_station_count` | `int32` | — | Number of reporting stations |
+
 #### CLI Options
 
 ```bash
@@ -348,7 +370,7 @@ python src/pipeline/phase1_extract.py [--data-root /path/to/raw/data] [--out-roo
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-root` | `/projects/prjs2061/data` | Root directory for raw input data (VIIRS, CBS, ENTSO-E) |
+| `--data-root` | `/projects/prjs2061/data` | Root directory for raw input data (VIIRS, CBS, ENTSO-E, KNMI) |
 | `--out-root` | `<repo>/data` | Root directory for pipeline outputs (`processing_1/`, etc.) |
 | `--workers` | All CPUs | Number of parallel worker processes |
 | `--force` | `false` | Re-process files even if output already exists |
@@ -364,7 +386,7 @@ Each sub-stage writes a `data_quality.json` alongside its output (e.g. `data/pro
 
 **Script:** `src/pipeline/phase2_aggregate.py`
 
-Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **four sub-stages** (A2 aggregation, A1 aggregation, CBS combination of three sources, ENTSO-E pass-through):
+Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **five sub-stages** (A2 aggregation, A1 aggregation, CBS combination, ENTSO-E pass-through, KNMI pass-through):
 
 #### 2A: VIIRS A2 and A1 Daily Aggregation
 
@@ -399,6 +421,10 @@ Outer-joins all four CBS monthly sources on `(year, month)` via a broadcast-join
 #### 2C: ENTSO-E Pass-through
 
 Re-partitions ENTSO-E hourly data by year with one file per partition and generates a Phase 2 quality report (same schema as Phase 1 ENTSO-E output).
+
+#### 2D: KNMI Pass-through
+
+Re-partitions KNMI hourly data by year and generates a Phase 2 quality report with per-year hour coverage vs expected (8760/8784), temperature statistics (min/max/mean/stddev), and per-variable null percentages.
 
 #### CLI Options
 
@@ -437,25 +463,28 @@ Joins all Phase 2 outputs onto a **contiguous hourly UTC timestamp spine** (2012
 | VIIRS A2 (daily) | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Broadcast left-join |
 | VIIRS A1 (daily) | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Broadcast left-join |
 | CBS Combined (monthly) | `(year, month)` | All `cbs_*` columns | Broadcast left-join |
+| KNMI (hourly) | `timestamp` | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | Left equi-join |
 
 All source tables are small enough to be broadcast; no shuffles occur.
 
 **Final output** — `data/processed/nl_hourly_dataset.parquet/year=YYYY/part-*.parquet`:
 
-The final dataset contains ~91 columns. Column ordering is deterministic:
+The final dataset contains ~100 columns. Column ordering is deterministic:
 
 1. `timestamp` — hourly UTC timestamp (primary key)
 2. `entsoe_load_mw` — **target variable** (electricity load in MW)
-3. VIIRS A2 satellite aggregates (5 columns: `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count`)
-4. VIIRS A1 satellite aggregates (5 columns: `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count`)
-5. CBS gas tariff columns (5 columns: transport rate, fixed supply rate, ODE tax, energy tax, total tax)
-6. CBS electricity tariff columns (8 columns: transport rate, fixed supply rate, dynamic rates, ODE tax, energy tax, total tax, tax refund)
-7. CBS GDP headline indicators (`cbs_gdp_yy`, `cbs_gdp_qq`, `cbs_gdp_wda_yy`, `cbs_gdp_wda_qq`)
+3. VIIRS A2 satellite aggregates (5 columns)
+4. VIIRS A1 satellite aggregates (5 columns)
+5. CBS gas tariff columns (5 columns)
+6. CBS electricity tariff columns (8 columns)
+7. CBS GDP headline indicators
 8. CBS population (`cbs_population_million`)
-9. All remaining `cbs_*` columns in sorted order — includes `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas`, all 18 `cbs_gep_*` price columns, and any future indicators (forward-compatible)
-10. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
+9. All remaining `cbs_*` columns in sorted order (forward-compatible)
+10. KNMI meteorological (9 columns: `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count`)
+11. All remaining `knmi_*` columns in sorted order (forward-compatible)
+12. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
 
-**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, CBS GDP, CBS CPI, and CBS GEP, and writes them all to `data_quality.json`.
+**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, CBS GDP, CBS CPI, CBS GEP, and KNMI, and writes them all to `data_quality.json`.
 
 #### CLI Options
 
@@ -471,6 +500,43 @@ python src/pipeline/phase3_merge.py [--out-root /path/to/output] [--start 2012-0
 | `--end` | Today (UTC) | Spine end date |
 | `--workers` | All CPUs | Accepted for compatibility; merge is single-threaded |
 | `--force` | `false` | Re-run even if final output exists |
+
+---
+
+## Exploratory Data Analysis
+
+**Script:** `analysis/run_analysis.py`  
+**SLURM:** `analysis/run_analysis.slurm`
+
+A batch-mode EDA script that produces all time series analysis figures and saves them to `analysis/figures/`. Designed for non-interactive execution on Snellius (uses `Agg` backend, FFT-based correlation, subsampled ACF/PACF).
+
+**Sections:**
+
+| # | Section | Key Figures |
+|---|---------|-------------|
+| 1 | Data loading | ENTSO-E, VIIRS, CBS, KNMI |
+| 2 | ENTSO-E hourly load | Time series, STL (period=168h), ACF/PACF, subseries |
+| 3 | VIIRS A2 daily NTL | Time series, STL (period=365d), ACF/PACF, subseries |
+| 4 | VIIRS A1 daily NTL | Same as A2 + A1/A2 comparison |
+| 5 | CBS monthly indicators | Time series, STL (period=12mo), ACF/PACF, subseries |
+| 6 | Multicollinearity | Correlation heatmap, VIF, cross-correlation, pair plot |
+| 7 | KNMI meteorological | Time series (8 variables), STL (period=24h), ACF/PACF, subseries, weather–load scatter |
+
+**Performance optimizations:**
+- ACF/PACF uses FFT-accelerated ACF and Yule-Walker PACF on the full dataset (168 lags)
+- VIF computed on a 50K-row random subsample
+- CCF uses FFT-based `scipy.signal.correlate` — O(n log n) vs O(n²)
+- `OMP_NUM_THREADS` set to match SLURM CPU allocation for NumPy BLAS parallelism
+
+**Run:**
+
+```bash
+# Interactive
+python analysis/run_analysis.py
+
+# Batch (Snellius)
+sbatch analysis/run_analysis.slurm
+```
 
 ---
 
@@ -517,6 +583,7 @@ echo "Phase 2: $JOB2, Phase 3: $JOB3"
 | 1 | `src/pipeline/phase1.slurm` | `rome` | 96 | Default (shared) | 4 hours | Shared |
 | 2 | `src/pipeline/phase2.slurm` | `rome` | 128 | Full node | 2 hours | **Exclusive** |
 | 3 | `src/pipeline/phase3.slurm` | `rome` | 32 | 64 GB | 30 minutes | Shared |
+| EDA | `analysis/run_analysis.slurm` | `rome` | 8 | 48 GB | 1 hour | Shared |
 
 ---
 
@@ -584,6 +651,7 @@ cat data/processing_2/viirs_a2_daily/data_quality.json
 cat data/processing_2/viirs_a1_daily/data_quality.json
 cat data/processing_2/cbs_combined/data_quality.json
 cat data/processing_2/entsoe/data_quality.json
+cat data/processing_2/knmi/data_quality.json
 
 # Phase 3 final quality report
 cat data/processed/data_quality.json
@@ -592,6 +660,8 @@ cat data/processed/data_quality.json
 Each report includes: row/column counts, per-column null percentages and dtypes, date ranges, output size in bytes/MB, and stage-specific metrics (pixel coverage fractions, year coverage percentages, load MW statistics, performance timings).
 
 ---
+
+## Directory Layout
 
 ```
 energy-demand-forecast-nl/                # Repository root (on Snellius)
@@ -615,44 +685,40 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │       ├── download_nl_viirs.py          # VIIRS HDF5 download script
 │       └── download_nl_knmi.py           # KNMI weather data download script
 │
+├── analysis/                             # Exploratory data analysis
+│   ├── run_analysis.py                   # Batch EDA script (7 sections, all figures)
+│   ├── run_analysis.slurm                # SLURM job script for EDA
+│   └── figures/                          # Generated PNG figures (git-ignored)
+│
 ├── data/                                 # Pipeline outputs (inside repo)
 │   ├── processing_1/                     # Phase 1 output (source-level Parquet)
-│   │   ├── viirs_a2/data/year=YYYY/      # Per-day VNP46A2 pixel Parquet (+ data_quality.json)
-│   │   ├── viirs_a1/data/year=YYYY/      # Per-day VNP46A1 pixel Parquet (+ data_quality.json)
+│   │   ├── viirs_a2/data/year=YYYY/      # Per-day VNP46A2 pixel Parquet
+│   │   ├── viirs_a1/data/year=YYYY/      # Per-day VNP46A1 pixel Parquet
 │   │   ├── cbs_energy/data/              # Monthly consumer tariffs (harmonized)
 │   │   ├── cbs_gdp/data/                 # Monthly GDP/economic indicators + population
 │   │   ├── cbs_cpi/data/                 # Monthly energy CPI (2015=100)
 │   │   ├── cbs_gep/data/                 # Monthly gas & electricity prices by band
-│   │   └── entsoe/data/year=YYYY/        # Hourly NL load
+│   │   ├── entsoe/data/year=YYYY/        # Hourly NL load
+│   │   └── knmi/data/year=YYYY/          # Hourly meteorological observations
 │   │
 │   ├── processing_2/                     # Phase 2 output (aggregated Parquet)
 │   │   ├── viirs_a2_daily/data/year=YYYY/  # Daily VNP46A2 aggregates
 │   │   ├── viirs_a1_daily/data/year=YYYY/  # Daily VNP46A1 aggregates
 │   │   ├── cbs_combined/data/              # Merged CBS (~70 columns)
-│   │   └── entsoe/data/year=YYYY/          # Re-partitioned ENTSO-E
+│   │   ├── entsoe/data/year=YYYY/          # Re-partitioned ENTSO-E
+│   │   └── knmi/data/year=YYYY/            # Re-partitioned KNMI
 │   │
 │   └── processed/                        # Phase 3 final output
-│       ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~91 columns)
+│       ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~100 columns)
 │       └── data_quality.json             # Comprehensive quality report
 │
 ├── logs/                                 # SLURM job output logs (git-ignored)
-│   └── phase*_*.log
 │
-├── download.log                          # VIIRS A2 download log  (root, git-ignored)
-├── download_A1.log                       # VIIRS A1 download log  (root, git-ignored)
-└── download_knmi.log                     # KNMI download log      (root, git-ignored)
-
 /projects/prjs2061/data/                  # Raw input data (outside repo — too large for git)
 ├── viirs/
 │   ├── A1/                               # Raw VNP46A1 HDF5 files
 │   └── A2/                               # Raw VNP46A2 HDF5 files
 ├── cbs/                                  # CBS CSV source files
-│   ├── Average_energy_prices_for_consumers__2018*.csv   # Old tariff schema
-│   ├── Average_energy_prices_for_consumers_2*.csv       # New tariff schema
-│   ├── Consumentenprijzen__prijsindex_2015_100__*.csv   # Consumer Price Index
-│   ├── Prices_of_natural_gas_and_electricity_*.csv      # Gas & Elec. Prices by band
-│   ├── GDP__output_and_expenditures__changes__*.csv     # Quarterly national accounts
-│   └── Population (x million).csv                       # Annual population
 ├── entso-e/                              # ENTSO-E Excel workbooks
-└── knmi/                                 # KNMI meteorological data
+└── knmi/                                 # KNMI hourly NetCDF files (~25K files)
 ```
