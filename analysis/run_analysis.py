@@ -17,6 +17,8 @@ Sections:
   5. CBS monthly indicators
   6. Multicollinearity (correlation, VIF, CCF, pair plot)
   7. KNMI meteorological analysis (time series, STL, ACF/PACF, weather–load)
+  8. KNMI validated meteorological analysis
+  9. Validated vs non-validated KNMI comparison
 
 Run interactively:
     source .venv/bin/activate
@@ -74,6 +76,7 @@ P_P2_A2  = REPO / "data" / "processing_2" / "viirs_a2_daily" / "data"
 P_P2_A1  = REPO / "data" / "processing_2" / "viirs_a1_daily" / "data"
 P_P2_CBS = REPO / "data" / "processing_2" / "cbs_combined"   / "data"
 P_P2_KNMI= REPO / "data" / "processing_2" / "knmi"           / "data"
+P_P2_KNMI_VAL = REPO / "data" / "processing_2" / "knmi_validated" / "data"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -122,6 +125,8 @@ _want = [
     "cbs_gdp_yy", "cbs_consumption_hh_yy", "cbs_population_million",
     "knmi_temp_c", "knmi_humidity_pct", "knmi_wind_speed_ms",
     "knmi_solar_rad_jcm2",
+    "knmi_val_temp_c", "knmi_val_humidity_pct", "knmi_val_wind_speed_ms",
+    "knmi_val_solar_rad_jcm2",
     "year", "month", "day", "hour", "day_of_week", "is_weekend",
 ]
 hourly = pd.read_parquet(P_FINAL, columns=[c for c in _want if c in _avail])
@@ -156,6 +161,18 @@ if P_P2_KNMI.exists():
 else:
     knmi = pd.DataFrame()
     print("  KNMI    : not found — skipping KNMI analysis")
+
+_knmi_val_cols = ["timestamp_utc","knmi_val_temp_c","knmi_val_dewpoint_c",
+              "knmi_val_wind_speed_ms","knmi_val_wind_speed_hourly_ms","knmi_val_wind_gust_ms",
+              "knmi_val_solar_rad_jcm2","knmi_val_sunshine_h","knmi_val_humidity_pct"]
+if P_P2_KNMI_VAL.exists():
+    knmi_val = pd.read_parquet(P_P2_KNMI_VAL, columns=[c for c in _knmi_val_cols])
+    knmi_val["timestamp_utc"] = pd.to_datetime(knmi_val["timestamp_utc"])
+    knmi_val = knmi_val.sort_values("timestamp_utc").set_index("timestamp_utc")
+    print(f"  KNMI Val: {len(knmi_val):,} rows  ({knmi_val.index.min()} → {knmi_val.index.max()})")
+else:
+    knmi_val = pd.DataFrame()
+    print("  KNMI Val: not found — skipping validated KNMI analysis")
 print(f"  data loaded in {elapsed(t0)}")
 
 
@@ -507,6 +524,7 @@ _feat_want = [
     "cbs_gas_total_tax","cbs_elec_total_tax",
     "cbs_gdp_yy","cbs_consumption_hh_yy","cbs_population_million",
     "knmi_temp_c","knmi_humidity_pct","knmi_wind_speed_ms","knmi_solar_rad_jcm2",
+    "knmi_val_temp_c","knmi_val_humidity_pct","knmi_val_wind_speed_ms","knmi_val_solar_rad_jcm2",
 ]
 feat = hourly[[c for c in _feat_want if c in hourly.columns]].copy()
 
@@ -747,6 +765,231 @@ if len(knmi) > 0:
         print("no overlapping data")
 else:
     print("\n[7] KNMI: skipped (no data)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8  KNMI VALIDATED METEOROLOGICAL
+# ══════════════════════════════════════════════════════════════════════════════
+if len(knmi_val) > 0:
+    print("\n[8] KNMI Validated Meteorological")
+
+    _knmi_val_display = {
+        "knmi_val_temp_c":               ("Temperature (\u00b0C)",       "steelblue"),
+        "knmi_val_dewpoint_c":           ("Dew point (\u00b0C)",         "teal"),
+        "knmi_val_wind_speed_ms":        ("Wind speed 10-min (m/s)","seagreen"),
+        "knmi_val_wind_speed_hourly_ms": ("Wind speed hourly (m/s)","mediumseagreen"),
+        "knmi_val_wind_gust_ms":         ("Wind gust max (m/s)",    "darkorange"),
+        "knmi_val_solar_rad_jcm2":       ("Solar radiation (J/cm\u00b2)","goldenrod"),
+        "knmi_val_sunshine_h":           ("Sunshine duration (h)",  "gold"),
+        "knmi_val_humidity_pct":         ("Humidity (%)",           "mediumpurple"),
+    }
+
+    # 8.1 ── Time series overview (all variables)
+    print("[8.1] KNMI Val time series \u2026", end=" ", flush=True)
+    t1 = time.time()
+    plot_vars_v = [c for c in _knmi_val_display if c in knmi_val.columns]
+    n_v = len(plot_vars_v)
+    fig, axes = plt.subplots(n_v, 1, figsize=(18, 3*n_v), sharex=True)
+    if n_v == 1: axes = [axes]
+    fig.suptitle("KNMI Validated Hourly Meteorological Observations \u2014 Netherlands (national mean)")
+    for ax, col in zip(axes, plot_vars_v):
+        label, color = _knmi_val_display[col]
+        s = knmi_val[col].dropna()
+        ax.plot(s.index, s.values, lw=0.15, color=color, alpha=0.4)
+        roll = s.rolling(24*30, center=True, min_periods=24*7).mean()
+        ax.plot(roll.index, roll.values, color=color, lw=1.8, label="30-day mean")
+        ax.set_ylabel(label, fontsize=9)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    plt.tight_layout(); savefig(fig, "knmi_val_01_timeseries"); print(elapsed(t1))
+
+    # 8.2 ── STL decomposition — Temperature (period = 24 h, 1-year sample)
+    print("[8.2] KNMI Val STL (temperature) \u2026", end=" ", flush=True)
+    t1 = time.time()
+    temp_v = knmi_val["knmi_val_temp_c"].dropna()
+    stl_kv_in = temp_v.iloc[-8760:].asfreq("h").ffill()
+    if len(stl_kv_in) >= 24*7*2:
+        stl_kv = STL(stl_kv_in, period=24, seasonal=13).fit()
+        fig, axes = plt.subplots(4, 1, figsize=(18, 12), sharex=True)
+        fig.suptitle("STL Decomposition \u2014 KNMI Validated Temperature  (period = 24 h, 1-year sample)")
+        for ax, (lbl, data, clr) in zip(axes, [
+            ("Observed", stl_kv_in.values, "steelblue"),
+            ("Trend", stl_kv.trend, "firebrick"),
+            ("Seasonal", stl_kv.seasonal, "seagreen"),
+            ("Residual", stl_kv.resid, "darkorange"),
+        ]):
+            ax.plot(stl_kv_in.index, data, color=clr,
+                    lw=0.3 if lbl in ("Observed","Residual") else 1.4)
+            ax.set_ylabel(lbl, fontsize=10)
+            ax.axhline(0, color="black", lw=0.4, ls="--")
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        plt.tight_layout(); savefig(fig, "knmi_val_02_stl_temp"); print(elapsed(t1))
+        obs_var_v = float(np.var(stl_kv_in.values))
+        _kvstl = {}
+        for n, c in [("Trend",stl_kv.trend),("Seasonal",stl_kv.seasonal),("Residual",stl_kv.resid)]:
+            pct = round(100*float(np.var(c))/obs_var_v, 1)
+            _kvstl[n.lower()] = pct
+            print(f"  {n}: {pct}%")
+        R["knmi_val_stl_variance_pct"] = _kvstl
+    else:
+        print("insufficient data for STL")
+
+    # 8.3 ── ACF / PACF — Temperature (168 lags)
+    print("[8.3] KNMI Val ACF/PACF \u2026", end=" ", flush=True)
+    t1 = time.time()
+    MAX_H_KV = 24 * 7
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 9))
+    fig.suptitle(f"KNMI Validated Temperature \u2014 ACF and PACF  (max lag = {MAX_H_KV} h)")
+    plot_acf( temp_v, lags=MAX_H_KV, ax=ax1, alpha=0.05, fft=True, title="ACF")
+    plot_pacf(temp_v, lags=MAX_H_KV, ax=ax2, alpha=0.05, method="ywm", title="PACF")
+    for ax in (ax1, ax2):
+        ax.set_xlabel("Lag (hours)")
+        for lag, lbl in [(24, "24 h"), (168, "168 h")]:
+            ax.axvline(lag, color="steelblue", lw=1.2, ls="--", alpha=0.7)
+    plt.tight_layout(); savefig(fig, "knmi_val_03_acf_pacf"); print(elapsed(t1))
+    _kvacf = acf(temp_v.dropna(), nlags=MAX_H_KV, fft=True)
+    R["knmi_val_temp_acf"] = {int(i): round(float(v), 6) for i, v in enumerate(_kvacf)}
+
+    # 8.4 ── Subseries — Temperature by hour, day-of-week, month
+    print("[8.4] KNMI Val subseries \u2026", end=" ", flush=True)
+    t1 = time.time()
+    kvdf = knmi_val[["knmi_val_temp_c"]].dropna().copy()
+    kvdf["hour"] = kvdf.index.hour
+    kvdf["dow"]  = kvdf.index.dayofweek
+    kvdf["month"]= kvdf.index.month
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("KNMI Validated Temperature \u2014 Seasonal Subseries")
+    sns.boxplot(data=kvdf, x="hour",  y="knmi_val_temp_c", ax=axes[0],
+                color="steelblue", showfliers=False, linewidth=0.7)
+    axes[0].set_title("By hour (UTC)"); axes[0].set_ylabel("Temperature (\u00b0C)")
+    sns.boxplot(data=kvdf, x="dow",   y="knmi_val_temp_c", ax=axes[1],
+                color="seagreen", showfliers=False, linewidth=0.7)
+    axes[1].set_title("By day of week"); axes[1].set_xticklabels(DOW_MON_FIRST)
+    axes[1].set_ylabel("Temperature (\u00b0C)")
+    sns.boxplot(data=kvdf, x="month", y="knmi_val_temp_c", ax=axes[2],
+                color="darkorange", showfliers=False, linewidth=0.7)
+    axes[2].set_title("By calendar month"); axes[2].set_xticklabels(MONTH_NAMES)
+    axes[2].set_ylabel("Temperature (\u00b0C)")
+    plt.tight_layout(); savefig(fig, "knmi_val_04_subseries"); print(elapsed(t1))
+    R["knmi_val_temp_subseries"] = {
+        "hourly_mean_c": {int(h): round(float(v), 2) for h, v in kvdf.groupby("hour")["knmi_val_temp_c"].mean().items()},
+        "monthly_mean_c": {MONTH_NAMES[int(m)-1]: round(float(v), 2) for m, v in kvdf.groupby("month")["knmi_val_temp_c"].mean().items()},
+    }
+
+    # 8.5 ── Weather–Load correlation (validated)
+    print("[8.5] KNMI Val weather\u2013load scatter \u2026", end=" ", flush=True)
+    t1 = time.time()
+    wl_v = hourly[["entsoe_load_mw"]].copy()
+    for c in ["knmi_val_temp_c","knmi_val_wind_speed_ms","knmi_val_solar_rad_jcm2","knmi_val_humidity_pct"]:
+        if c in hourly.columns:
+            wl_v[c] = hourly[c]
+    wl_v = wl_v.dropna()
+    if len(wl_v) > 0:
+        wl_v_cols = [c for c in wl_v.columns if c != "entsoe_load_mw"]
+        n_c = len(wl_v_cols)
+        fig, axes = plt.subplots(1, n_c, figsize=(6*n_c, 5))
+        if n_c == 1: axes = [axes]
+        fig.suptitle("Electricity Load vs Validated Weather Variables (hourly)")
+        for ax, col in zip(axes, wl_v_cols):
+            label, color = _knmi_val_display.get(col, (col, "steelblue"))
+            sample = wl_v.sample(min(8000, len(wl_v)), random_state=42)
+            ax.scatter(sample[col], sample["entsoe_load_mw"],
+                       s=2, alpha=0.15, color=color, rasterized=True)
+            bins = pd.cut(wl_v[col], bins=30)
+            binned = wl_v.groupby(bins, observed=True)["entsoe_load_mw"].mean()
+            bin_centers = [(b.left+b.right)/2 for b in binned.index]
+            ax.plot(bin_centers, binned.values, color="firebrick", lw=2.5, label="Binned mean")
+            ax.set_xlabel(label); ax.set_ylabel("Load (MW)")
+            ax.legend(fontsize=9)
+            r = float(wl_v[col].corr(wl_v["entsoe_load_mw"]))
+            ax.set_title(f"r = {r:.3f}")
+            R.setdefault("knmi_val_weather_load_r", {})[col] = round(r, 4)
+        plt.tight_layout(); savefig(fig, "knmi_val_05_weather_load"); print(elapsed(t1))
+    else:
+        print("no overlapping data")
+else:
+    print("\n[8] KNMI Validated: skipped (no data)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9  VALIDATED vs NON-VALIDATED COMPARISON
+# ══════════════════════════════════════════════════════════════════════════════
+if len(knmi) > 0 and len(knmi_val) > 0:
+    print("\n[9] Validated vs Non-validated Comparison")
+
+    # Find overlapping timestamps
+    shared_idx = knmi.index.intersection(knmi_val.index)
+    if len(shared_idx) > 100:
+        # 9.1 ── Side-by-side temperature time series
+        print("[9.1] Val vs Non-val temperature \u2026", end=" ", flush=True)
+        t1 = time.time()
+        roll_nv = knmi["knmi_temp_c"].reindex(shared_idx).rolling(24*30, center=True).mean()
+        roll_v  = knmi_val["knmi_val_temp_c"].reindex(shared_idx).rolling(24*30, center=True).mean()
+        fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
+        fig.suptitle("KNMI Temperature: Validated vs Non-validated (30-day rolling mean)")
+        axes[0].plot(roll_nv.index, roll_nv.values, color="steelblue", lw=1.4, label="Non-validated")
+        axes[0].plot(roll_v.index,  roll_v.values,  color="firebrick", lw=1.4, label="Validated")
+        axes[0].set_ylabel("Temperature (\u00b0C)"); axes[0].legend(fontsize=10)
+        axes[0].set_title("30-day rolling mean comparison")
+
+        # 9.2 ── Difference plot
+        diff = knmi_val["knmi_val_temp_c"].reindex(shared_idx) - knmi["knmi_temp_c"].reindex(shared_idx)
+        diff_roll = diff.rolling(24*30, center=True).mean()
+        axes[1].plot(diff_roll.index, diff_roll.values, color="darkorange", lw=1.4)
+        axes[1].axhline(0, color="black", lw=0.8, ls="--", alpha=0.5)
+        axes[1].set_ylabel("\u0394T (val \u2212 non-val) (\u00b0C)")
+        axes[1].set_title("Difference: Validated \u2212 Non-validated (30-day rolling mean)")
+        axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        plt.tight_layout(); savefig(fig, "knmi_val_vs_nonval_01_temp"); print(elapsed(t1))
+
+        diff_clean = diff.dropna()
+        R["knmi_val_vs_nonval"] = {
+            "overlapping_hours": len(shared_idx),
+            "temp_diff_mean_c": round(float(diff_clean.mean()), 4),
+            "temp_diff_std_c": round(float(diff_clean.std()), 4),
+            "temp_diff_abs_max_c": round(float(diff_clean.abs().max()), 4),
+        }
+
+        # 9.3 ── Correlation matrix between validated and non-validated
+        print("[9.3] Val vs Non-val correlation \u2026", end=" ", flush=True)
+        t1 = time.time()
+        _cmp_pairs = [
+            ("knmi_temp_c",      "knmi_val_temp_c"),
+            ("knmi_dewpoint_c",  "knmi_val_dewpoint_c"),
+            ("knmi_wind_speed_ms","knmi_val_wind_speed_ms"),
+            ("knmi_solar_rad_jcm2","knmi_val_solar_rad_jcm2"),
+            ("knmi_humidity_pct", "knmi_val_humidity_pct"),
+        ]
+        _cmp_labels = []; _cmp_r = []
+        for nv_col, v_col in _cmp_pairs:
+            if nv_col in knmi.columns and v_col in knmi_val.columns:
+                nv_s = knmi[nv_col].reindex(shared_idx)
+                v_s  = knmi_val[v_col].reindex(shared_idx)
+                mask = nv_s.notna() & v_s.notna()
+                if mask.sum() > 100:
+                    r = float(nv_s[mask].corr(v_s[mask]))
+                    suffix = nv_col.replace("knmi_", "")
+                    _cmp_labels.append(suffix)
+                    _cmp_r.append(round(r, 6))
+
+        if _cmp_labels:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            bars = ax.barh(_cmp_labels, _cmp_r, color="steelblue")
+            ax.set_xlim(min(0.9, min(_cmp_r) - 0.02), 1.005)
+            ax.set_xlabel("Pearson r")
+            ax.set_title("Validated vs Non-validated: Per-variable Correlation")
+            for bar, r in zip(bars, _cmp_r):
+                ax.text(bar.get_width() + 0.001, bar.get_y() + bar.get_height()/2,
+                        f"{r:.5f}", va="center", fontsize=9)
+            ax.invert_yaxis()
+            plt.tight_layout(); savefig(fig, "knmi_val_vs_nonval_02_correlation"); print(elapsed(t1))
+            R["knmi_val_vs_nonval_pearson"] = dict(zip(_cmp_labels, _cmp_r))
+        else:
+            print("no matching columns")
+    else:
+        print("  Insufficient overlap for comparison.")
+else:
+    print("\n[9] Val vs Non-val comparison: skipped (missing data)")
 
 
 # ── Write machine-readable results ────────────────────────────────────────────

@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""Bulk-download KNMI hourly in-situ meteorological observations via Open Data API v1.
+
+Supports both the non-validated and validated datasets:
+
+  Non-validated (default):
+    python download_nl_knmi.py --dest /projects/prjs2061/data/knmi
+
+  Validated:
+    python download_nl_knmi.py \
+        --dataset hourly-in-situ-meteorological-observations-validated \
+        --dest /projects/prjs2061/data/knmi_validated
+
+API keys are read from the environment (or .env file):
+  - KNMI_API_KEY             → used for the non-validated dataset (default)
+  - KNMI_VALIDATED_API_KEY   → used when --dataset contains 'validated'
+
+You can always override with -k/--key.
+"""
 import asyncio
 import logging
 import os
@@ -147,7 +165,8 @@ async def main() -> None:
     parser.add_argument(
         "-n", "--dataset",
         default="hourly-in-situ-meteorological-observations",
-        help="KNMI dataset name (default: hourly-in-situ-meteorological-observations)",
+        help="KNMI dataset name (default: hourly-in-situ-meteorological-observations). "
+             "Use 'hourly-in-situ-meteorological-observations-validated' for the validated dataset.",
     )
     parser.add_argument(
         "-V", "--version",
@@ -156,8 +175,10 @@ async def main() -> None:
     )
     parser.add_argument(
         "-d", "--dest",
-        default="/projects/prjs2061/data/knmi",
-        help="Destination directory for downloaded files",
+        default=None,
+        help="Destination directory for downloaded files "
+             "(default: /projects/prjs2061/data/knmi for non-validated, "
+             "/projects/prjs2061/data/knmi_validated for validated)",
     )
     parser.add_argument(
         "--start-year",
@@ -178,10 +199,26 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    api_key = args.key or os.environ.get("KNMI_API_KEY")
+    # Select the correct API key based on dataset name
+    is_validated = "validated" in args.dataset.lower()
+    if args.key:
+        api_key = args.key
+    elif is_validated:
+        api_key = os.environ.get("KNMI_VALIDATED_API_KEY")
+    else:
+        api_key = os.environ.get("KNMI_API_KEY")
+
     if not api_key:
+        env_var = "KNMI_VALIDATED_API_KEY" if is_validated else "KNMI_API_KEY"
         parser.error(
-            "No API key found. Pass -k/--key or set KNMI_API_KEY in the environment / .env file."
+            f"No API key found. Pass -k/--key or set {env_var} in the environment / .env file."
+        )
+
+    # Default destination based on dataset type
+    if args.dest is None:
+        args.dest = (
+            "/projects/prjs2061/data/knmi_validated" if is_validated
+            else "/projects/prjs2061/data/knmi"
         )
 
     base_url = "https://api.dataplatform.knmi.nl/open-data/v1"

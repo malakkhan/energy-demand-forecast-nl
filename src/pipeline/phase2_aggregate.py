@@ -440,6 +440,8 @@ def passthrough_knmi(
     p1_dir: str,
     out_dir: str,
     force: bool = False,
+    col_prefix: str = "knmi",
+    source_label: str = "knmi",
 ) -> None:
     """Re-partition KNMI data by year and generate a Phase 2 quality report.
 
@@ -447,8 +449,16 @@ def passthrough_knmi(
     resolution from Phase 1. We re-write it with one file per year partition
     (instead of one file per year from Phase 1) and produce a Phase 2 quality
     JSON covering per-year hour coverage and meteorological statistics.
+
+    Parameters
+    ----------
+    col_prefix : str
+        Column name prefix (``"knmi"`` or ``"knmi_val"``) used to identify
+        the temperature column for sanity-check statistics.
+    source_label : str
+        Label used in log messages and quality reports.
     """
-    logger.info("=== Phase 2D: KNMI pass-through ===")
+    logger.info("=== Phase 2: %s pass-through ===", source_label.upper())
     t0 = time.time()
 
     if _stage_done(out_dir) and not force:
@@ -491,7 +501,8 @@ def passthrough_knmi(
         }
 
     # Temperature statistics for sanity checking
-    temp_col = "knmi_temp_c"
+    temp_col = f"{col_prefix}_temp_c"
+    station_count_col = f"{col_prefix}_station_count"
     temp_stats = {}
     if temp_col in result.columns:
         temp = result[temp_col].dropna()
@@ -503,7 +514,7 @@ def passthrough_knmi(
         }
 
     # Per-variable null percentages
-    knmi_vars = [c for c in result.columns if c.startswith("knmi_") and c != "knmi_station_count"]
+    knmi_vars = [c for c in result.columns if c.startswith(f"{col_prefix}_") and c != station_count_col]
     var_null_pct = {}
     for v in knmi_vars:
         nn = int(result[v].notna().sum())
@@ -515,7 +526,7 @@ def passthrough_knmi(
         "variable_null_pct": var_null_pct,
         "stage_elapsed_seconds": round(time.time() - t0, 1),
     }
-    metrics = _compute_quality_metrics(out_parquet, "knmi", 2, extra)
+    metrics = _compute_quality_metrics(out_parquet, source_label, 2, extra)
     _write_quality_json(metrics, out_dir)
 
 
@@ -635,6 +646,16 @@ def main() -> None:
             p1_dir=os.path.join(p1_dir, "knmi"),
             out_dir=os.path.join(p2_dir, "knmi"),
             force=args.force,
+            col_prefix="knmi",
+            source_label="knmi",
+        )
+        passthrough_knmi(
+            spark,
+            p1_dir=os.path.join(p1_dir, "knmi_validated"),
+            out_dir=os.path.join(p2_dir, "knmi_validated"),
+            force=args.force,
+            col_prefix="knmi_val",
+            source_label="knmi_validated",
         )
         logger.info("=== Phase 2 complete in %.0fs. ===", time.time() - t_total)
     finally:

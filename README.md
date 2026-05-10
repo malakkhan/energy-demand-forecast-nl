@@ -1,6 +1,6 @@
 # Energy Demand Forecast — Netherlands
 
-A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests VIIRS VNP46A1/A2 satellite nighttime-lights imagery, CBS consumer energy tariffs, CBS Consumer Price Index, CBS gas and electricity prices by consumption band, CBS quarterly economic statistics, ENTSO-E electricity load data, and KNMI hourly in-situ meteorological observations, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
+A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests VIIRS VNP46A1/A2 satellite nighttime-lights imagery, CBS consumer energy tariffs, CBS Consumer Price Index, CBS gas and electricity prices by consumption band, CBS quarterly economic statistics, ENTSO-E electricity load data, and KNMI hourly in-situ meteorological observations (both non-validated and validated), transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
 
 ---
 
@@ -76,6 +76,7 @@ source .env
 | `EDL_TOKEN` | `download_nl_viirs.py` (fallback) | [NASA Earthdata Login](https://urs.earthdata.nasa.gov/) → Profile → Generate Token |
 | `LAADS_TOKEN` | `download_nl_viirs.py` (primary) | [LAADS DAAC](https://ladsweb.modaps.eosdis.nasa.gov/) → Profile → App Keys |
 | `KNMI_API_KEY` | `download_nl_knmi.py` (optional) | [KNMI Data Platform](https://dataplatform.knmi.nl/) → API Keys (a public fallback key is hard-coded) |
+| `KNMI_VALIDATED_API_KEY` | `download_nl_knmi.py` (validated dataset) | [KNMI Data Platform](https://dataplatform.knmi.nl/) → API Keys → Bulk Download Policy for `hourly-in-situ-meteorological-observations-validated` |
 
 The VIIRS download script checks `LAADS_TOKEN` first, then falls back to `EDL_TOKEN`. At least one must be set.
 
@@ -151,6 +152,18 @@ python3 src/download/download_nl_knmi.py --dest /projects/prjs2061/data/knmi --s
 - Uses concurrent `ThreadPoolExecutor` downloads (up to 10 threads for small files, 1 for large).
 - Handles HTTP 429 rate-limiting with automatic 20-second backoff retries.
 
+**Validated dataset:** The same script supports downloading the validated version of the data by specifying a different dataset name:
+
+```bash
+source .env
+python3 src/download/download_nl_knmi.py \
+    --dataset hourly-in-situ-meteorological-observations-validated \
+    --dest /projects/prjs2061/data/knmi_validated \
+    --start-year 2012
+```
+
+When `--dataset` contains `validated`, the script automatically uses `KNMI_VALIDATED_API_KEY` from the environment (or you can pass `-k` explicitly). Output defaults to `/projects/prjs2061/data/knmi_validated`.
+
 ### Manual Downloads (CBS & ENTSO-E)
 
 The CBS and ENTSO-E source files are downloaded manually from their respective platforms and placed in the expected directories:
@@ -187,7 +200,7 @@ The pipeline is organized in three sequential phases. Each phase reads from the 
 
 **Script:** `src/pipeline/phase1_extract.py`
 
-Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **eight sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + CBS GEP + ENTSO-E + KNMI):
+Extracts and cleans raw source files into standardised, source-level Parquet files. Runs **nine sub-stages** sequentially (two VIIRS products + CBS energy + CBS GDP + CBS CPI + CBS GEP + ENTSO-E + KNMI + KNMI validated):
 
 #### 1A: VIIRS A2 and A1 Extraction
 
@@ -362,6 +375,25 @@ Uses `ProcessPoolExecutor` for parallelism (same pattern as VIIRS — each file 
 | `knmi_humidity_pct` | `float64` | % | Relative humidity |
 | `knmi_station_count` | `int32` | — | Number of reporting stations |
 
+#### 1H: KNMI Validated Hourly Meteorological Observations
+
+Identical to 1G but reads from the **validated** dataset directory (`/projects/prjs2061/data/knmi_validated`). All output columns use the `knmi_val_` prefix instead of `knmi_`.
+
+**Output schema** — `data/processing_1/knmi_validated/data/year=YYYY/knmi.parquet`:
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `timestamp_utc` | `datetime64[us]` | — | Observation hour (UTC) |
+| `knmi_val_temp_c` | `float64` | °C | Temperature at 1.5m |
+| `knmi_val_dewpoint_c` | `float64` | °C | Dew point temperature |
+| `knmi_val_wind_speed_ms` | `float64` | m/s | 10-min mean wind speed |
+| `knmi_val_wind_speed_hourly_ms` | `float64` | m/s | Hourly mean wind speed |
+| `knmi_val_wind_gust_ms` | `float64` | m/s | Maximum wind gust |
+| `knmi_val_solar_rad_jcm2` | `float64` | J/cm² | Global solar radiation |
+| `knmi_val_sunshine_h` | `float64` | h | Sunshine duration |
+| `knmi_val_humidity_pct` | `float64` | % | Relative humidity |
+| `knmi_val_station_count` | `int32` | — | Number of reporting stations |
+
 #### CLI Options
 
 ```bash
@@ -386,7 +418,7 @@ Each sub-stage writes a `data_quality.json` alongside its output (e.g. `data/pro
 
 **Script:** `src/pipeline/phase2_aggregate.py`
 
-Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **five sub-stages** (A2 aggregation, A1 aggregation, CBS combination, ENTSO-E pass-through, KNMI pass-through):
+Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **six sub-stages** (A2 aggregation, A1 aggregation, CBS combination, ENTSO-E pass-through, KNMI pass-through, KNMI validated pass-through):
 
 #### 2A: VIIRS A2 and A1 Daily Aggregation
 
@@ -426,6 +458,10 @@ Re-partitions ENTSO-E hourly data by year with one file per partition and genera
 
 Re-partitions KNMI hourly data by year and generates a Phase 2 quality report with per-year hour coverage vs expected (8760/8784), temperature statistics (min/max/mean/stddev), and per-variable null percentages.
 
+#### 2E: KNMI Validated Pass-through
+
+Same as 2D but for the validated dataset. Reads from `processing_1/knmi_validated/` and writes to `processing_2/knmi_validated/`. Uses `knmi_val_` column prefix for quality statistics.
+
 #### CLI Options
 
 ```bash
@@ -464,6 +500,7 @@ Joins all Phase 2 outputs onto a **contiguous hourly UTC timestamp spine** (2012
 | VIIRS A1 (daily) | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Broadcast left-join |
 | CBS Combined (monthly) | `(year, month)` | All `cbs_*` columns | Broadcast left-join |
 | KNMI (hourly) | `timestamp` | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | Left equi-join |
+| KNMI Validated (hourly) | `timestamp` | `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count` | Left equi-join |
 
 All source tables are small enough to be broadcast; no shuffles occur.
 
@@ -480,11 +517,13 @@ The final dataset contains ~100 columns. Column ordering is deterministic:
 7. CBS GDP headline indicators
 8. CBS population (`cbs_population_million`)
 9. All remaining `cbs_*` columns in sorted order (forward-compatible)
-10. KNMI meteorological (9 columns: `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count`)
-11. All remaining `knmi_*` columns in sorted order (forward-compatible)
-12. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
+10. KNMI non-validated meteorological (9 columns: `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count`)
+11. All remaining `knmi_*` columns (non-validated) in sorted order (forward-compatible)
+12. KNMI validated meteorological (9 columns: `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count`)
+13. All remaining `knmi_val_*` columns in sorted order (forward-compatible)
+14. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
 
-**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, CBS GDP, CBS CPI, CBS GEP, and KNMI, and writes them all to `data_quality.json`.
+**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, CBS GDP, CBS CPI, CBS GEP, KNMI, and KNMI Validated, and writes them all to `data_quality.json`.
 
 #### CLI Options
 
@@ -514,13 +553,15 @@ A batch-mode EDA script that produces all time series analysis figures and saves
 
 | # | Section | Key Figures |
 |---|---------|-------------|
-| 1 | Data loading | ENTSO-E, VIIRS, CBS, KNMI |
+| 1 | Data loading | ENTSO-E, VIIRS, CBS, KNMI, KNMI Validated |
 | 2 | ENTSO-E hourly load | Time series, STL (period=168h), ACF/PACF, subseries |
 | 3 | VIIRS A2 daily NTL | Time series, STL (period=365d), ACF/PACF, subseries |
 | 4 | VIIRS A1 daily NTL | Same as A2 + A1/A2 comparison |
 | 5 | CBS monthly indicators | Time series, STL (period=12mo), ACF/PACF, subseries |
 | 6 | Multicollinearity | Correlation heatmap, VIF, cross-correlation, pair plot |
 | 7 | KNMI meteorological | Time series (8 variables), STL (period=24h), ACF/PACF, subseries, weather–load scatter |
+| 8 | KNMI validated meteorological | Same as section 7 for validated observations |
+| 9 | Validated vs non-validated | Side-by-side temperature, difference plot, per-variable correlation |
 
 **Performance optimizations:**
 - ACF/PACF uses FFT-accelerated ACF and Yule-Walker PACF on the full dataset (168 lags)
@@ -652,6 +693,7 @@ cat data/processing_2/viirs_a1_daily/data_quality.json
 cat data/processing_2/cbs_combined/data_quality.json
 cat data/processing_2/entsoe/data_quality.json
 cat data/processing_2/knmi/data_quality.json
+cat data/processing_2/knmi_validated/data_quality.json
 
 # Phase 3 final quality report
 cat data/processed/data_quality.json
@@ -699,14 +741,16 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   │   ├── cbs_cpi/data/                 # Monthly energy CPI (2015=100)
 │   │   ├── cbs_gep/data/                 # Monthly gas & electricity prices by band
 │   │   ├── entsoe/data/year=YYYY/        # Hourly NL load
-│   │   └── knmi/data/year=YYYY/          # Hourly meteorological observations
+│   │   ├── knmi/data/year=YYYY/          # Hourly meteorological observations (non-validated)
+│   │   └── knmi_validated/data/year=YYYY/ # Hourly meteorological observations (validated)
 │   │
 │   ├── processing_2/                     # Phase 2 output (aggregated Parquet)
 │   │   ├── viirs_a2_daily/data/year=YYYY/  # Daily VNP46A2 aggregates
 │   │   ├── viirs_a1_daily/data/year=YYYY/  # Daily VNP46A1 aggregates
 │   │   ├── cbs_combined/data/              # Merged CBS (~70 columns)
 │   │   ├── entsoe/data/year=YYYY/          # Re-partitioned ENTSO-E
-│   │   └── knmi/data/year=YYYY/            # Re-partitioned KNMI
+│   │   ├── knmi/data/year=YYYY/            # Re-partitioned KNMI (non-validated)
+│   │   └── knmi_validated/data/year=YYYY/  # Re-partitioned KNMI (validated)
 │   │
 │   └── processed/                        # Phase 3 final output
 │       ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~100 columns)
@@ -720,5 +764,6 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   └── A2/                               # Raw VNP46A2 HDF5 files
 ├── cbs/                                  # CBS CSV source files
 ├── entso-e/                              # ENTSO-E Excel workbooks
-└── knmi/                                 # KNMI hourly NetCDF files (~25K files)
+├── knmi/                                 # KNMI hourly NetCDF files — non-validated (~100K files)
+└── knmi_validated/                        # KNMI hourly NetCDF files — validated
 ```

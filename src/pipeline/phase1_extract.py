@@ -1397,18 +1397,28 @@ def extract_entsoe(entsoe_dir: str, out_dir: str, workers: int = 1) -> None:
 # contains one hour of observations from 61 stations.  We average across
 # stations to produce national-mean hourly scalars.
 
-# Variables to extract and their output column names.  Only the 8 most
-# energy-relevant fields are selected (temperature, wind, solar, humidity).
-_KNMI_VAR_MAP: list[tuple[str, str]] = [
-    ("T",   "knmi_temp_c"),               # Temperature at 1.5m (°C)
-    ("TD",  "knmi_dewpoint_c"),            # Dew point temperature (°C)
-    ("FF",  "knmi_wind_speed_ms"),         # 10-min mean wind speed (m/s)
-    ("FH",  "knmi_wind_speed_hourly_ms"),  # Hourly mean wind speed (m/s)
-    ("FX",  "knmi_wind_gust_ms"),          # Max wind gust (m/s)
-    ("Q",   "knmi_solar_rad_jcm2"),        # Global solar radiation (J/cm²)
-    ("SQ",  "knmi_sunshine_h"),            # Sunshine duration (h)
-    ("U",   "knmi_humidity_pct"),          # Relative humidity (%)
+# Variables to extract and their output column suffixes (after the prefix).
+# Only the 8 most energy-relevant fields are selected (temperature, wind,
+# solar, humidity). The full column name is ``{col_prefix}_{suffix}``.
+_KNMI_VAR_SUFFIXES: list[tuple[str, str]] = [
+    ("T",   "temp_c"),               # Temperature at 1.5m (°C)
+    ("TD",  "dewpoint_c"),            # Dew point temperature (°C)
+    ("FF",  "wind_speed_ms"),         # 10-min mean wind speed (m/s)
+    ("FH",  "wind_speed_hourly_ms"),  # Hourly mean wind speed (m/s)
+    ("FX",  "wind_gust_ms"),          # Max wind gust (m/s)
+    ("Q",   "solar_rad_jcm2"),        # Global solar radiation (J/cm²)
+    ("SQ",  "sunshine_h"),            # Sunshine duration (h)
+    ("U",   "humidity_pct"),          # Relative humidity (%)
 ]
+
+
+def _knmi_var_map(col_prefix: str = "knmi") -> list[tuple[str, str]]:
+    """Build the KNMI variable → column-name mapping with the given prefix.
+
+    Default (non-validated):  ``knmi_temp_c``, ``knmi_wind_speed_ms``, …
+    Validated:                ``knmi_val_temp_c``, ``knmi_val_wind_speed_ms``, …
+    """
+    return [(nc_var, f"{col_prefix}_{suffix}") for nc_var, suffix in _KNMI_VAR_SUFFIXES]
 
 # Reference epoch for the KNMI time variable (seconds since 1950-01-01).
 _KNMI_EPOCH = datetime(1950, 1, 1)
@@ -1440,12 +1450,19 @@ def _process_one_knmi_file(filepath: str) -> dict:
     ``(n_stations, 1)``, and computes the mean across all reporting
     stations (ignoring NaN).
 
+    The column prefix (e.g. ``knmi`` or ``knmi_val``) is read from the
+    module-level ``_NL_CACHE`` dict, populated by ``_init_worker``.
+
     Returns a dict with the timestamp and averaged meteorological values,
     plus metadata for progress tracking.
     """
     ts = _parse_knmi_timestamp_from_file(filepath)
     if ts is None:
         return {"file": filepath, "status": "skip", "reason": "no timestamp"}
+
+    col_prefix = _NL_CACHE.get("col_prefix", "knmi")
+    var_map = _knmi_var_map(col_prefix)
+    station_count_col = f"{col_prefix}_station_count"
 
     try:
         with _open_h5_with_retry(filepath) as hf:
@@ -1454,7 +1471,7 @@ def _process_one_knmi_file(filepath: str) -> dict:
             # Count reporting stations from the temperature field
             station_count = 0
 
-            for nc_var, col_name in _KNMI_VAR_MAP:
+            for nc_var, col_name in var_map:
                 if nc_var in hf:
                     data = hf[nc_var][:].ravel().astype(np.float64)
                     valid = data[~np.isnan(data)]
@@ -1464,7 +1481,7 @@ def _process_one_knmi_file(filepath: str) -> dict:
                 else:
                     record[col_name] = np.nan
 
-            record["knmi_station_count"] = station_count
+            record[station_count_col] = station_count
 
     except Exception as exc:
         return {"file": filepath, "status": "error", "reason": str(exc)}
@@ -1481,6 +1498,8 @@ def extract_knmi(
     out_dir: str,
     workers: int,
     force: bool = False,
+    col_prefix: str = "knmi",
+    source_label: str = "knmi",
 ) -> None:
     """Extract KNMI hourly meteorological NetCDF files to Parquet.
 
@@ -1496,8 +1515,17 @@ def extract_knmi(
     dependencies are required.
 
     Output is written as year-partitioned Parquet files.
+
+    Parameters
+    ----------
+    col_prefix : str
+        Column name prefix: ``"knmi"`` for non-validated (produces
+        ``knmi_temp_c``, etc.) or ``"knmi_val"`` for validated
+        (produces ``knmi_val_temp_c``, etc.).
+    source_label : str
+        Label used in quality reports and log messages.
     """
-    logger.info("=== Phase 1G: KNMI hourly meteorological extraction ===")
+    logger.info("=== Phase 1: %s hourly meteorological extraction ===", source_label.upper())
     t0 = time.time()
 
     nc_files = sorted(glob.glob(os.path.join(knmi_dir, "*.nc")))
@@ -1532,7 +1560,17 @@ def extract_knmi(
     err_count = 0
     skip_count = 0
 
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # Populate the cache with col_prefix so workers can build column names.
+    # Under fork (Linux default), the parent's cache is inherited; under
+    # spawn/forkserver, the initializer re-populates it.
+    cache = {"col_prefix": col_prefix}
+    _init_worker(cache)
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(cache,),
+    ) as pool:
         futures = {pool.submit(_process_one_knmi_file, f): f for f in nc_files}
 
         for i, future in enumerate(as_completed(futures), 1):
@@ -1577,7 +1615,8 @@ def extract_knmi(
           .reset_index(drop=True)
     )
     df["year"] = df["timestamp_utc"].dt.year
-    df["knmi_station_count"] = df["knmi_station_count"].astype(np.int32)
+    station_count_col = f"{col_prefix}_station_count"
+    df[station_count_col] = df[station_count_col].astype(np.int32)
 
     elapsed = time.time() - t0
     logger.info(
@@ -1612,8 +1651,8 @@ def extract_knmi(
             "total_hourly_records": len(df),
             "year_range": [int(df["year"].min()), int(df["year"].max())],
             "station_count_range": [
-                int(df["knmi_station_count"].min()),
-                int(df["knmi_station_count"].max()),
+                int(df[station_count_col].min()),
+                int(df[station_count_col].max()),
             ],
         },
         "performance": {
@@ -1622,7 +1661,7 @@ def extract_knmi(
             "workers": workers,
         },
     }
-    metrics = _compute_parquet_quality(data_dir, "knmi", 1, extra)
+    metrics = _compute_parquet_quality(data_dir, source_label, 1, extra)
     _write_quality_json(metrics, out_dir)
 
 
@@ -1734,6 +1773,16 @@ def main() -> None:
         os.path.join(p1_dir, "knmi"),
         workers=workers,
         force=args.force,
+        col_prefix="knmi",
+        source_label="knmi",
+    )
+    extract_knmi(
+        os.path.join(data_root, "knmi_validated"),
+        os.path.join(p1_dir, "knmi_validated"),
+        workers=workers,
+        force=args.force,
+        col_prefix="knmi_val",
+        source_label="knmi_validated",
     )
 
     logger.info(
