@@ -66,10 +66,11 @@ def download_dataset_file(
         return True, filename
 
     endpoint = f"{base_url}/datasets/{dataset_name}/versions/{dataset_version}/files/{filename}/url"
+    timeout = 60  # seconds
 
     get_file_response = None
     for attempt in range(5):
-        get_file_response = session.get(endpoint)
+        get_file_response = session.get(endpoint, timeout=timeout)
         if get_file_response.status_code == 429:
             wait = 20 * (attempt + 1)
             logger.warning(f"Rate limited on '{filename}'. Waiting {wait}s (attempt {attempt + 1}/5)...")
@@ -112,7 +113,7 @@ def list_dataset_files(
 
     response = None
     for attempt in range(5):
-        response = session.get(endpoint, params=params)
+        response = session.get(endpoint, params=params, timeout=60)
         if response.status_code == 429:
             wait = 20 * (attempt + 1)
             logger.warning(f"Rate limited while listing files. Waiting {wait}s...")
@@ -235,11 +236,14 @@ async def main() -> None:
     file_sizes: list[int] = []
     next_page_token: str | None = None
 
+    page = 0
     while True:
+        page += 1
         params: dict[str, str] = {"maxKeys": "500"}
         if next_page_token:
             params["nextPageToken"] = next_page_token
 
+        logger.info(f"  Fetching file list page {page}...")
         batch_names, body = list_dataset_files(session, base_url, args.dataset, args.version, params)
         batch_files = body.get("files", [])
 
