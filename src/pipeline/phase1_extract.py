@@ -1428,10 +1428,11 @@ def _parse_knmi_timestamp_from_file(filepath: str) -> Optional[datetime]:
     """Parse the UTC timestamp from a KNMI NetCDF filename.
 
     Filename format: ``hourly-observations-YYYYMMDD-HH.nc``
+                 or: ``hourly-observations-validated-YYYYMMDD-HH.nc``
     Returns a timezone-naive datetime (represents UTC) or ``None``.
     """
     match = re.search(
-        r"hourly-observations-(\d{4})(\d{2})(\d{2})-(\d{2})\.nc$",
+        r"hourly-observations-(?:validated-)?(\d{4})(\d{2})(\d{2})-(\d{2})\.nc$",
         os.path.basename(filepath),
     )
     if not match:

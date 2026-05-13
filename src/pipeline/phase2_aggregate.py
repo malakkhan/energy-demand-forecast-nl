@@ -166,6 +166,7 @@ def aggregate_viirs(
     out_dir: str,
     force: bool = False,
     product: str = "a2",
+    selective: bool = True,
 ) -> None:
     """Aggregate pixel-level VIIRS data to daily scalar statistics.
 
@@ -179,20 +180,41 @@ def aggregate_viirs(
     the four columns we need (date, ntl_radiance, quality_flag, is_fill)
     to halve the bytes read from Parquet.
 
+    Parameters
+    ----------
+    selective : bool
+        If ``True`` (default), ``ntl_mean`` and ``ntl_sum`` are computed only
+        over pixels with ``quality_flag <= 1`` (directly observed, high-quality
+        pixels — cloud-free or lightly contaminated).  If ``False``, they are
+        computed over **all non-fill pixels** regardless of quality flag,
+        including gap-filled / imputed pixels (quality_flag 2–3) present in the
+        VNP46A2 product.  This "non-selective" mode gives the full picture of
+        what the A2 gap-filling algorithm provides.
+
+        In both modes the pixel-count breakdown (``ntl_valid_count``,
+        ``ntl_fill_count``, ``ntl_invalid_count``) uses the same fixed
+        definitions so the two outputs are directly comparable:
+            - ``ntl_valid_count``   : quality <= 1 and not fill
+            - ``ntl_fill_count``    : fill sentinel (no data at all)
+            - ``ntl_invalid_count`` : quality > 1 and not fill (imputed)
+
     Output columns:
         - ``date``: Observation date.
-        - ``ntl_mean``: Mean NTL radiance of valid pixels (quality ≤ 1, not
-          fill). Unit: nW/cm²/sr.
-        - ``ntl_sum``: Sum of NTL radiance of valid pixels.
-        - ``ntl_valid_count``: Number of valid pixels (quality ≤ 1, not fill).
-        - ``ntl_fill_count``: Number of fill-value pixels (``-999.9``).
-        - ``ntl_invalid_count``: Number of non-fill pixels with poor quality.
+        - ``ntl_mean``: Mean NTL radiance over the pixel set selected by
+          ``selective``. Unit: nW/cm²/sr.
+        - ``ntl_sum``: Sum of NTL radiance over the selected pixel set.
+        - ``ntl_valid_count``: Number of directly-observed pixels (quality ≤ 1,
+          not fill).
+        - ``ntl_fill_count``: Number of fill-value pixels (no measurement).
+        - ``ntl_invalid_count``: Number of imputed/degraded pixels (quality > 1,
+          not fill).
     """
-    logger.info("=== Phase 2: VIIRS %s daily aggregation ===", product.upper())
+    label = f"VIIRS {product.upper()} {'selective' if selective else 'non-selective (all)'}"
+    logger.info("=== Phase 2: %s daily aggregation ===", label)
     t0 = time.time()
 
     if _stage_done(out_dir) and not force:
-        logger.info("VIIRS daily output already present — skipping (use --force to re-run).")
+        logger.info("%s daily output already present — skipping (use --force to re-run).", label)
         return
 
     if force:
@@ -212,17 +234,26 @@ def aggregate_viirs(
         "date", "ntl_radiance", "quality_flag", "is_fill"
     )
 
-    # Classification predicates, defined once for readability.
-    is_valid = (~F.col("is_fill")) & (F.col("quality_flag") <= 1)
-    is_fill = F.col("is_fill")
-    is_invalid = (~F.col("is_fill")) & (F.col("quality_flag") > 1)
+    # Fixed pixel-classification predicates — identical in both modes so
+    # ntl_valid_count / ntl_fill_count / ntl_invalid_count are always comparable.
+    is_directly_observed = (~F.col("is_fill")) & (F.col("quality_flag") <= 1)
+    is_fill_pred = F.col("is_fill")
+    is_imputed = (~F.col("is_fill")) & (F.col("quality_flag") > 1)
+
+    # The mean/sum predicate changes based on selectivity.
+    if selective:
+        # Only high-quality, directly observed pixels contribute to ntl_mean.
+        is_for_mean = is_directly_observed
+    else:
+        # All non-fill pixels (quality 0–3) contribute to ntl_mean.
+        is_for_mean = ~F.col("is_fill")
 
     agg_df = df.groupBy("date").agg(
-        F.mean(F.when(is_valid, F.col("ntl_radiance"))).alias("ntl_mean"),
-        F.sum(F.when(is_valid, F.col("ntl_radiance"))).alias("ntl_sum"),
-        F.sum(F.when(is_valid, 1).otherwise(0)).cast(T.IntegerType()).alias("ntl_valid_count"),
-        F.sum(F.when(is_fill, 1).otherwise(0)).cast(T.IntegerType()).alias("ntl_fill_count"),
-        F.sum(F.when(is_invalid, 1).otherwise(0)).cast(T.IntegerType()).alias("ntl_invalid_count"),
+        F.mean(F.when(is_for_mean, F.col("ntl_radiance"))).alias("ntl_mean"),
+        F.sum(F.when(is_for_mean, F.col("ntl_radiance"))).alias("ntl_sum"),
+        F.sum(F.when(is_directly_observed, 1).otherwise(0)).cast(T.IntegerType()).alias("ntl_valid_count"),
+        F.sum(F.when(is_fill_pred, 1).otherwise(0)).cast(T.IntegerType()).alias("ntl_fill_count"),
+        F.sum(F.when(is_imputed, 1).otherwise(0)).cast(T.IntegerType()).alias("ntl_invalid_count"),
     ).withColumn("year", F.year("date"))
 
     # The aggregated result is ~5k rows across ~15 years. Coalesce to one
@@ -246,7 +277,13 @@ def aggregate_viirs(
                      + result["ntl_invalid_count"])
     valid_frac = result["ntl_valid_count"] / total_per_day.replace(0, pd.NA)
 
+    # For non-selective mode, also report the fraction of pixels that were
+    # imputed (quality > 1) among the non-fill pixels used in ntl_mean.
+    non_fill_per_day = result["ntl_valid_count"] + result["ntl_invalid_count"]
+    imputed_frac = result["ntl_invalid_count"] / non_fill_per_day.replace(0, pd.NA)
+
     extra = {
+        "selective": selective,
         "pixel_counts_per_day": {
             "min": int(total_per_day.min()),
             "max": int(total_per_day.max()),
@@ -256,12 +293,17 @@ def aggregate_viirs(
             "mean": round(float(valid_frac.mean()), 4) if valid_frac.notna().any() else None,
             "min": round(float(valid_frac.min()), 4) if valid_frac.notna().any() else None,
         },
+        "imputed_pixel_fraction": {
+            "mean": round(float(imputed_frac.mean()), 4) if imputed_frac.notna().any() else None,
+            "max": round(float(imputed_frac.max()), 4) if imputed_frac.notna().any() else None,
+        },
         "integrity": {
             "total_aggregated_days": len(result),
         },
         "stage_elapsed_seconds": round(time.time() - t0, 1),
     }
-    metrics = _compute_quality_metrics(out_parquet, f"viirs_{product}_daily", 2, extra)
+    source_label = f"viirs_{product}_daily" if selective else f"viirs_{product}_all_daily"
+    metrics = _compute_quality_metrics(out_parquet, source_label, 2, extra)
     _write_quality_json(metrics, out_dir)
 
 
@@ -621,6 +663,15 @@ def main() -> None:
             out_dir=os.path.join(p2_dir, "viirs_a2_daily"),
             force=args.force,
             product="a2",
+            selective=True,
+        )
+        aggregate_viirs(
+            spark,
+            p1_dir=os.path.join(p1_dir, "viirs_a2"),
+            out_dir=os.path.join(p2_dir, "viirs_a2_all_daily"),
+            force=args.force,
+            product="a2",
+            selective=False,
         )
         aggregate_viirs(
             spark,
@@ -628,6 +679,7 @@ def main() -> None:
             out_dir=os.path.join(p2_dir, "viirs_a1_daily"),
             force=args.force,
             product="a1",
+            selective=True,
         )
         combine_cbs(
             spark,

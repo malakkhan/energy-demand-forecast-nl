@@ -12,6 +12,7 @@ partitioned by year, with a comprehensive ``data_quality.json``.
 Join strategy (pure pandas — the total dataset is ~122K rows):
     - **ENTSO-E** (hourly): Left-join on ``timestamp``.
     - **VIIRS A2 daily** (daily): Left-join on ``date``; columns prefixed ``ntl_a2_``.
+    - **VIIRS A2 all daily** (daily): Left-join on ``date``; columns prefixed ``ntl_a2_all_``.
     - **VIIRS A1 daily** (daily): Left-join on ``date``; columns prefixed ``ntl_a1_``.
     - **CBS Combined** (monthly): Left-join on ``(year, month)``.
     - **KNMI** (hourly): Left-join on ``timestamp``; 8 weather variables + station count.
@@ -298,9 +299,12 @@ def _ordered_columns(columns: list) -> list:
         "timestamp",
         # Target
         "entsoe_load_mw",
-        # VIIRS A2 aggregates (gap-filled BRDF-corrected)
+        # VIIRS A2 selective aggregates (quality <= 1 only)
         "ntl_a2_mean", "ntl_a2_sum",
         "ntl_a2_valid_count", "ntl_a2_fill_count", "ntl_a2_invalid_count",
+        # VIIRS A2 non-selective aggregates (all non-fill pixels incl. imputed)
+        "ntl_a2_all_mean", "ntl_a2_all_sum",
+        "ntl_a2_all_valid_count", "ntl_a2_all_fill_count", "ntl_a2_all_invalid_count",
         # VIIRS A1 aggregates (at-sensor radiance)
         "ntl_a1_mean", "ntl_a1_sum",
         "ntl_a1_valid_count", "ntl_a1_fill_count", "ntl_a1_invalid_count",
@@ -457,8 +461,9 @@ def main() -> None:
 
     # 2. Join sources — all done in-memory with pandas merge.
     df = join_entsoe(df, os.path.join(p2_dir, "entsoe", "data"))
-    df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_daily", "data"), product="a2")
-    df = join_viirs(df, os.path.join(p2_dir, "viirs_a1_daily", "data"), product="a1")
+    df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_daily",     "data"), product="a2")
+    df = join_viirs(df, os.path.join(p2_dir, "viirs_a2_all_daily", "data"), product="a2_all")
+    df = join_viirs(df, os.path.join(p2_dir, "viirs_a1_daily",     "data"), product="a1")
     df = join_cbs(df, os.path.join(p2_dir, "cbs_combined", "data"))
     df = join_knmi(df, os.path.join(p2_dir, "knmi", "data"), col_prefix="knmi")
     df = join_knmi(df, os.path.join(p2_dir, "knmi_validated", "data"), col_prefix="knmi_val")
@@ -490,23 +495,26 @@ def main() -> None:
 
     # 6. Quality + coverage
     total = len(df)
-    entsoe_nn = int(df["entsoe_load_mw"].notna().sum())
-    viirs_a2_nn = int(df["ntl_a2_mean"].notna().sum()) if "ntl_a2_mean" in df.columns else 0
-    viirs_a1_nn = int(df["ntl_a1_mean"].notna().sum()) if "ntl_a1_mean" in df.columns else 0
+    entsoe_nn     = int(df["entsoe_load_mw"].notna().sum())
+    viirs_a2_nn   = int(df["ntl_a2_mean"].notna().sum())     if "ntl_a2_mean"     in df.columns else 0
+    viirs_a2all_nn= int(df["ntl_a2_all_mean"].notna().sum()) if "ntl_a2_all_mean" in df.columns else 0
+    viirs_a1_nn   = int(df["ntl_a1_mean"].notna().sum())     if "ntl_a1_mean"     in df.columns else 0
     cbs_energy_nn = int(df["cbs_gas_total_tax"].notna().sum()) if "cbs_gas_total_tax" in df.columns else 0
-    cbs_gdp_nn = int(df["cbs_gdp_yy"].notna().sum()) if "cbs_gdp_yy" in df.columns else 0
-    cbs_cpi_nn = int(df["cbs_cpi_energy"].notna().sum()) if "cbs_cpi_energy" in df.columns else 0
-    cbs_gep_nn = int(df["cbs_gep_gas_hh_total"].notna().sum()) if "cbs_gep_gas_hh_total" in df.columns else 0
-    knmi_nn = int(df["knmi_temp_c"].notna().sum()) if "knmi_temp_c" in df.columns else 0
-    knmi_val_nn = int(df["knmi_val_temp_c"].notna().sum()) if "knmi_val_temp_c" in df.columns else 0
+    cbs_gdp_nn    = int(df["cbs_gdp_yy"].notna().sum())       if "cbs_gdp_yy"        in df.columns else 0
+    cbs_cpi_nn    = int(df["cbs_cpi_energy"].notna().sum())    if "cbs_cpi_energy"    in df.columns else 0
+    cbs_gep_nn    = int(df["cbs_gep_gas_hh_total"].notna().sum()) if "cbs_gep_gas_hh_total" in df.columns else 0
+    knmi_nn       = int(df["knmi_temp_c"].notna().sum())       if "knmi_temp_c"     in df.columns else 0
+    knmi_val_nn   = int(df["knmi_val_temp_c"].notna().sum())   if "knmi_val_temp_c" in df.columns else 0
     load = df["entsoe_load_mw"].dropna()
 
     logger.info("Final: %d hourly rows.", total)
     logger.info(
-        "Coverage — ENTSO-E: %.1f%% | VIIRS A2: %.1f%% | VIIRS A1: %.1f%% "
-        "| CBS Tariffs: %.1f%% | CBS GDP: %.1f%% | CBS CPI: %.1f%% "
+        "Coverage — ENTSO-E: %.1f%% | VIIRS A2 (sel): %.1f%% | VIIRS A2 (all): %.1f%% "
+        "| VIIRS A1: %.1f%% | CBS Tariffs: %.1f%% | CBS GDP: %.1f%% | CBS CPI: %.1f%% "
         "| CBS GEP: %.1f%% | KNMI: %.1f%% | KNMI Val: %.1f%%",
-        100 * entsoe_nn / total, 100 * viirs_a2_nn / total,
+        100 * entsoe_nn / total,
+        100 * viirs_a2_nn / total,
+        100 * viirs_a2all_nn / total,
         100 * viirs_a1_nn / total,
         100 * cbs_energy_nn / total, 100 * cbs_gdp_nn / total,
         100 * cbs_cpi_nn / total, 100 * cbs_gep_nn / total,
@@ -536,6 +544,10 @@ def main() -> None:
             "ntl_a2_mean": {
                 "non_null": viirs_a2_nn,
                 "pct": round(100 * viirs_a2_nn / total, 2) if total else 0.0,
+            },
+            "ntl_a2_all_mean": {
+                "non_null": viirs_a2all_nn,
+                "pct": round(100 * viirs_a2all_nn / total, 2) if total else 0.0,
             },
             "ntl_a1_mean": {
                 "non_null": viirs_a1_nn,

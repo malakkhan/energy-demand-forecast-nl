@@ -71,12 +71,13 @@ REPO     = Path(__file__).parent.parent
 FIG_DIR  = REPO / "analysis" / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
-P_FINAL  = REPO / "data" / "processed" / "nl_hourly_dataset.parquet"
-P_P2_A2  = REPO / "data" / "processing_2" / "viirs_a2_daily" / "data"
-P_P2_A1  = REPO / "data" / "processing_2" / "viirs_a1_daily" / "data"
-P_P2_CBS = REPO / "data" / "processing_2" / "cbs_combined"   / "data"
-P_P2_KNMI= REPO / "data" / "processing_2" / "knmi"           / "data"
-P_P2_KNMI_VAL = REPO / "data" / "processing_2" / "knmi_validated" / "data"
+P_FINAL      = REPO / "data" / "processed" / "nl_hourly_dataset.parquet"
+P_P2_A2      = REPO / "data" / "processing_2" / "viirs_a2_daily"     / "data"
+P_P2_A2_ALL  = REPO / "data" / "processing_2" / "viirs_a2_all_daily" / "data"
+P_P2_A1      = REPO / "data" / "processing_2" / "viirs_a1_daily"     / "data"
+P_P2_CBS     = REPO / "data" / "processing_2" / "cbs_combined"       / "data"
+P_P2_KNMI    = REPO / "data" / "processing_2" / "knmi"               / "data"
+P_P2_KNMI_VAL= REPO / "data" / "processing_2" / "knmi_validated"     / "data"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -118,7 +119,7 @@ _avail = set(pq.read_schema(_first_pq).names)
 
 _want = [
     "timestamp", "entsoe_load_mw",
-    "ntl_a2_mean", "ntl_a1_mean",
+    "ntl_a2_mean", "ntl_a2_all_mean", "ntl_a1_mean",
     "cbs_cpi_energy", "cbs_cpi_electricity", "cbs_cpi_gas",
     "cbs_gep_gas_hh_total", "cbs_gep_elec_hh_total",
     "cbs_gas_total_tax", "cbs_elec_total_tax",
@@ -138,12 +139,21 @@ _vcols = ["date","ntl_mean","ntl_sum","ntl_valid_count","ntl_fill_count","ntl_in
 viirs_a2 = pd.read_parquet(P_P2_A2, columns=_vcols)
 viirs_a2["date"] = pd.to_datetime(viirs_a2["date"])
 viirs_a2 = viirs_a2.sort_values("date").set_index("date")
-print(f"  VIIRS A2: {len(viirs_a2):,} rows")
+print(f"  VIIRS A2 (selective): {len(viirs_a2):,} rows")
+
+if P_P2_A2_ALL.exists():
+    viirs_a2_all = pd.read_parquet(P_P2_A2_ALL, columns=_vcols)
+    viirs_a2_all["date"] = pd.to_datetime(viirs_a2_all["date"])
+    viirs_a2_all = viirs_a2_all.sort_values("date").set_index("date")
+    print(f"  VIIRS A2 (all pix) : {len(viirs_a2_all):,} rows")
+else:
+    viirs_a2_all = pd.DataFrame()
+    print("  VIIRS A2 (all pix) : not found — skipping A2-all analysis")
 
 viirs_a1 = pd.read_parquet(P_P2_A1, columns=_vcols)
 viirs_a1["date"] = pd.to_datetime(viirs_a1["date"])
 viirs_a1 = viirs_a1.sort_values("date").set_index("date")
-print(f"  VIIRS A1: {len(viirs_a1):,} rows")
+print(f"  VIIRS A1           : {len(viirs_a1):,} rows")
 
 cbs = pd.read_parquet(P_P2_CBS)
 cbs["date"] = pd.to_datetime(cbs[["year","month"]].assign(day=1))
@@ -387,8 +397,8 @@ shared = viirs_a2["ntl_mean"].index.intersection(viirs_a1["ntl_mean"].index)
 roll_a2 = viirs_a2["ntl_mean"].reindex(shared).rolling(30, center=True).mean()
 roll_a1 = viirs_a1["ntl_mean"].reindex(shared).rolling(30, center=True).mean()
 fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
-fig.suptitle("VIIRS A1 vs A2 — 30-day Rolling Mean")
-axes[0].plot(roll_a2.index, roll_a2.values, color="steelblue",    lw=1.4, label="A2 (gap-filled, BRDF-corrected)")
+fig.suptitle("VIIRS A1 vs A2 (selective) — 30-day Rolling Mean")
+axes[0].plot(roll_a2.index, roll_a2.values, color="steelblue",    lw=1.4, label="A2 selective (quality ≤ 1)")
 axes[0].plot(roll_a1.index, roll_a1.values, color="mediumpurple", lw=1.4, label="A1 (at-sensor raw)")
 axes[0].set_ylabel("30-day mean ntl_mean"); axes[0].legend(fontsize=10)
 ratio = viirs_a1["ntl_mean"].reindex(shared) / viirs_a2["ntl_mean"].reindex(shared).replace(0, np.nan)
@@ -400,6 +410,107 @@ _ratio_clean = ratio.dropna()
 R["viirs_a1a2_ratio"] = {"mean": round(float(_ratio_clean.mean()), 4),
                          "median": round(float(_ratio_clean.median()), 4),
                          "std": round(float(_ratio_clean.std()), 4)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4b  VIIRS A2 NON-SELECTIVE (all non-fill pixels, including imputed)
+# ══════════════════════════════════════════════════════════════════════════════
+if not viirs_a2_all.empty:
+    print("\n[4b] VIIRS A2 all pixels (non-selective)")
+    R["viirs_a2_all"] = analyse_viirs(
+        viirs_a2_all, "viirs_a2_all",
+        "VIIRS VNP46A2 All Pixels (incl. imputed)", "teal"
+    )
+
+    # A2 selective vs A2-all comparison
+    print("[4b.5] A2 selective vs A2 all comparison …", end=" ", flush=True)
+    t1 = time.time()
+    shared_a2 = viirs_a2["ntl_mean"].index.intersection(viirs_a2_all["ntl_mean"].index)
+    roll_sel = viirs_a2["ntl_mean"].reindex(shared_a2).rolling(30, center=True).mean()
+    roll_all = viirs_a2_all["ntl_mean"].reindex(shared_a2).rolling(30, center=True).mean()
+
+    # Also compute valid and imputed pixel fractions from the all-pixel version
+    tot_px  = (viirs_a2_all["ntl_valid_count"]
+               + viirs_a2_all["ntl_fill_count"]
+               + viirs_a2_all["ntl_invalid_count"]).replace(0, np.nan)
+    imputed_frac = viirs_a2_all["ntl_invalid_count"] / tot_px * 100
+    valid_frac   = viirs_a2_all["ntl_valid_count"]   / tot_px * 100
+
+    fig, axes = plt.subplots(3, 1, figsize=(18, 13), sharex=True)
+    fig.suptitle("VIIRS A2: Selective (quality ≤ 1) vs Non-Selective (all pixels) — 30-day Rolling Mean")
+
+    axes[0].plot(roll_sel.index, roll_sel.values, color="steelblue", lw=1.4,
+                 label="A2 selective (quality ≤ 1 only)")
+    axes[0].plot(roll_all.index, roll_all.values, color="teal",      lw=1.4,
+                 label="A2 all pixels (incl. imputed)")
+    axes[0].set_ylabel("ntl_mean (nW/cm²/sr)"); axes[0].legend(fontsize=10)
+
+    axes[1].stackplot(
+        viirs_a2_all.index,
+        valid_frac.fillna(0), imputed_frac.fillna(0),
+        labels=["Directly observed (quality ≤ 1)", "Imputed / gap-filled (quality > 1)"],
+        colors=["seagreen", "darkorange"], alpha=0.75,
+    )
+    axes[1].set_ylabel("% of non-fill pixels"); axes[1].legend(loc="upper right", fontsize=9)
+    axes[1].set_ylim(0, 105)
+
+    ratio_a2 = (viirs_a2_all["ntl_mean"].reindex(shared_a2)
+                / viirs_a2["ntl_mean"].reindex(shared_a2).replace(0, np.nan))
+    axes[2].plot(ratio_a2.index, ratio_a2.rolling(30, center=True).mean().values,
+                 color="darkorange", lw=1.4)
+    axes[2].axhline(1.0, color="black", lw=0.8, ls="--", alpha=0.5)
+    axes[2].set_ylabel("all / selective ratio")
+    axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.tight_layout(); savefig(fig, "viirs_a2_selective_vs_all"); print(elapsed(t1))
+
+    # Monthly breakdown of imputed fraction
+    print("[4b.6] A2 imputed pixel fraction by month …", end=" ", flush=True)
+    t1 = time.time()
+    imp_df = imputed_frac.to_frame("imputed_pct")
+    imp_df["valid_pct"] = valid_frac
+    imp_df["month"] = imp_df.index.month
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("VIIRS A2: Fraction of Imputed (gap-filled) vs Directly Observed Pixels by Month")
+    months_order = list(range(1, 13))
+    imp_monthly = imp_df.groupby("month")[["imputed_pct", "valid_pct"]].mean().reindex(months_order)
+    imp_monthly.index = MONTH_NAMES
+    imp_monthly[["valid_pct", "imputed_pct"]].plot(
+        kind="bar", ax=axes[0], color=["seagreen", "darkorange"],
+        label=["Directly observed", "Imputed"], legend=True,
+    )
+    axes[0].set_title("Mean pixel composition by month")
+    axes[0].set_ylabel("% of non-fill pixels"); axes[0].set_xticklabels(MONTH_NAMES, rotation=45)
+    axes[0].legend(["Directly observed (quality ≤ 1)", "Imputed (quality > 1)"])
+
+    sns.boxplot(data=imp_df.dropna(), x="month", y="imputed_pct",
+                ax=axes[1], color="darkorange", showfliers=False, linewidth=0.7)
+    axes[1].set_title("Distribution of imputed pixel % by month")
+    axes[1].set_ylabel("Imputed pixel %"); axes[1].set_xticklabels(MONTH_NAMES, rotation=45)
+    plt.tight_layout(); savefig(fig, "viirs_a2_imputed_fraction_monthly"); print(elapsed(t1))
+
+    _imp_monthly_mean = {MONTH_NAMES[int(m)-1]: round(float(v), 2)
+                         for m, v in imp_df.groupby("month")["imputed_pct"].mean().items()}
+    _imp_overall = round(float(imputed_frac.mean()), 2) if imputed_frac.notna().any() else None
+    R["viirs_a2_all"]["imputed_pixel_pct_monthly_mean"] = _imp_monthly_mean
+    R["viirs_a2_all"]["imputed_pixel_pct_overall_mean"] = _imp_overall
+
+    # Pearson correlation with ENTSO-E load for all three NTL series
+    if "entsoe_load_mw" in hourly.columns and "ntl_a2_all_mean" in hourly.columns:
+        _sel = hourly[["entsoe_load_mw", "ntl_a2_mean",
+                       "ntl_a2_all_mean", "ntl_a1_mean"]].dropna()
+        _corr = {
+            "ntl_a2_selective": round(float(_sel["entsoe_load_mw"].corr(_sel["ntl_a2_mean"])), 4)
+                if "ntl_a2_mean" in _sel.columns else None,
+            "ntl_a2_all":       round(float(_sel["entsoe_load_mw"].corr(_sel["ntl_a2_all_mean"])), 4)
+                if "ntl_a2_all_mean" in _sel.columns else None,
+            "ntl_a1":           round(float(_sel["entsoe_load_mw"].corr(_sel["ntl_a1_mean"])), 4)
+                if "ntl_a1_mean" in _sel.columns else None,
+        }
+        R["viirs_ntl_load_correlations"] = _corr
+        print(f"  NTL–load correlations: {_corr}")
+else:
+    print("\n[4b] VIIRS A2 all pixels: skipped (data not found)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

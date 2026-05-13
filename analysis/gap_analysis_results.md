@@ -36,6 +36,27 @@ Most gaps are concentrated in 2015–2016 (early dataset period) and are likely 
 
 ---
 
+## KNMI Validated (Hourly)
+
+| Metric | Value |
+|--------|-------|
+| **Range** | 2012-01-01 → 2026-05-12 |
+| **Total files** | 125,878 |
+| **Extracted records** | **125,878** |
+| **Corrupt files** | **0** |
+
+> [!NOTE]
+> 2 files were initially corrupt (0-byte / truncated HDF5) after the bulk download on 2026-05-13:
+>
+> | File | Date/Hour |
+> |------|-----------|
+> | `hourly-observations-validated-20190819-18.nc` | 2019-08-19 18:00 UTC |
+> | `hourly-observations-validated-20221103-01.nc` | 2022-11-03 01:00 UTC |
+>
+> Both were re-downloaded, verified, and successfully re-extracted. The dataset now has **0 errors and full coverage**.
+
+---
+
 ## VIIRS A1 (VNP46A1 — At-Sensor Radiance, Daily)
 
 | Metric | Value |

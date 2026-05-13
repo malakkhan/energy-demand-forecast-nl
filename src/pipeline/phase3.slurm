@@ -11,6 +11,12 @@
 REPO_ROOT=/projects/prjs2061/energy-demand-forecast-nl
 mkdir -p "$REPO_ROOT/logs"
 
+# ── Load modules and activate venv ────────────────────────────────────────────
+module load 2023
+module load Python/3.11.3-GCCcore-12.3.0
+source "${REPO_ROOT}/.venv/bin/activate"
+
 python -u "$REPO_ROOT/src/pipeline/phase3_merge.py" \
     --out-root "$REPO_ROOT/data" \
-    --workers  "$SLURM_CPUS_PER_TASK"
+    --workers  "$SLURM_CPUS_PER_TASK" \
+    --force
