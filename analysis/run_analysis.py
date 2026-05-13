@@ -119,7 +119,8 @@ _avail = set(pq.read_schema(_first_pq).names)
 
 _want = [
     "timestamp", "entsoe_load_mw",
-    "ntl_a2_mean", "ntl_a2_all_mean", "ntl_a1_mean",
+    "ntl_a2_mean", "ntl_a2_sum", "ntl_a2_all_mean", "ntl_a2_all_sum",
+    "ntl_a1_mean", "ntl_a1_sum",
     "cbs_cpi_energy", "cbs_cpi_electricity", "cbs_cpi_gas",
     "cbs_gep_gas_hh_total", "cbs_gep_elec_hh_total",
     "cbs_gas_total_tax", "cbs_elec_total_tax",
@@ -296,32 +297,44 @@ def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> dict
     """Analyse a VIIRS product and return numerical results."""
     vr = {}  # results for this product
     a_mean   = viirs["ntl_mean"]
+    a_sum    = viirs["ntl_sum"]
     total_px = viirs[["ntl_valid_count","ntl_fill_count","ntl_invalid_count"]].sum(axis=1)
     vpct     = viirs["ntl_valid_count"].div(total_px.replace(0, np.nan)) * 100
 
     # 3/4.1 ── Time series
     print(f"[{tag}.1] {label} time series …", end=" ", flush=True)
     t1 = time.time()
-    fig, axes = plt.subplots(3, 1, figsize=(18, 11), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(18, 14), sharex=True)
     fig.suptitle(f"{label} — Daily NTL Radiance, Netherlands")
     axes[0].plot(a_mean.index, a_mean.values, lw=0.35, color=color, alpha=0.65)
     axes[0].plot(a_mean.rolling(30,center=True).mean().index,
                  a_mean.rolling(30,center=True).mean().values, color=color, lw=1.8, label="30d mean")
     axes[0].set_ylabel("ntl_mean (nW/cm²/sr)"); axes[0].legend(fontsize=10)
     axes[0].set_title("Mean NTL radiance")
-    axes[1].stackplot(viirs.index,
+    axes[1].plot(a_sum.index, a_sum.values, lw=0.35, color="darkorange", alpha=0.65)
+    axes[1].plot(a_sum.rolling(30,center=True).mean().index,
+                 a_sum.rolling(30,center=True).mean().values, color="darkorange", lw=1.8, label="30d sum")
+    axes[1].set_ylabel("ntl_sum (nW/cm²/sr)"); axes[1].legend(fontsize=10)
+    axes[1].set_title("Total NTL radiance (sum over valid pixels)")
+    axes[2].stackplot(viirs.index,
                       viirs["ntl_valid_count"], viirs["ntl_fill_count"], viirs["ntl_invalid_count"],
                       labels=["valid","fill","invalid"],
                       colors=["seagreen","firebrick","darkorange"], alpha=0.7)
-    axes[1].set_ylabel("Pixel count"); axes[1].legend(loc="upper right", fontsize=9)
-    axes[2].plot(vpct.index, vpct.values, lw=0.4, color=color, alpha=0.7)
-    axes[2].plot(vpct.rolling(30,center=True).mean().index,
+    axes[2].set_ylabel("Pixel count"); axes[2].legend(loc="upper right", fontsize=9)
+    axes[3].plot(vpct.index, vpct.values, lw=0.4, color=color, alpha=0.7)
+    axes[3].plot(vpct.rolling(30,center=True).mean().index,
                  vpct.rolling(30,center=True).mean().values, color=color, lw=1.8)
-    axes[2].set_ylabel("Valid pixel (%)"); axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    axes[3].set_ylabel("Valid pixel (%)"); axes[3].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     plt.tight_layout(); savefig(fig, f"{tag.lower()}_01_timeseries"); print(elapsed(t1))
-    vr["overall_stats"] = {"mean": round(float(a_mean.mean()), 4), "std": round(float(a_mean.std()), 4),
-                           "min": round(float(a_mean.min()), 4), "max": round(float(a_mean.max()), 4),
-                           "valid_pixel_pct_mean": round(float(vpct.mean()), 2)}
+    vr["overall_stats"] = {
+        "mean": round(float(a_mean.mean()), 4), "std": round(float(a_mean.std()), 4),
+        "min": round(float(a_mean.min()), 4), "max": round(float(a_mean.max()), 4),
+        "valid_pixel_pct_mean": round(float(vpct.mean()), 2),
+        "sum_mean": round(float(a_sum.mean()), 2),
+        "sum_std": round(float(a_sum.std()), 2),
+        "sum_min": round(float(a_sum.min()), 2),
+        "sum_max": round(float(a_sum.max()), 2),
+    }
 
     # 3/4.2 ── STL (last 5 years, period=365, non-robust for speed)
     print(f"[{tag}.2] {label} STL …", end=" ", flush=True)
@@ -365,22 +378,33 @@ def analyse_viirs(viirs: pd.DataFrame, tag: str, label: str, color: str) -> dict
     # 3/4.4 ── Subseries
     print(f"[{tag}.4] {label} subseries …", end=" ", flush=True)
     t1 = time.time()
-    df = viirs[["ntl_mean"]].copy()
+    df = viirs[["ntl_mean", "ntl_sum"]].copy()
     df["month"] = df.index.month; df["dayofwk"] = df.index.dayofweek
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle(f"{label} NTL Mean — Seasonal Subseries")
-    sns.boxplot(data=df.dropna(), x="month", y="ntl_mean",   ax=axes[0], color=color, showfliers=False, linewidth=0.7)
-    axes[0].set_title("By calendar month"); axes[0].set_xticklabels(MONTH_NAMES, rotation=45)
-    sns.boxplot(data=df.dropna(), x="dayofwk", y="ntl_mean", ax=axes[1], color=color, showfliers=False, linewidth=0.7)
-    axes[1].set_title("By day of week"); axes[1].set_xticklabels(DOW_MON_FIRST)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"{label} NTL — Seasonal Subseries (Mean and Sum)")
+    sns.boxplot(data=df.dropna(), x="month", y="ntl_mean",   ax=axes[0,0], color=color, showfliers=False, linewidth=0.7)
+    axes[0,0].set_title("Mean by month"); axes[0,0].set_xticklabels(MONTH_NAMES, rotation=45)
+    sns.boxplot(data=df.dropna(), x="dayofwk", y="ntl_mean", ax=axes[0,1], color=color, showfliers=False, linewidth=0.7)
+    axes[0,1].set_title("Mean by day of week"); axes[0,1].set_xticklabels(DOW_MON_FIRST)
     hmap = df.dropna().groupby([df.dropna().index.year,"month"])["ntl_mean"].mean().unstack("month")
     hmap.columns = [MONTH_NAMES[int(m)-1] for m in hmap.columns]
-    sns.heatmap(hmap, ax=axes[2], cmap="YlOrRd", cbar_kws={"label":"Mean NTL","shrink":0.8},
+    sns.heatmap(hmap, ax=axes[0,2], cmap="YlOrRd", cbar_kws={"label":"Mean NTL","shrink":0.8},
                 linewidths=0.3, linecolor="white")
-    axes[2].set_title("Year × month heatmap")
+    axes[0,2].set_title("Mean: year × month heatmap")
+    sns.boxplot(data=df.dropna(), x="month", y="ntl_sum",    ax=axes[1,0], color="darkorange", showfliers=False, linewidth=0.7)
+    axes[1,0].set_title("Sum by month"); axes[1,0].set_xticklabels(MONTH_NAMES, rotation=45)
+    sns.boxplot(data=df.dropna(), x="dayofwk", y="ntl_sum",  ax=axes[1,1], color="darkorange", showfliers=False, linewidth=0.7)
+    axes[1,1].set_title("Sum by day of week"); axes[1,1].set_xticklabels(DOW_MON_FIRST)
+    hmap_s = df.dropna().groupby([df.dropna().index.year,"month"])["ntl_sum"].mean().unstack("month")
+    hmap_s.columns = [MONTH_NAMES[int(m)-1] for m in hmap_s.columns]
+    sns.heatmap(hmap_s, ax=axes[1,2], cmap="YlOrRd", cbar_kws={"label":"Sum NTL","shrink":0.8},
+                linewidths=0.3, linecolor="white")
+    axes[1,2].set_title("Sum: year × month heatmap")
     plt.tight_layout(); savefig(fig, f"{tag.lower()}_04_subseries"); print(elapsed(t1))
     vr["subseries_monthly_mean"] = {MONTH_NAMES[int(m)-1]: round(float(v), 4)
                                     for m, v in df.dropna().groupby("month")["ntl_mean"].mean().items()}
+    vr["subseries_monthly_sum"] = {MONTH_NAMES[int(m)-1]: round(float(v), 2)
+                                   for m, v in df.dropna().groupby("month")["ntl_sum"].mean().items()}
     return vr
 
 
@@ -495,18 +519,20 @@ if not viirs_a2_all.empty:
     R["viirs_a2_all"]["imputed_pixel_pct_monthly_mean"] = _imp_monthly_mean
     R["viirs_a2_all"]["imputed_pixel_pct_overall_mean"] = _imp_overall
 
-    # Pearson correlation with ENTSO-E load for all three NTL series
+    # Pearson correlation with ENTSO-E load for all three NTL series (mean + sum)
     if "entsoe_load_mw" in hourly.columns and "ntl_a2_all_mean" in hourly.columns:
-        _sel = hourly[["entsoe_load_mw", "ntl_a2_mean",
-                       "ntl_a2_all_mean", "ntl_a1_mean"]].dropna()
-        _corr = {
-            "ntl_a2_selective": round(float(_sel["entsoe_load_mw"].corr(_sel["ntl_a2_mean"])), 4)
-                if "ntl_a2_mean" in _sel.columns else None,
-            "ntl_a2_all":       round(float(_sel["entsoe_load_mw"].corr(_sel["ntl_a2_all_mean"])), 4)
-                if "ntl_a2_all_mean" in _sel.columns else None,
-            "ntl_a1":           round(float(_sel["entsoe_load_mw"].corr(_sel["ntl_a1_mean"])), 4)
-                if "ntl_a1_mean" in _sel.columns else None,
-        }
+        _sel_cols = ["entsoe_load_mw", "ntl_a2_mean", "ntl_a2_all_mean", "ntl_a1_mean"]
+        _sum_cols = ["ntl_a2_sum", "ntl_a2_all_sum", "ntl_a1_sum"]
+        _all_corr_cols = [c for c in _sel_cols + _sum_cols if c in hourly.columns]
+        _sel = hourly[_all_corr_cols].dropna(subset=["entsoe_load_mw"])
+        _corr = {}
+        for col in _all_corr_cols:
+            if col == "entsoe_load_mw":
+                continue
+            _sub = _sel[["entsoe_load_mw", col]].dropna()
+            if len(_sub) > 100:
+                key = col.replace("ntl_", "")
+                _corr[key] = round(float(_sub["entsoe_load_mw"].corr(_sub[col])), 4)
         R["viirs_ntl_load_correlations"] = _corr
         print(f"  NTL–load correlations: {_corr}")
 else:
@@ -629,7 +655,7 @@ plt.tight_layout(); savefig(fig, "cbs_04_subseries"); print(elapsed(t1))
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n[6] Multicollinearity")
 _feat_want = [
-    "entsoe_load_mw", "ntl_a2_mean", "ntl_a1_mean",
+    "entsoe_load_mw", "ntl_a2_mean", "ntl_a2_sum", "ntl_a1_mean", "ntl_a1_sum",
     "cbs_cpi_energy","cbs_cpi_electricity","cbs_cpi_gas",
     "cbs_gep_gas_hh_total","cbs_gep_elec_hh_total",
     "cbs_gas_total_tax","cbs_elec_total_tax",

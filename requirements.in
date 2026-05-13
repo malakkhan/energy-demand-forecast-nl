@@ -13,6 +13,9 @@ pandas
 # Numerical operations (used in VIIRS pixel masking and aggregation)
 numpy
 
+# Polygon-based spatial masking for Netherlands boundary (GADM)
+shapely
+
 # Distributed data processing pipeline (Phase 2/3)
 pyspark
 

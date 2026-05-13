@@ -19,8 +19,8 @@ flowchart TD
 
     subgraph P1["PHASE 1 — EXTRACTION  ·  src/pipeline/phase1_extract.py"]
         direction TB
-        VA2_1["🔬 VIIRS A2 Processor\n· Gap_Filled_DNB_BRDF-Corrected_NTL\n· Mandatory_Quality_Flag (uint8)\n· Crop to NL bbox: 672×937 pixels\n· 1 row per pixel per day"]
-        VA1_1["🔬 VIIRS A1 Processor\n· DNB_At_Sensor_Radiance\n· QF_DNB bits 0-1 → uint8 quality\n· Crop to NL bbox: 672×937 pixels\n· 1 row per pixel per day"]
+        VA2_1["🔬 VIIRS A2 Processor\n· Gap_Filled_DNB_BRDF-Corrected_NTL\n· Mandatory_Quality_Flag (uint8)\n· Crop to NL bbox + GADM polygon mask\n· 285,719 pixels/day\n· 1 row per pixel per day"]
+        VA1_1["🔬 VIIRS A1 Processor\n· DNB_At_Sensor_Radiance\n· QF_DNB bits 0-1 → uint8 quality\n· Crop to NL bbox + GADM polygon mask\n· 285,719 pixels/day\n· 1 row per pixel per day"]
         C1_1["📋 CBS Tariff Harmonizer\n· Read old schema (2018–2023)\n· Read new schema (2021+)\n· Splice at 2020/2021 boundary\n· ODE + energy tax → total_tax\n· Drop non-comparable variable rates"]
         C3_1["📋 CBS CPI Parser\n· Parse Dutch month names\n· Drop annual summary rows\n· Convert comma decimals\n· 3 index series (energy/elec/gas)"]
         C4_1["📋 CBS GEP Parser\n· Parse semester periods\n· Drop annual rows\n· Pivot 3 components × 6 bands\n· Expand semester → 6 monthly rows\n· 18 price columns"]
@@ -45,7 +45,8 @@ flowchart TD
 
     subgraph P2["PHASE 2 — AGGREGATION  ·  src/pipeline/phase2_aggregate.py"]
         direction TB
-        VA2_2["📐 VIIRS A2 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
+        VA2_2["📐 VIIRS A2 Aggregator\n· Selective: quality ≤ 1\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
+        VA2_ALL["📐 VIIRS A2-all Aggregator\n· Non-selective: all non-fill\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
         VA1_2["📐 VIIRS A1 Aggregator\n· GroupBy date\n· mean, sum, valid_count\n· fill_count, invalid_count"]
         C2_2["🔗 CBS Combiner\n· Outer-join energy + GDP\n· + CPI + GEP\n· on (year, month)\n· Year gap detection"]
         E2["✅ ENTSO-E Validator\n· Re-partition by year\n· Per-year hour coverage\n· Load statistics"]
@@ -56,6 +57,7 @@ flowchart TD
     subgraph P2_OUT["processing_2/ outputs"]
         direction LR
         VA2_2_O["viirs_a2_daily/\n~5,080 rows\n📁 by year"]
+        VA2_ALL_O["viirs_a2_all_daily/\n~5,080 rows\n📁 by year"]
         VA1_2_O["viirs_a1_daily/\n~5,080 rows\n📁 by year"]
         C2_O2["cbs_combined/\n~400 rows\n~70 columns"]
         E2_O["entsoe/\n~150K rows\n📁 by year"]
@@ -66,11 +68,11 @@ flowchart TD
     subgraph P3["PHASE 3 — MERGE  ·  src/pipeline/phase3_merge.py"]
         direction TB
         SPINE["🕐 Hourly UTC Spine\n2012-01-01 → today\n~126,000 rows\n+ 9 temporal features"]
-        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A1 on date → ntl_a1_*\n4. CBS on year,month (broadcast)\n5. KNMI on timestamp → knmi_*\n6. KNMI Val on timestamp → knmi_val_*"]
+        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A2-all on date → ntl_a2_all_*\n4. VIIRS A1 on date → ntl_a1_*\n5. CBS on year,month (broadcast)\n6. KNMI on timestamp → knmi_*\n7. KNMI Val on timestamp → knmi_val_*"]
     end
 
     subgraph FINAL["📦 FINAL OUTPUT"]
-        OUT["nl_hourly_dataset.parquet\n~100 columns · ~126K rows\nPartitioned by year"]
+        OUT["nl_hourly_dataset.parquet\n~105 columns · ~126K rows\nPartitioned by year"]
     end
 
     VA2_RAW --> VA2_1
@@ -94,6 +96,7 @@ flowchart TD
     KV1 --> KV1_O
 
     VA2_1_O --> VA2_2
+    VA2_1_O --> VA2_ALL
     VA1_1_O --> VA1_2
     C1_O --> C2_2
     C3_O --> C2_2
@@ -104,6 +107,7 @@ flowchart TD
     KV1_O --> KV2
 
     VA2_2 --> VA2_2_O
+    VA2_ALL --> VA2_ALL_O
     VA1_2 --> VA1_2_O
     C2_2 --> C2_O2
     E2 --> E2_O
@@ -112,6 +116,7 @@ flowchart TD
 
     E2_O --> JOIN
     VA2_2_O --> JOIN
+    VA2_ALL_O --> JOIN
     VA1_2_O --> JOIN
     C2_O2 --> JOIN
     K2_O --> JOIN
@@ -151,7 +156,7 @@ Input A1:  /projects/prjs2061/data/viirs/A1/*.h5  (~5,080 files — at-sensor ra
 Output A1: data/processing_1/viirs_a1/data/  (partitioned by year)
 ```
 
-Both products are extracted by the same `extract_viirs()` function with a `product` parameter. They share the same HDF5 group (`HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields`), lat/lon structure, fill value (−999.9), and NL bounding-box crop. The only differences are the NTL and quality-flag dataset names:
+Both products are extracted by the same `extract_viirs()` function with a `product` parameter. They share the same HDF5 group (`HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields`), lat/lon structure, fill value (−999.9), and two-stage spatial filter. The only differences are the NTL and quality-flag dataset names:
 
 | Aspect | VNP46A2 | VNP46A1 |
 |---|---|---|
@@ -161,15 +166,22 @@ Both products are extracted by the same `extract_viirs()` function with a `produ
 | Fill value | −999.9 | −999.9 |
 
 ````carousel
-**Step 1 — NL Mask Computation**
+**Step 1 — NL Mask Computation (Two-Stage)**
 
 The first HDF5 file is opened to read the 1D `lat` (2400,) and `lon` (2400,) coordinate arrays. These are **identical across all h18v03 files** (they define the fixed sinusoidal grid).
 
-A Netherlands bounding box filter is applied:
+**Stage 1 — Bounding-box crop** (fast first pass):
 - Latitude:  50.75° – 53.55° N → **672 pixel rows** (indices 1548–2219)
 - Longitude:  3.35° –  7.25° E → **937 pixel columns** (indices 804–1740)
+- Result: 672 × 937 = **629,664** candidate pixels
 
-These index arrays are computed **once** and broadcast to all workers.
+**Stage 2 — GADM polygon mask** (precise):
+- Loads the GADM 4.1 Netherlands Level 0 boundary (`data/geo/gadm41_NLD_0.json` — land + islands, WGS84)
+- Runs `shapely.contains_xy()` on all 629,664 bounding-box pixels (~0.3 s, fully vectorised)
+- Result: **285,719** pixels (45.4%) are inside the Netherlands polygon
+- Excluded: North Sea pixels, Belgian border slivers (south Limburg), German border slivers (east Drenthe/Overijssel)
+
+Both the bounding-box indices and the 2D boolean polygon mask are computed **once** and broadcast to all workers.
 <!-- slide -->
 **Step 2 — Parallel HDF5 Reading**
 
@@ -177,7 +189,9 @@ File paths are distributed across a `ProcessPoolExecutor` with ~96 workers. Each
 
 For **A1**, `QF_DNB` is a uint16 bitmask; bits 0–1 are extracted into a uint8 quality tier (0=best, 1=low, 2=poor, 3=no retrieval) — identical semantics to A2's `Mandatory_Quality_Flag`.
 <!-- slide -->
-**Step 3 — Pixel Row Emission**
+**Step 3 — Polygon Masking and Pixel Row Emission**
+
+After slicing the HDF5 data to the bounding-box rectangle, the 2D polygon mask is applied via NumPy boolean indexing: only pixels where `nl_pixel_mask[i,j] == True` are included in the output DataFrame. This eliminates non-Dutch pixels before writing to Parquet.
 
 The output schema is **identical** for both products:
 
@@ -195,7 +209,7 @@ The output schema is **identical** for both products:
 
 Fill pixels are **retained** (not discarded) so Phase 2 can count them.
 
-**Total rows per product**: 629,664 × ~5,080 ≈ **3.2 billion**
+**Total rows per product**: 285,719 × ~5,080 ≈ **1.45 billion**
 ````
 
 ---
@@ -452,31 +466,46 @@ Coverage may differ from the non-validated dataset (validated data typically lag
 
 ### Phase 2 — Aggregation (`phase2_aggregate.py`)
 
-> **Goal**: Reduce spatial VIIRS data to daily scalars, combine CBS tables, validate ENTSO-E.
+> **Goal**: Reduce spatial VIIRS data to daily scalars (both selective and non-selective pixel filters), combine CBS tables, validate ENTSO-E and KNMI.
 
 ---
 
-#### 2A. VIIRS Daily Aggregates (A2 and A1)
+#### 2A. VIIRS Daily Aggregates (A2 selective, A2-all, and A1)
 
 ```
-Input A2:  data/processing_1/viirs_a2/data/   (3.2B pixel rows)
-Output A2: data/processing_2/viirs_a2_daily/data/  (~5,080 rows, partitioned by year)
+Input A2:  data/processing_1/viirs_a2/data/   (1.45B pixel rows)
+Output A2 (selective): data/processing_2/viirs_a2_daily/data/  (~5,080 rows, partitioned by year)
+Output A2 (non-selective): data/processing_2/viirs_a2_all_daily/data/  (~5,080 rows, partitioned by year)
 
-Input A1:  data/processing_1/viirs_a1/data/   (3.2B pixel rows)
+Input A1:  data/processing_1/viirs_a1/data/   (1.45B pixel rows, partitioned by year)
 Output A1: data/processing_2/viirs_a1_daily/data/  (~5,080 rows, partitioned by year)
 ```
 
-Both products are aggregated by the same `aggregate_viirs()` function (with `product="a2"` and `product="a1"` respectively). Groups all ~630K pixels per day into **one row per date** with five aggregate columns:
+Both products are aggregated by the same `aggregate_viirs()` function (with `product` and `selective` parameters). For VNP46A2, two modes are run:
+
+| Mode | `selective` | Pixels in `ntl_mean`/`ntl_sum` | Output dir | Column prefix |
+|---|---|---|---|---|
+| A2 selective | `True` | `quality_flag ≤ 1` AND not fill (high-quality, directly observed) | `viirs_a2_daily/` | `ntl_a2_` |
+| A2 non-selective (A2-all) | `False` | All non-fill pixels (quality 0–3, including gap-filled/imputed) | `viirs_a2_all_daily/` | `ntl_a2_all_` |
+| A1 selective | `True` | `quality_flag ≤ 1` AND not fill | `viirs_a1_daily/` | `ntl_a1_` |
+
+> **Why A2-all?** The selective A2 version exhibits severe survivorship bias — summer nights are short and heavily cloud-masked, so only a small fraction of pixels pass the quality ≤ 1 filter, creating a spurious "summer peak" artifact. A2-all includes gap-filled/imputed pixels (quality 2–3), eliminating this selection bias and achieving ~97.5% hourly coverage (vs ~76% for selective A2). However, the imputed values reflect historical climatological composites, producing a smoother signal with weaker load correlation.
+
+Each run groups all ~286K pixels per day into **one row per date** with five aggregate columns:
+
+In all three modes, the pixel-count breakdown uses the same fixed definitions:
 
 | Column | Aggregation | Filter |
 |---|---|---|
-| `ntl_mean` | `AVG(ntl_radiance)` | where `is_fill=false AND quality_flag ≤ 1` |
-| `ntl_sum` | `SUM(ntl_radiance)` | where `is_fill=false AND quality_flag ≤ 1` |
-| `ntl_valid_count` | `COUNT(*)` | where `is_fill=false AND quality_flag ≤ 1` |
-| `ntl_fill_count` | `COUNT(*)` | where `is_fill=true` |
-| `ntl_invalid_count` | `COUNT(*)` | where `is_fill=false AND quality_flag > 1` |
+| `ntl_mean` | `AVG(ntl_radiance)` | **Selective**: `is_fill=false AND quality_flag ≤ 1`; **Non-selective**: `is_fill=false` |
+| `ntl_sum` | `SUM(ntl_radiance)` | Same as `ntl_mean` |
+| `ntl_valid_count` | `COUNT(*)` | where `is_fill=false AND quality_flag ≤ 1` (always) |
+| `ntl_fill_count` | `COUNT(*)` | where `is_fill=true` (always) |
+| `ntl_invalid_count` | `COUNT(*)` | where `is_fill=false AND quality_flag > 1` (always) |
 
-**Invariant check**: `ntl_valid_count + ntl_fill_count + ntl_invalid_count = 629,664` for every day.
+**Minimum coverage filter (10%)**:  After aggregation, days where the contributing pixel count is below 10% of the NL polygon mask (285,719 × 0.10 = 28,571 pixels) have their `ntl_mean` and `ntl_sum` set to `null`. This prevents extreme survivorship bias from corrupting daily statistics on nights with very sparse clear-sky observations. For selective products, the contributing count is `ntl_valid_count`; for non-selective, it is `ntl_valid_count + ntl_invalid_count` (all non-fill pixels). Pixel counts are preserved regardless of the filter for diagnostic use.
+
+**Invariant check**: `ntl_valid_count + ntl_fill_count + ntl_invalid_count = 285,719` for every day.
 
 ---
 
@@ -549,7 +578,8 @@ flowchart LR
     SPINE["🕐 Hourly Spine\n2012-01-01 00:00\n   ↓ every hour\n2026-04-20 23:00\n~126,000 rows"]
 
     E["⚡ ENTSO-E\n~150K rows\nhourly"]
-    VA2["🛰️ VIIRS A2 Daily\n~5K rows\ndaily"]
+    VA2["🛰️ VIIRS A2 Daily\n(selective)\n~5K rows\ndaily"]
+    VA2ALL["🛰️ VIIRS A2-all Daily\n(non-selective)\n~5K rows\ndaily"]
     VA1["🛰️ VIIRS A1 Daily\n~5K rows\ndaily"]
     C["📊 CBS Combined\n~400 rows\nmonthly\n~50 columns"]
     K["🌤️ KNMI\n~100K rows\nhourly"]
@@ -561,7 +591,10 @@ flowchart LR
     J1 -->|"LEFT JOIN on date\n→ ntl_a2_* cols"| J2
     VA2 --> J2
 
-    J2 -->|"LEFT JOIN on date\n→ ntl_a1_* cols"| J3
+    J2 -->|"LEFT JOIN on date\n→ ntl_a2_all_* cols"| J2b
+    VA2ALL --> J2b
+
+    J2b -->|"LEFT JOIN on date\n→ ntl_a1_* cols"| J3
     VA1 --> J3
 
     J3 -->|"LEFT JOIN\non (year,month)\n(broadcast)"| J4
@@ -573,7 +606,7 @@ flowchart LR
     J5 -->|"LEFT JOIN\non timestamp"| J6
     KV --> J6
 
-    J6 --> OUT["📦 Final Dataset\n~120 columns\n~126K rows"]
+    J6 --> OUT["📦 Final Dataset\n~105 columns\n~126K rows"]
 ```
 
 #### Join Details
@@ -581,11 +614,12 @@ flowchart LR
 | # | Source | Join Key | Output Columns | Strategy |
 |---|---|---|---|---|
 | 1 | ENTSO-E | `timestamp` | `entsoe_load_mw` | Left equi-join |
-| 2 | VIIRS A2 | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Left + broadcast |
-| 3 | VIIRS A1 | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Left + broadcast |
-| 4 | CBS | `(year, month)` | All `cbs_*` columns | Left + broadcast |
-| 5 | KNMI | `timestamp` | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | Left equi-join |
-| 6 | KNMI Validated | `timestamp` | `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count` | Left equi-join |
+| 2 | VIIRS A2 (selective) | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Left + broadcast |
+| 3 | VIIRS A2-all (non-selective) | `date` | `ntl_a2_all_mean`, `ntl_a2_all_sum`, `ntl_a2_all_valid_count`, `ntl_a2_all_fill_count`, `ntl_a2_all_invalid_count` | Left + broadcast |
+| 4 | VIIRS A1 | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Left + broadcast |
+| 5 | CBS | `(year, month)` | All `cbs_*` columns | Left + broadcast |
+| 6 | KNMI | `timestamp` | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | Left equi-join |
+| 7 | KNMI Validated | `timestamp` | `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count` | Left equi-join |
 
 #### Temporal Feature Generation
 
@@ -609,16 +643,18 @@ Phase 3 arranges columns in a deterministic semantic order:
 
 1. `timestamp` (primary key)
 2. `entsoe_load_mw` (target variable)
-3. VIIRS aggregates (`ntl_mean`, `ntl_sum`, etc.)
-4. CBS energy tariffs (gas, then electricity — explicit order)
-5. CBS GDP headline indicators (`cbs_gdp_yy`, `cbs_gdp_qq`, etc.)
-6. CBS population
-7. Any additional `cbs_*` columns (auto-appended in sorted order)
-8. KNMI meteorological (`knmi_temp_c`, `knmi_wind_speed_ms`, etc.)
-9. Any additional `knmi_*` columns (non-validated, auto-appended in sorted order)
-10. KNMI validated meteorological (`knmi_val_temp_c`, `knmi_val_wind_speed_ms`, etc.)
-11. Any additional `knmi_val_*` columns (auto-appended in sorted order)
-12. Temporal features (`year`, `month`, `day`, `hour`, etc.)
+3. VIIRS A2 selective aggregates (`ntl_a2_mean`, `ntl_a2_sum`, etc.)
+4. VIIRS A2-all non-selective aggregates (`ntl_a2_all_mean`, `ntl_a2_all_sum`, etc.)
+5. VIIRS A1 aggregates (`ntl_a1_mean`, `ntl_a1_sum`, etc.)
+6. CBS energy tariffs (gas, then electricity — explicit order)
+7. CBS GDP headline indicators (`cbs_gdp_yy`, `cbs_gdp_qq`, etc.)
+8. CBS population
+9. Any additional `cbs_*` columns (auto-appended in sorted order)
+10. KNMI meteorological (`knmi_temp_c`, `knmi_wind_speed_ms`, etc.)
+11. Any additional `knmi_*` columns (non-validated, auto-appended in sorted order)
+12. KNMI validated meteorological (`knmi_val_temp_c`, `knmi_val_wind_speed_ms`, etc.)
+13. Any additional `knmi_val_*` columns (auto-appended in sorted order)
+14. Temporal features (`year`, `month`, `day`, `hour`, etc.)
 
 This ordering is forward-compatible: new `cbs_*` or `knmi_*` columns added in Phase 1 are automatically included without modifying Phase 3 code.
 
@@ -636,7 +672,8 @@ data/processed/nl_hourly_dataset.parquet/
 | Group | Columns | Source | Native Res. | Notes |
 |---|---|---|---|---|
 | Target | `entsoe_load_mw` | ENTSO-E | Hourly | Target variable (MW) |
-| Satellite A2 | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | VIIRS VNP46A2 | Daily | Gap-filled BRDF-corrected NTL spatial aggregates |
+| Satellite A2 (selective) | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | VIIRS VNP46A2 | Daily | Quality ≤ 1 pixels only; ~76% hourly coverage |
+| Satellite A2-all (non-selective) | `ntl_a2_all_mean`, `ntl_a2_all_sum`, `ntl_a2_all_valid_count`, `ntl_a2_all_fill_count`, `ntl_a2_all_invalid_count` | VIIRS VNP46A2 | Daily | All non-fill pixels (incl. gap-filled/imputed); ~97.5% hourly coverage |
 | Satellite A1 | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | VIIRS VNP46A1 | Daily | At-sensor raw radiance spatial aggregates |
 | Gas tariffs | `cbs_gas_transport_rate`, `cbs_gas_fixed_supply_rate`, `cbs_gas_ode_tax`, `cbs_gas_energy_tax`, `cbs_gas_total_tax` | CBS | Monthly | 2018–2026; ODE null after 2022 |
 | Electricity tariffs | `cbs_elec_transport_rate`, `cbs_elec_fixed_supply_rate`, `cbs_elec_*_dynamic`, `cbs_elec_ode_tax`, `cbs_elec_energy_tax`, `cbs_elec_total_tax`, `cbs_elec_energy_tax_refund` | CBS | Monthly | 2018–2026; dynamic null before 2025 |
@@ -644,7 +681,7 @@ data/processed/nl_hourly_dataset.parquet/
 | GDP (q/q) | `cbs_gdp_qq`, `cbs_imports_total_qq`, ... (17 cols) | CBS | Quarterly→Monthly | 1996–2025, forward-filled |
 | Population | `cbs_population_million` | CBS | Annual→Monthly | Replicated to all months |
 | Energy CPI | `cbs_cpi_energy`, `cbs_cpi_electricity`, `cbs_cpi_gas` | CBS | Monthly | Index (2015=100), 1996–2025 |
-| Gas & Elec. Prices | `cbs_gep_{gas_hh,gas_nnh_med,gas_nnh_lrg,elec_hh,elec_nnh_med,elec_nnh_lrg}_{total,supply,network}` (18 cols) | CBS GEP | Semi-annual→Monthly | €/m³ or €/kWh, incl. VAT/taxes, 2009–2025 |
+| Gas & Elec. Prices | `cbs_gep_{gas_hh,gas_nnh_med,...}_{total,supply,network}` (18 cols) | CBS GEP | Semi-annual→Monthly | €/m³ or €/kWh, incl. VAT/taxes, 2009–2025 |
 | Meteorology | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | KNMI | Hourly | National mean across 61 stations (non-validated) |
 | Meteorology (Validated) | `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count` | KNMI Validated | Hourly | National mean across 61 stations (expert-validated) |
 | Temporal | `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter` | Derived | Hourly | From timestamp |
@@ -667,7 +704,7 @@ flowchart LR
         Q1G["KNMI: file count, year range,\nstation count range,\nhourly record count"]
     end
     subgraph P2_QC["Phase 2 Quality Checks"]
-        Q2A["VIIRS A2 + A1: pixel-count consistency\n(valid+fill+invalid = 629,664),\nvalid pixel fraction stats"]
+        Q2A["VIIRS A2 + A1: pixel-count consistency\n(valid+fill+invalid = 285,719),\nvalid pixel fraction stats"]
         Q2B["CBS: year gap detection,\nmissing year list"]
         Q2C["ENTSO-E: per-year hour coverage\nvs expected, load min/max/σ"]
         Q2D["KNMI: per-year hour coverage,\ntemperature stats, per-variable\nnull percentages"]

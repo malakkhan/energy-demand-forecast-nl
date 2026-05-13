@@ -256,6 +256,35 @@ def aggregate_viirs(
         F.sum(F.when(is_imputed, 1).otherwise(0)).cast(T.IntegerType()).alias("ntl_invalid_count"),
     ).withColumn("year", F.year("date"))
 
+    # --- Minimum valid-pixel coverage filter (10%) ---
+    # Days where the contributing pixel count is below 10% of the NL polygon
+    # mask (285,719 pixels) are unreliable due to extreme spatial selection
+    # bias.  Null out ntl_mean and ntl_sum while preserving raw counts for
+    # diagnostics.  For selective products the contributing count is
+    # ntl_valid_count; for non-selective it is ntl_valid_count +
+    # ntl_invalid_count (all non-fill pixels).
+    NL_PIXEL_COUNT = 285_719
+    MIN_COVERAGE = 0.10  # 10%
+    min_pixels = int(NL_PIXEL_COUNT * MIN_COVERAGE)  # 28,571
+
+    if selective:
+        contributing = F.col("ntl_valid_count")
+    else:
+        contributing = F.col("ntl_valid_count") + F.col("ntl_invalid_count")
+
+    agg_df = agg_df.withColumn(
+        "ntl_mean",
+        F.when(contributing >= min_pixels, F.col("ntl_mean")),
+    ).withColumn(
+        "ntl_sum",
+        F.when(contributing >= min_pixels, F.col("ntl_sum")),
+    )
+    logger.info(
+        "  Coverage filter: nulling mean/sum when contributing pixels < %d "
+        "(%d%% of %d NL pixels).",
+        min_pixels, int(MIN_COVERAGE * 100), NL_PIXEL_COUNT,
+    )
+
     # The aggregated result is ~5k rows across ~15 years. Coalesce to one
     # file per year partition instead of Spark's default many-small-files.
     out_parquet = os.path.join(out_dir, "data")

@@ -186,6 +186,7 @@ numpy==2.0.2
     #   patsy
     #   scipy
     #   seaborn
+    #   shapely
     #   statsmodels
 openpyxl==3.1.5
     # via -r requirements.in
@@ -290,6 +291,8 @@ seaborn==0.13.2
     # via -r requirements.in
 send2trash==2.1.0
     # via jupyter-server
+shapely==2.0.7
+    # via -r requirements.in
 six==1.17.0
     # via
     #   python-dateutil

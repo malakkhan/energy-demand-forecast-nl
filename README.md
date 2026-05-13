@@ -49,6 +49,7 @@ Key packages:
 |---|---|
 | `h5py` | Reading VIIRS HDF5 satellite files |
 | `numpy` | Vectorised pixel-level array operations |
+| `shapely` | Polygon-based spatial masking (Netherlands GADM boundary) |
 | `pandas` | Small-file parsing (CBS, ENTSO-E, quality metrics) |
 | `pyarrow` | Direct Parquet I/O in Phase 1 (bypasses JVM overhead) |
 | `pyspark` (4.x) | Distributed aggregation and joins in Phases 2 & 3 |
@@ -204,7 +205,7 @@ Extracts and cleans raw source files into standardised, source-level Parquet fil
 
 #### 1A: VIIRS A2 and A1 Extraction
 
-The same `extract_viirs()` function (parameterised by `product`) processes both VNP46A2 and VNP46A1 HDF5 files. Both products share the same HDF5 group structure, NL bounding-box crop (`50.75°N–53.55°N`, `3.35°E–7.25°E`), and fill value (−999.9). The key differences:
+The same `extract_viirs()` function (parameterised by `product`) processes both VNP46A2 and VNP46A1 HDF5 files. Both products share the same HDF5 group structure, two-stage spatial filter, and fill value (−999.9). The key differences:
 
 | Aspect | VNP46A2 | VNP46A1 |
 |---|---|---|
@@ -213,7 +214,9 @@ The same `extract_viirs()` function (parameterised by `product`) processes both 
 | Output dir | `processing_1/viirs_a2/` | `processing_1/viirs_a1/` |
 
 - **Parallelism**: `multiprocessing.ProcessPoolExecutor` — each worker processes one HDF5 file independently. On a 96-core node this achieves near-linear speedup.
-- **Spatial masking**: Computes NL row/col indices once from the h18v03 sinusoidal grid, then reuses for all files (the grid is identical across the tile).
+- **Spatial masking**: Two-stage filter applied identically to both products:
+  1. **Bounding-box crop** (fast): reduces the 2400×2400 h18v03 tile to a ~672×937 subgrid using coordinate bounds (`50.75°N–53.55°N`, `3.35°E–7.25°E`).
+  2. **GADM polygon mask** (precise): a vectorised point-in-polygon test using `shapely.contains_xy()` against the GADM 4.1 Netherlands Level 0 boundary (`data/geo/gadm41_NLD_0.json`) retains only pixels inside Dutch land territory and islands, excluding North Sea and foreign-border pixels. The mask is computed once at startup (~0.3 s) and cached for all workers. This reduces the pixel count from 629,664 to **285,719 per day** (45.4% of the bounding box).
 - **Caching**: Existing Parquet outputs are skipped (unless `--force`); partial writes are prevented via atomic `tmp → rename`.
 - **Retry**: HDF5 opens retry up to 3 times with exponential backoff for transient GPFS errors.
 
@@ -418,24 +421,39 @@ Each sub-stage writes a `data_quality.json` alongside its output (e.g. `data/pro
 
 **Script:** `src/pipeline/phase2_aggregate.py`
 
-Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **six sub-stages** (A2 aggregation, A1 aggregation, CBS combination, ENTSO-E pass-through, KNMI pass-through, KNMI validated pass-through):
+Reads Phase 1 outputs and produces aggregated/combined tables using **PySpark** in local mode. Runs **seven sub-stages** (A2 selective aggregation, A2 non-selective aggregation, A1 aggregation, CBS combination, ENTSO-E pass-through, KNMI pass-through, KNMI validated pass-through):
 
-#### 2A: VIIRS A2 and A1 Daily Aggregation
+#### 2A: VIIRS A2, A2-all, and A1 Daily Aggregation
 
-The same `aggregate_viirs()` function (parameterised by `product`) is run for both VNP46A2 and VNP46A1. Reads the NL pixel-level Parquet (~630K pixels/day × ~5000 days) and aggregates to **one row per day** with spatial summary statistics. Uses column pruning (only reads 4 of 8 columns) to halve I/O.
+The same `aggregate_viirs()` function (parameterised by `product` and `selective`) is run three times: once for A2 selective, once for A2 non-selective ("A2-all"), and once for A1. Reads the NL pixel-level Parquet (~286K pixels/day × ~5000 days) and aggregates to **one row per day** with spatial summary statistics. Uses column pruning (only reads 4 of 8 columns) to halve I/O.
 
-**Output schema** — identical for both products:
-- `data/processing_2/viirs_a2_daily/data/year=YYYY/part-*.parquet`
-- `data/processing_2/viirs_a1_daily/data/year=YYYY/part-*.parquet`
+**Selective vs non-selective aggregation:**
+
+| Mode | Pixels in `ntl_mean`/`ntl_sum` | Output dir | Column prefix |
+|---|---|---|---|
+| **Selective** (default) | `quality_flag ≤ 1` AND not fill (high-quality, directly observed) | `viirs_a2_daily/` | `ntl_a2_` |
+| **Non-selective** (A2-all) | All non-fill pixels (quality 0–3, including gap-filled/imputed) | `viirs_a2_all_daily/` | `ntl_a2_all_` |
+| **A1 selective** | `quality_flag ≤ 1` AND not fill | `viirs_a1_daily/` | `ntl_a1_` |
+
+In all three modes, the pixel-count breakdown (`ntl_valid_count`, `ntl_fill_count`, `ntl_invalid_count`) uses the same fixed definitions, so the outputs are directly comparable.
+
+> **Why A2-all?** The selective A2 version exhibits severe survivorship bias — summer nights are short and heavily cloud-masked, so only a small fraction of pixels pass the quality ≤ 1 filter, creating a spurious "summer peak" artifact. A2-all includes gap-filled/imputed pixels (quality 2–3) from the VNP46A2 product, which eliminates this selection bias and achieves ~97.5% hourly coverage (vs ~76% for selective A2). However, the imputed values reflect historical climatological composites rather than actual emission variability, so the signal is smoother and less predictive of load.
+
+**Output schema** — identical for all three variants:
+- `data/processing_2/viirs_a2_daily/data/year=YYYY/part-*.parquet` (selective)
+- `data/processing_2/viirs_a2_all_daily/data/year=YYYY/part-*.parquet` (non-selective)
+- `data/processing_2/viirs_a1_daily/data/year=YYYY/part-*.parquet` (A1)
 
 | Column | Type | Description |
 |---|---|---|
 | `date` | `date` | Observation date |
-| `ntl_mean` | `double` | Mean NTL radiance of valid pixels (quality ≤ 1, not fill) |
-| `ntl_sum` | `double` | Sum of NTL radiance across valid pixels |
-| `ntl_valid_count` | `int` | Count of valid pixels |
+| `ntl_mean` | `double` | Mean NTL radiance of selected pixel set (see mode above); `null` when coverage < 10% |
+| `ntl_sum` | `double` | Sum of NTL radiance across selected pixel set; `null` when coverage < 10% |
+| `ntl_valid_count` | `int` | Count of valid pixels (quality ≤ 1, not fill) |
 | `ntl_fill_count` | `int` | Count of fill-value pixels (sensor/retrieval gaps) |
-| `ntl_invalid_count` | `int` | Count of quality-degraded pixels (cloud/atmosphere) |
+| `ntl_invalid_count` | `int` | Count of quality-degraded/imputed pixels (quality > 1, not fill) |
+
+> **10% minimum coverage filter**: Days where the contributing pixel count (28,571 = 10% of 285,719 NL polygon pixels) is not met have `ntl_mean` and `ntl_sum` set to `null`. This eliminates unreliable statistics from nights with extreme spatial selection bias. Pixel counts remain populated for diagnostic use.
 
 #### 2B: CBS Combined
 
@@ -496,7 +514,8 @@ Joins all Phase 2 outputs onto a **contiguous hourly UTC timestamp spine** (2012
 | Source | Join Key | Output Columns | Join Type |
 |---|---|---|---|
 | ENTSO-E (hourly) | `timestamp` | `entsoe_load_mw` | Broadcast left-join |
-| VIIRS A2 (daily) | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Broadcast left-join |
+| VIIRS A2 selective (daily) | `date` | `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count` | Broadcast left-join |
+| VIIRS A2-all non-selective (daily) | `date` | `ntl_a2_all_mean`, `ntl_a2_all_sum`, `ntl_a2_all_valid_count`, `ntl_a2_all_fill_count`, `ntl_a2_all_invalid_count` | Broadcast left-join |
 | VIIRS A1 (daily) | `date` | `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count` | Broadcast left-join |
 | CBS Combined (monthly) | `(year, month)` | All `cbs_*` columns | Broadcast left-join |
 | KNMI (hourly) | `timestamp` | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | Left equi-join |
@@ -506,24 +525,25 @@ All source tables are small enough to be broadcast; no shuffles occur.
 
 **Final output** — `data/processed/nl_hourly_dataset.parquet/year=YYYY/part-*.parquet`:
 
-The final dataset contains ~100 columns. Column ordering is deterministic:
+The final dataset contains ~105 columns. Column ordering is deterministic:
 
 1. `timestamp` — hourly UTC timestamp (primary key)
 2. `entsoe_load_mw` — **target variable** (electricity load in MW)
-3. VIIRS A2 satellite aggregates (5 columns)
-4. VIIRS A1 satellite aggregates (5 columns)
-5. CBS gas tariff columns (5 columns)
-6. CBS electricity tariff columns (8 columns)
-7. CBS GDP headline indicators
-8. CBS population (`cbs_population_million`)
-9. All remaining `cbs_*` columns in sorted order (forward-compatible)
-10. KNMI non-validated meteorological (9 columns: `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count`)
-11. All remaining `knmi_*` columns (non-validated) in sorted order (forward-compatible)
-12. KNMI validated meteorological (9 columns: `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count`)
-13. All remaining `knmi_val_*` columns in sorted order (forward-compatible)
-14. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
+3. VIIRS A2 selective satellite aggregates (5 columns: `ntl_a2_mean`, `ntl_a2_sum`, `ntl_a2_valid_count`, `ntl_a2_fill_count`, `ntl_a2_invalid_count`)
+4. VIIRS A2-all non-selective satellite aggregates (5 columns: `ntl_a2_all_mean`, `ntl_a2_all_sum`, `ntl_a2_all_valid_count`, `ntl_a2_all_fill_count`, `ntl_a2_all_invalid_count`)
+5. VIIRS A1 satellite aggregates (5 columns: `ntl_a1_mean`, `ntl_a1_sum`, `ntl_a1_valid_count`, `ntl_a1_fill_count`, `ntl_a1_invalid_count`)
+6. CBS gas tariff columns (5 columns)
+7. CBS electricity tariff columns (8 columns)
+8. CBS GDP headline indicators
+9. CBS population (`cbs_population_million`)
+10. All remaining `cbs_*` columns in sorted order (forward-compatible)
+11. KNMI non-validated meteorological (9 columns: `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count`)
+12. All remaining `knmi_*` columns (non-validated) in sorted order (forward-compatible)
+13. KNMI validated meteorological (9 columns: `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count`)
+14. All remaining `knmi_val_*` columns in sorted order (forward-compatible)
+15. Temporal features (9 columns: `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter`)
 
-**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2, VIIRS A1, ENTSO-E, CBS tariffs, CBS GDP, CBS CPI, CBS GEP, KNMI, and KNMI Validated, and writes them all to `data_quality.json`.
+**Coverage tracking**: Phase 3 logs separate coverage metrics for VIIRS A2 (selective), VIIRS A2 (all), VIIRS A1, ENTSO-E, CBS tariffs, CBS GDP, CBS CPI, CBS GEP, KNMI, and KNMI Validated, and writes them all to `data_quality.json`.
 
 #### CLI Options
 
@@ -689,6 +709,7 @@ cat data/processing_1/entsoe/data_quality.json
 
 # Phase 2 quality reports
 cat data/processing_2/viirs_a2_daily/data_quality.json
+cat data/processing_2/viirs_a2_all_daily/data_quality.json
 cat data/processing_2/viirs_a1_daily/data_quality.json
 cat data/processing_2/cbs_combined/data_quality.json
 cat data/processing_2/entsoe/data_quality.json
@@ -733,6 +754,8 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   └── figures/                          # Generated PNG figures (git-ignored)
 │
 ├── data/                                 # Pipeline outputs (inside repo)
+│   ├── geo/                              # Geospatial reference data
+│   │   └── gadm41_NLD_0.json            # GADM 4.1 Netherlands boundary (Level 0, WGS84)
 │   ├── processing_1/                     # Phase 1 output (source-level Parquet)
 │   │   ├── viirs_a2/data/year=YYYY/      # Per-day VNP46A2 pixel Parquet
 │   │   ├── viirs_a1/data/year=YYYY/      # Per-day VNP46A1 pixel Parquet
@@ -745,15 +768,16 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   │   └── knmi_validated/data/year=YYYY/ # Hourly meteorological observations (validated)
 │   │
 │   ├── processing_2/                     # Phase 2 output (aggregated Parquet)
-│   │   ├── viirs_a2_daily/data/year=YYYY/  # Daily VNP46A2 aggregates
-│   │   ├── viirs_a1_daily/data/year=YYYY/  # Daily VNP46A1 aggregates
-│   │   ├── cbs_combined/data/              # Merged CBS (~70 columns)
-│   │   ├── entsoe/data/year=YYYY/          # Re-partitioned ENTSO-E
-│   │   ├── knmi/data/year=YYYY/            # Re-partitioned KNMI (non-validated)
-│   │   └── knmi_validated/data/year=YYYY/  # Re-partitioned KNMI (validated)
+│   │   ├── viirs_a2_daily/data/year=YYYY/      # Daily VNP46A2 aggregates (selective: quality ≤ 1)
+│   │   ├── viirs_a2_all_daily/data/year=YYYY/  # Daily VNP46A2 aggregates (non-selective: all non-fill)
+│   │   ├── viirs_a1_daily/data/year=YYYY/      # Daily VNP46A1 aggregates
+│   │   ├── cbs_combined/data/                  # Merged CBS (~70 columns)
+│   │   ├── entsoe/data/year=YYYY/              # Re-partitioned ENTSO-E
+│   │   ├── knmi/data/year=YYYY/                # Re-partitioned KNMI (non-validated)
+│   │   └── knmi_validated/data/year=YYYY/      # Re-partitioned KNMI (validated)
 │   │
 │   └── processed/                        # Phase 3 final output
-│       ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~100 columns)
+│       ├── nl_hourly_dataset.parquet/year=YYYY/  # Final unified dataset (~105 columns)
 │       └── data_quality.json             # Comprehensive quality report
 │
 ├── logs/                                 # SLURM job output logs (git-ignored)

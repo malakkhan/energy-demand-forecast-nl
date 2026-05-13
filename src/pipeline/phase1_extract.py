@@ -40,6 +40,8 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from shapely import contains_xy
+from shapely.geometry import shape
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,11 +71,16 @@ _A2_QF_DATASET = "Mandatory_Quality_Flag"   # uint8: 0=best, 1=good, 2+=degraded
 _A1_NTL_DATASET = "DNB_At_Sensor_Radiance"
 _A1_QF_DATASET = "QF_DNB"   # uint16 bitmask; bits 0-1 encode quality tier
 
-# Netherlands bounding box (WGS84)
+# Netherlands bounding box (WGS84) — used as a fast first-pass crop on the
+# h18v03 tile before applying the precise GADM polygon mask.
 _NL_LAT_MIN = 50.75
 _NL_LAT_MAX = 53.55
 _NL_LON_MIN = 3.35
 _NL_LON_MAX = 7.25
+
+# GADM 4.1 Netherlands Level 0 boundary (land + islands, WGS84).
+# Resolved relative to the repo root at runtime.
+_NL_GEOJSON_RELPATH = os.path.join("data", "geo", "gadm41_NLD_0.json")
 
 # ENTSO-E Netherlands country code
 _NL_COUNTRY_CODE = "NL"
@@ -83,7 +90,8 @@ _H5_MAX_RETRIES = 3
 _H5_RETRY_BACKOFF_S = 1.0
 
 # Parquet row group size — tuned for downstream columnar scans (Spark/Dask).
-# One VIIRS day over NL is ~168k rows, so a single row group per file is fine.
+# One VIIRS day over NL is ~286k rows (after shapefile masking), so a single
+# row group per file is fine.
 _PARQUET_ROW_GROUP_SIZE = 500_000
 
 
@@ -190,12 +198,38 @@ def _open_h5_with_retry(filepath: str):
     raise last_exc
 
 
-def _compute_nl_indices(h5_filepath: str) -> tuple:
-    """Compute NL bounding-box row/col indices from one HDF5 file.
+def _compute_nl_mask(h5_filepath: str, geojson_path: str) -> tuple:
+    """Compute NL bounding-box indices AND polygon mask from one HDF5 file.
 
-    All input files share the same h18v03 sinusoidal-tile grid, so these
-    indices are identical across the dataset — compute once, reuse for all.
+    Two-stage spatial filter:
+
+    1. **Bounding-box crop** (fast): identify row/col index ranges where
+       lat/lon fall within the NL bounding box.  This is the same cheap
+       rectangular filter used previously — it reduces the 2400×2400
+       tile to a ~672×937 subgrid.
+
+    2. **Polygon mask** (precise): for every pixel in the bounding-box
+       subgrid, test whether it falls inside the GADM Netherlands
+       polygon (land + islands).  Uses ``shapely.contains_xy()`` for
+       fully vectorised point-in-polygon testing (~0.3 s for 630K
+       points on Shapely 2.0+).
+
+    All input files share the same h18v03 sinusoidal-tile grid, so the
+    mask is identical across the dataset — compute once, reuse for all.
+
+    Returns
+    -------
+    lat_idx, lon_idx : 1-D arrays
+        Row/column indices for the bounding-box slice.
+    lat_vals, lon_vals : 1-D arrays
+        Latitude/longitude values for the bounding-box rows/columns.
+    nl_pixel_mask : 2-D bool array
+        Shape ``(len(lat_idx), len(lon_idx))``.  ``True`` for pixels
+        inside the Netherlands polygon.
     """
+    import json as _json
+
+    # --- Stage 1: bounding-box crop (unchanged) ---
     with _open_h5_with_retry(h5_filepath) as hf:
         grp = hf[_VIIRS_GROUP]
         lat = grp[_VIIRS_LAT_DATASET][:]
@@ -203,13 +237,22 @@ def _compute_nl_indices(h5_filepath: str) -> tuple:
 
     lat_mask = (lat >= _NL_LAT_MIN) & (lat <= _NL_LAT_MAX)
     lon_mask = (lon >= _NL_LON_MIN) & (lon <= _NL_LON_MAX)
+    lat_idx = np.where(lat_mask)[0]
+    lon_idx = np.where(lon_mask)[0]
+    lat_vals = lat[lat_mask]
+    lon_vals = lon[lon_mask]
 
-    return (
-        np.where(lat_mask)[0],
-        np.where(lon_mask)[0],
-        lat[lat_mask],
-        lon[lon_mask],
-    )
+    # --- Stage 2: polygon mask ---
+    with open(geojson_path) as f:
+        gj = _json.load(f)
+    nl_geom = shape(gj["features"][0]["geometry"])
+
+    lat_grid, lon_grid = np.meshgrid(lat_vals, lon_vals, indexing="ij")
+    # shapely.contains_xy is fully vectorised (C-level loop, no Python iter)
+    in_nl = contains_xy(nl_geom, lon_grid.ravel(), lat_grid.ravel())
+    nl_pixel_mask = in_nl.reshape(lat_grid.shape)
+
+    return lat_idx, lon_idx, lat_vals, lon_vals, nl_pixel_mask
 
 
 # Module-level cache for NL indices. Populated either by fork-inheritance
@@ -304,15 +347,21 @@ def _process_one_viirs_file(filepath: str) -> dict:
     else:
         quality_flag_flat = qf_crop.ravel().astype(np.uint8)
 
+    # --- Apply Netherlands polygon mask: keep only pixels inside the
+    # GADM administrative boundary.  The mask is a 2D boolean array
+    # pre-computed once at startup and shared across all workers. ---
+    nl_mask = _NL_CACHE["nl_pixel_mask"]
+    keep = nl_mask.ravel()
+
     df = pd.DataFrame({
         "date": np.datetime64(obs_date),
-        "row_idx": ri_grid.ravel().astype(np.int32),
-        "col_idx": ci_grid.ravel().astype(np.int32),
-        "lat": lat_grid.ravel().astype(np.float32),
-        "lon": lon_grid.ravel().astype(np.float32),
-        "ntl_radiance": radiance,
-        "quality_flag": quality_flag_flat,
-        "is_fill": is_fill,
+        "row_idx": ri_grid.ravel()[keep].astype(np.int32),
+        "col_idx": ci_grid.ravel()[keep].astype(np.int32),
+        "lat": lat_grid.ravel()[keep].astype(np.float32),
+        "lon": lon_grid.ravel()[keep].astype(np.float32),
+        "ntl_radiance": radiance[keep],
+        "quality_flag": quality_flag_flat[keep],
+        "is_fill": is_fill[keep],
     })
 
     # Atomic write: write to a tmp file then rename, so a crash mid-write
@@ -379,14 +428,35 @@ def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
     logger.info("Found %d VIIRS HDF5 files. Using %d workers. force=%s",
                 len(h5_files), workers, force)
 
-    # Compute NL crop indices once from any file in the directory. All files
-    # share the h18v03 sinusoidal tile grid, so the crop is identical.
-    lat_idx, lon_idx, lat_vals, lon_vals = _compute_nl_indices(h5_files[0])
-    n_pixels = len(lat_idx) * len(lon_idx)
+    # Compute NL crop indices + polygon mask once from any file in the
+    # directory.  All files share the h18v03 sinusoidal tile grid, so the
+    # mask is identical across the dataset.
+    _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    geojson_path = os.path.join(_repo_root, _NL_GEOJSON_RELPATH)
+    if not os.path.exists(geojson_path):
+        raise FileNotFoundError(
+            f"GADM Netherlands boundary not found: {geojson_path}\n"
+            "Download it with: curl -L -o data/geo/gadm41_NLD_0.json "
+            "https://geodata.ucdavis.edu/gadm/gadm4.1/json/gadm41_NLD_0.json"
+        )
+    lat_idx, lon_idx, lat_vals, lon_vals, nl_pixel_mask = (
+        _compute_nl_mask(h5_files[0], geojson_path)
+    )
+    n_bbox_pixels = len(lat_idx) * len(lon_idx)
+    n_pixels = int(nl_pixel_mask.sum())
     logger.info(
-        "NL crop: %d lat × %d lon = %d pixels/day (rows %d–%d, cols %d–%d).",
-        len(lat_idx), len(lon_idx), n_pixels,
+        "NL bbox crop: %d lat × %d lon = %d pixels "
+        "(rows %d–%d, cols %d–%d).",
+        len(lat_idx), len(lon_idx), n_bbox_pixels,
         lat_idx[0], lat_idx[-1], lon_idx[0], lon_idx[-1],
+    )
+    logger.info(
+        "NL polygon mask (GADM): %d of %d bbox pixels inside Netherlands "
+        "(%.1f%% retained, %.1f%% excluded as ocean/foreign).",
+        n_pixels, n_bbox_pixels,
+        100 * n_pixels / n_bbox_pixels,
+        100 * (1 - n_pixels / n_bbox_pixels),
     )
 
     data_dir = os.path.join(out_dir, "data")
@@ -397,6 +467,7 @@ def extract_viirs(viirs_dir: str, out_dir: str, workers: int,
         "lon_idx": lon_idx,
         "lat_vals": lat_vals,
         "lon_vals": lon_vals,
+        "nl_pixel_mask": nl_pixel_mask,
         "out_dir": data_dir,
         "force": force,
         "ntl_dataset": ntl_dataset,
