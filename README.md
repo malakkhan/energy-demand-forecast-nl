@@ -15,7 +15,7 @@ A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherla
 4. [Exploratory Data Analysis](#exploratory-data-analysis)
 5. [Running on SLURM (Snellius)](#running-on-slurm-snellius)
 6. [Observability — Logs, Jobs & Efficiency](#observability--logs-jobs--efficiency)
-6. [Directory Layout](#directory-layout)
+7. [Directory Layout](#directory-layout)
 
 ---
 
@@ -76,7 +76,7 @@ source .env
 |---|---|---|
 | `EDL_TOKEN` | `download_nl_viirs.py` (fallback) | [NASA Earthdata Login](https://urs.earthdata.nasa.gov/) → Profile → Generate Token |
 | `LAADS_TOKEN` | `download_nl_viirs.py` (primary) | [LAADS DAAC](https://ladsweb.modaps.eosdis.nasa.gov/) → Profile → App Keys |
-| `KNMI_API_KEY` | `download_nl_knmi.py` (optional) | [KNMI Data Platform](https://dataplatform.knmi.nl/) → API Keys (a public fallback key is hard-coded) |
+| `KNMI_API_KEY` | `download_nl_knmi.py` (non-validated dataset) | [KNMI Data Platform](https://dataplatform.knmi.nl/) → API Keys |
 | `KNMI_VALIDATED_API_KEY` | `download_nl_knmi.py` (validated dataset) | [KNMI Data Platform](https://dataplatform.knmi.nl/) → API Keys → Bulk Download Policy for `hourly-in-situ-meteorological-observations-validated` |
 
 The VIIRS download script checks `LAADS_TOKEN` first, then falls back to `EDL_TOKEN`. At least one must be set.
@@ -133,18 +133,19 @@ Downloads hourly in-situ meteorological observations from the [KNMI Open Data Pl
 **Usage:**
 
 ```bash
-python3 src/download/download_nl_knmi.py --dest /projects/prjs2061/data/knmi --start-year 2012
+python3 src/download/download_nl_knmi.py --dest /projects/prjs2061/data/knmi --start-year 2015
 ```
 
 **CLI options:**
 
 | Flag | Default | Description |
 |---|---|---|
-| `-k`, `--key` | `$KNMI_API_KEY` or built-in public key | API key for the KNMI data platform |
-| `-d`, `--dataset` | `uurwaarden` | KNMI dataset name |
-| `-v`, `--version` | `1` | Dataset version |
-| `--dest` | `/projects/prjs2061/data/knmi` | Output directory |
-| `--start-year` | `2012` | Only download files for this year and later |
+| `-k`, `--key` | `$KNMI_API_KEY` or `$KNMI_VALIDATED_API_KEY` | API key (auto-selected by dataset; override with `-k`) |
+| `-n`, `--dataset` | `hourly-in-situ-meteorological-observations` | KNMI dataset name (append `-validated` for validated data) |
+| `-V`, `--version` | `1.0` | Dataset version |
+| `-d`, `--dest` | `/projects/prjs2061/data/knmi` (or `knmi_validated`) | Output directory (auto-selected when `--dataset` contains `validated`) |
+| `--start-year` | `2015` | Only download files for this year and later |
+| `--end-year` | No limit | Only download files up to and including this year |
 | `--overwrite` | `false` | Re-download even if file exists locally |
 
 **Key behaviour:**
@@ -548,7 +549,7 @@ The final dataset contains ~105 columns. Column ordering is deterministic:
 #### CLI Options
 
 ```bash
-python src/pipeline/phase3_merge.py [--out-root /path/to/output] [--start 2012-01-01] [--end 2026-04-20]
+python src/pipeline/phase3_merge.py [--out-root /path/to/output] [--start 2012-01-01] [--end 2025-12-31]
                        [--workers N] [--force]
 ```
 
@@ -556,8 +557,8 @@ python src/pipeline/phase3_merge.py [--out-root /path/to/output] [--start 2012-0
 |---|---|---|
 | `--out-root` | `<repo>/data` | Root directory for pipeline outputs (`processing_2/`, `processed/`) |
 | `--start` | `2012-01-01` | Spine start date |
-| `--end` | Today (UTC) | Spine end date |
-| `--workers` | All CPUs | Accepted for compatibility; merge is single-threaded |
+| `--end` | `2025-12-31` | Spine end date |
+| `--workers` | `1` | Accepted for CLI compatibility; merge is single-threaded |
 | `--force` | `false` | Re-run even if final output exists |
 
 ---
@@ -573,10 +574,11 @@ A batch-mode EDA script that produces all time series analysis figures and saves
 
 | # | Section | Key Figures |
 |---|---------|-------------|
-| 1 | Data loading | ENTSO-E, VIIRS, CBS, KNMI, KNMI Validated |
+| 1 | Data loading | ENTSO-E, VIIRS A2 (selective), VIIRS A2 (all), VIIRS A1, CBS, KNMI, KNMI Validated |
 | 2 | ENTSO-E hourly load | Time series, STL (period=168h), ACF/PACF, subseries |
-| 3 | VIIRS A2 daily NTL | Time series, STL (period=365d), ACF/PACF, subseries |
+| 3 | VIIRS A2 daily NTL (selective) | Time series, STL (period=365d), ACF/PACF, subseries |
 | 4 | VIIRS A1 daily NTL | Same as A2 + A1/A2 comparison |
+| 4b | VIIRS A2-all (non-selective) | Same as A2 + selective vs all comparison, imputed pixel fraction |
 | 5 | CBS monthly indicators | Time series, STL (period=12mo), ACF/PACF, subseries |
 | 6 | Multicollinearity | Correlation heatmap, VIF, cross-correlation, pair plot |
 | 7 | KNMI meteorological | Time series (8 variables), STL (period=24h), ACF/PACF, subseries, weather–load scatter |
@@ -734,6 +736,7 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 ├── pipeline_architecture.md              # Pipeline design document
 ├── requirements.in                       # Top-level Python dependencies
 ├── requirements.txt                      # Locked/pinned versions (pip-compile)
+├── setup_env.sh                          # Venv creation/update + Jupyter kernel setup
 │
 ├── src/
 │   ├── pipeline/                         # ETL pipeline: scripts + SLURM jobs
@@ -742,16 +745,26 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   │   ├── phase3_merge.py               # Phase 3: Aggregated → final hourly dataset
 │   │   ├── phase1.slurm                  # SLURM job script for Phase 1
 │   │   ├── phase2.slurm                  # SLURM job script for Phase 2
-│   │   └── phase3.slurm                  # SLURM job script for Phase 3
+│   │   ├── phase3.slurm                  # SLURM job script for Phase 3
+│   │   └── jupyter_lab.slurm             # JupyterLab compute-node server
 │   │
 │   └── download/                         # Data download utilities
 │       ├── download_nl_viirs.py          # VIIRS HDF5 download script
 │       └── download_nl_knmi.py           # KNMI weather data download script
 │
 ├── analysis/                             # Exploratory data analysis
-│   ├── run_analysis.py                   # Batch EDA script (7 sections, all figures)
+│   ├── run_analysis.py                   # Batch EDA script (9 sections, all figures)
 │   ├── run_analysis.slurm                # SLURM job script for EDA
+│   ├── eda_results.json                  # Machine-readable EDA results (generated)
+│   ├── eda_report.md                     # Formatted EDA report (generated)
+│   ├── gap_analysis.py                   # KNMI data gap analysis utility
+│   ├── md_to_pdf.py                      # Markdown → PDF conversion utility
 │   └── figures/                          # Generated PNG figures (git-ignored)
+│
+├── docs/                                 # Thesis and design documents
+│   └── methodology.tex                   # LaTeX methodology chapter
+│
+├── figures/                              # EDA figures (repo-root copy, git-ignored)
 │
 ├── data/                                 # Pipeline outputs (inside repo)
 │   ├── geo/                              # Geospatial reference data

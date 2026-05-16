@@ -40,7 +40,7 @@ flowchart TD
         C2_O["cbs_gdp/\n360 rows\n36 indicator columns"]
         E1_O["entsoe/\n~150K rows\n📁 by year"]
         K1_O["knmi/\n~100K rows\n📁 by year"]
-        KV1_O["knmi_validated/\nrows\n📁 by year"]
+        KV1_O["knmi_validated/\n~100K rows\n📁 by year"]
     end
 
     subgraph P2["PHASE 2 — AGGREGATION  ·  src/pipeline/phase2_aggregate.py"]
@@ -62,7 +62,7 @@ flowchart TD
         C2_O2["cbs_combined/\n~400 rows\n~70 columns"]
         E2_O["entsoe/\n~150K rows\n📁 by year"]
         K2_O["knmi/\n~100K rows\n📁 by year"]
-        KV2_O["knmi_validated/\nrows\n📁 by year"]
+        KV2_O["knmi_validated/\n~100K rows\n📁 by year"]
     end
 
     subgraph P3["PHASE 3 — MERGE  ·  src/pipeline/phase3_merge.py"]
@@ -424,8 +424,8 @@ Final: truncate to whole hours with `floor("h")`, drop NaT/NaN rows.
 #### 1G. KNMI Hourly Meteorological Observations
 
 ```
-Input:  /projects/prjs2061/data/knmi/hourly-observations-*.nc  (~25K files)
-Output: data/processing_1/knmi/data/  (partitioned by year, ~25K rows)
+Input:  /projects/prjs2061/data/knmi/hourly-observations-*.nc  (~100K files)
+Output: data/processing_1/knmi/data/  (partitioned by year, ~100K rows)
 ```
 
 The KNMI Open Data API provides hourly in-situ meteorological observations from **61 weather stations** across the Netherlands in NetCDF4 format (which is HDF5-based, so `h5py` reads them natively — no extra dependency needed).
@@ -583,7 +583,7 @@ flowchart LR
     VA1["🛰️ VIIRS A1 Daily\n~5K rows\ndaily"]
     C["📊 CBS Combined\n~400 rows\nmonthly\n~50 columns"]
     K["🌤️ KNMI\n~100K rows\nhourly"]
-    KV["🌤️ KNMI Val\nrows\nhourly"]
+    KV["🌤️ KNMI Val\n~100K rows\nhourly"]
 
     SPINE -->|"LEFT JOIN\non timestamp"| J1
     E --> J1
