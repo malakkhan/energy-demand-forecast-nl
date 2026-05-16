@@ -1,0 +1,44 @@
+{
+  "script": "train_prophet_lstm.py",
+  "started": "2026-05-16T23:04:45.122241",
+  "data_path": "/gpfs/work5/0/prjs2061/energy-demand-forecast-nl/data/processed/nl_hourly_dataset.parquet",
+  "rocv": {
+    "start_date": "2012-01-01",
+    "min_train_years": 2,
+    "fold_step_years": 1,
+    "horizons_days": [
+      60,
+      75,
+      90,
+      105,
+      120,
+      135,
+      150,
+      165,
+      180
+    ]
+  },
+  "prophet": {
+    "daily_seasonality": true,
+    "weekly_seasonality": true,
+    "yearly_seasonality": true
+  },
+  "lstm": {
+    "lstm1_units": 30,
+    "lstm2_units_huang": 90,
+    "lstm2_units_tan": 60,
+    "dropout_rates": [
+      0.2,
+      0.3
+    ],
+    "epochs": 50,
+    "batch_size": 128,
+    "early_stop_patience": 3,
+    "early_stop_min_delta": 0.0001,
+    "early_stop_start_epoch": 8
+  },
+  "variants_run": [
+    "huang"
+  ],
+  "total_elapsed_s": 2565.1
+}

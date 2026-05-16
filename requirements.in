@@ -36,3 +36,17 @@ jupyterlab
 
 # Jupyter kernel registration (registers this venv as a kernel inside JupyterHub)
 ipykernel
+
+# ── Baseline model dependencies (src/models/baselines/) ──
+
+# Prophet (Facebook/Meta) for trend + seasonality decomposition
+prophet
+
+# TensorFlow/Keras for LSTM (matching the reference implementation)
+tensorflow
+
+# scikit-learn for MinMaxScaler, IterativeImputer, and PCA
+scikit-learn
+
+# scipy for pearsonr correlation
+scipy
