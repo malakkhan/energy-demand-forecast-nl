@@ -1,0 +1,206 @@
+# ==============================================================================
+# BASELINE EXPERIMENT CONFIGURATIONS
+# Target Variable: Hourly Mean System Load
+# Evaluation Strategy: Rolling-Origin Cross-Validation (ROCV)
+# ==============================================================================
+
+models:
+  # ----------------------------------------------------------------------------
+  # 1. Multiple Linear Regression (MLR) - van de Sande et al.
+  # Best performance attained *including* climate and economic predictors.
+  # ----------------------------------------------------------------------------
+  van_de_sande_mlr:
+    model_type: "scikit-learn LinearRegression"
+    best_feature_setting: "Include exogenous predictors"
+    data_preprocessing:
+      outlier_removal: 
+        method: "IQR_Clipping"
+        bounds: ["Q1 - 1.5*IQR", "Q3 + 1.5*IQR"]
+        apply_to: "train_folds_only" # Prevent data leakage
+      imputation: 
+        method: "MICE (Multivariate Imputation by Chained Equations)"
+        fit_on: "train_folds_only"
+      scaling: "None"
+    feature_engineering:
+      target_shift_horizon: 1440 # 60 days in hours
+      autoregressive_lags_included: [24, 168, 8760] # 24h, 7d, 12m
+
+  # ----------------------------------------------------------------------------
+  # 2. Prophet-LSTM - van de Sande et al.
+  # Best performance attained *excluding* exogenous predictors (Model 1).
+  # ----------------------------------------------------------------------------
+  van_de_sande_prophet_lstm:
+    model_type: "Hybrid_Ensemble_Prophet_PyTorch"
+    best_feature_setting: "Exclude exogenous predictors (Lags + Prophet only)"
+    data_preprocessing:
+      outlier_removal: "IQR_Clipping (Train folds only)"
+      imputation: "MICE (Train folds only)"
+      scaling: "MinMaxScaler (range [0,1], fit on train, transform test)"
+    stage_1_prophet:
+      seasonality_mode: "additive"
+      seasonalities_enabled: ["daily", "weekly", "yearly"]
+      prophet_features_extracted: ["yhat", "trend", "daily", "weekly", "yearly"]
+    stage_2_lstm:
+      target_shift_horizon: 1440 # 60 days in hours
+      features: "Extracted Prophet components + Autoregressive lags (24h, 168h, 8760h)"
+      architecture:
+        layers:
+          - type: "LSTM"
+            units: 30
+            return_sequences: true
+          - type: "LSTM"
+            units: 90
+            return_sequences: false
+          - type: "Dense"
+            units: 1
+            activation: "linear"
+        dropout: 0.0 # 'Model 1' explicitly excluded dropout layers
+      training:
+        optimizer: "Adam"
+        loss_function: "MSE"
+        epochs: 50
+        batch_size: 128
+        early_stopping:
+          monitor: "val_loss"
+          min_delta: 0.0001
+          patience: 3
+          start_from_epoch: 10
+
+  # ----------------------------------------------------------------------------
+  # 3. SARIMAX - Ashtar et al.
+  # Best performance attained using internally "Generated Features".
+  # ----------------------------------------------------------------------------
+  ashtar_sarimax:
+    model_type: "statsmodels SARIMAX"
+    best_feature_setting: "Generated temporal features only"
+    data_preprocessing:
+      missing_values: "forward_fill"
+      outlier_removal: 
+        method: "Winsorization"
+        limits: [0.01, 0.99] # 1st and 99th percentiles
+    feature_engineering:
+      rolling_means_hours: [168, 720] # 7-day, 30-day (adapted to hourly)
+      lagged_features_hours: [1, 24, 168] # previous hour, day, week
+      calendar_flags: ["hour_of_day", "day_of_week", "month", "season", "weekend_indicator", "holiday_indicator"]
+    hyperparameters:
+      order: [1, 0, 1] # p=1, d=0, q=1
+      seasonal_order: [1, 0, 1, 168] # P=1, D=0, Q=1, m=168 (Weekly seasonality for hourly data)
+
+  # ----------------------------------------------------------------------------
+  # 4. SARIMAX-LSTM - Ashtar et al.
+  # Stage 1: SARIMAX extracts structure. Stage 2: LSTM models residuals.
+  # ----------------------------------------------------------------------------
+  ashtar_sarimax_lstm:
+    model_type: "Hybrid_Residual_Stacking"
+    best_feature_setting: "Generated temporal features only"
+    data_preprocessing:
+      inherited_from: "ashtar_sarimax"
+      scaling: "MinMaxScaler (range [0,1]) applied to features and residuals"
+    stage_1_sarimax:
+      hyperparameters: "inherited_from: ashtar_sarimax"
+      output: "Extract residuals (Actual - SARIMAX_Predicted)"
+    stage_2_lstm:
+      input_sequence_length: 720 # Sliding window of previous 30 days of residuals (30 * 24 hours)
+      target: "Residual at time t"
+      architecture:
+        - type: "LSTM"
+          units: 50
+          activation: "ReLU"
+          return_sequences: false
+        - type: "Dense"
+          units: 1
+      training:
+        optimizer: "Adam"
+        loss_function: "MSE"
+    inference:
+      final_prediction: "SARIMAX_prediction(t) + LSTM_residual_prediction(t)"
+
+  # ----------------------------------------------------------------------------
+  # 5. Sequence-to-Sequence (Seq2Seq) - Ashtar et al.
+  # Purely trained on generated temporal features.
+  # ----------------------------------------------------------------------------
+  ashtar_seq2seq:
+    model_type: "Encoder_Decoder_LSTM"
+    best_feature_setting: "Generated temporal features only"
+    data_preprocessing:
+      inherited_from: "ashtar_sarimax"
+      scaling: "MinMaxScaler (range [0,1])"
+    architecture_seq2seq:
+      input_sequence_length: 720 # 30 days * 24 hours
+      output_sequence_length: 168 # 7 days * 24 hours
+      encoder:
+        layers: 1
+        type: "LSTM"
+        units: 64
+        returns: ["hidden_state", "cell_state"]
+      decoder:
+        layers: 1
+        type: "LSTM"
+        units: 64
+        initial_state: "encoder_states"
+        output_layer: "TimeDistributed(Dense(1))"
+    training:
+      optimizer: "Adam"
+      loss_function: "MSE"
+      epochs: 20
+      batch_size: 16
+      training_technique: "Teacher_Forcing (feed true lagged target values to decoder during training)"
+
+  # ----------------------------------------------------------------------------
+  # 6. Prophet-QLSTM with XGBoost Stacking - Curiël et al.
+  # Hybrid Quantum-Classical Ensemble with Meta-Learner.
+  # ----------------------------------------------------------------------------
+  curiel_stacked_prophet_qlstm:
+    model_type: "Stacked_Prophet_QLSTM_XGBoost"
+    data_preprocessing:
+      imputation: "MICE"
+      outlier_removal: "IQR_Clipping [Q1-1.5*IQR, Q3+1.5*IQR] (applied to predictors, target left unaltered)"
+      scaling: "MinMaxScaler (range [0,1])"
+    feature_engineering:
+      target_shift_horizon: 4320 # 180 days in hours
+      generic_time_features: ["month", "week"]
+      exogenous_predictors: "17_selected_features (10 Economic, 7 Climate)"
+    stage_1_prophet:
+      prophet_seasonality_mode: "multiplicative"
+      prophet_features_extracted: ["yhat", "weekly", "yearly", "trend"]
+      use_advanced_prophet: true
+    stage_2_qlstm:
+      framework: "PennyLane_PyTorch"
+      quantum_backend: "lightning.qubit"
+      n_qubits: 4
+      n_qlayers: 1
+      sequence_length: 48 # explicit 48-hour sequence length used in paper
+      architecture:
+        layers:
+          - type: "QLSTM"
+            hidden_size: 60
+            return_sequences: true
+          - type: "Dropout"
+            rate: 0.3
+          - type: "QLSTM"
+            hidden_size: 120
+            return_sequences: false
+          - type: "Dense"
+            activation: "ReLU"
+          - type: "Dense"
+            units: 1
+      training:
+        optimizer: "Adam"
+        learning_rate: 0.001
+        loss_function: "MSE"
+        epochs: 50
+        batch_size: 256
+        warmup_epochs: 3
+        early_stopping:
+          monitor: "val_loss"
+          min_delta: 0.00001
+          patience: 5
+          start_from_epoch: 3
+    stage_3_xgboost_stacker:
+      inputs: ["Prophet_base_predictions", "Prophet_QLSTM_predictions"]
+      hyperparameters:
+        model: "xgboost.XGBRegressor"
+        n_estimators: 100
+        max_depth: 3
+        learning_rate: 0.1
+        random_state: 42

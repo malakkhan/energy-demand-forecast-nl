@@ -42,7 +42,17 @@ ipykernel
 # Prophet (Facebook/Meta) for trend + seasonality decomposition
 prophet
 
-# TensorFlow/Keras for LSTM (matching the reference implementation)
+# PyTorch for LSTM, Seq2Seq, QLSTM models (replaces TensorFlow for baselines)
+torch
+
+# PennyLane for quantum-classical QLSTM hybrid model (Curiël et al.)
+pennylane
+pennylane-lightning
+
+# XGBoost for stacking meta-learner (Curiël et al.)
+xgboost
+
+# TensorFlow/Keras — legacy: kept for prophet_lstm_tf.py reference only
 tensorflow
 
 # scikit-learn for MinMaxScaler, IterativeImputer, and PCA

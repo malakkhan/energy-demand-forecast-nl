@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Train and evaluate the Prophet-LSTM baseline using ROCV.
 
+.. deprecated::
+    This script uses the TensorFlow/Keras implementation.  The new
+    PyTorch implementation is available via the unified orchestrator::
+
+        python -u src/models/baselines/train_baselines.py \\
+            --model van_de_sande_prophet_lstm
+
+    See also: ``prophet_lstm_pytorch.py`` (PyTorch replacement)
+              ``prophet_lstm_tf.py``      (preserved TF reference)
 Faithfully reproduces the reference implementation's pipeline:
 
     1. Load hourly dataset → drop NTL → merge weather
