@@ -155,6 +155,164 @@ def generate_latex_table(summary: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Fold × Horizon comparison across all models
+# ═══════════════════════════════════════════════════════════════════════════
+
+# For lower-is-better metrics, the minimum across models is "best".
+# For higher-is-better (PCC), the maximum is "best".
+_LOWER_IS_BETTER = {"rmse", "mae", "mape_pct", "mase", "nmae", "nrmse"}
+_HIGHER_IS_BETTER = {"pcc"}
+
+
+def generate_fold_horizon_comparison(combined: pd.DataFrame, results_dir: Path):
+    """Generate per-fold × per-horizon comparison tables.
+
+    For each (fold, horizon_days) pair, produce a row per model with all 7
+    metrics.  The best value in each metric column across models is
+    highlighted in **bold** (LaTeX ``\\textbf{}``, CSV with ``*`` suffix).
+
+    Saves:
+        - ``comparison_fold_horizon.csv``  — flat CSV with best markers
+        - ``comparison_fold_horizon.tex``  — LaTeX table
+        - ``comparison_by_horizon_mean.csv`` — mean across folds per model
+    """
+    if combined.empty:
+        logger.warning("No data for fold×horizon comparison.")
+        return
+
+    metrics = [m for m in METRIC_COLUMNS if m in combined.columns]
+    if not metrics:
+        logger.warning("No metric columns found.")
+        return
+
+    # ── 1. Flat comparison CSV ────────────────────────────────────────
+    pivot_rows = []
+    for (fold, h_days), grp in combined.groupby(["fold", "horizon_days"]):
+        for _, row in grp.iterrows():
+            pivot_rows.append({
+                "fold": int(fold),
+                "cutoff": row.get("cutoff", ""),
+                "horizon_days": int(h_days),
+                "model": row["model"],
+                **{m: row.get(m, np.nan) for m in metrics},
+            })
+
+    comparison = pd.DataFrame(pivot_rows)
+
+    # Mark best per (fold, horizon) group
+    for (fold, h_days), grp in comparison.groupby(["fold", "horizon_days"]):
+        for m in metrics:
+            vals = grp[m].dropna()
+            if vals.empty:
+                continue
+            if m in _LOWER_IS_BETTER:
+                best_idx = vals.idxmin()
+            else:
+                best_idx = vals.idxmax()
+            comparison.loc[best_idx, f"{m}_best"] = True
+
+    comparison.to_csv(results_dir / "comparison_fold_horizon.csv", index=False)
+    logger.info("Fold×horizon comparison CSV saved (%d rows).", len(comparison))
+
+    # ── 2. Mean across folds per model × horizon ─────────────────────
+    mean_cols = {m: (m, "mean") for m in metrics}
+    mean_cols["n_folds"] = ("fold", "count")
+    mean_df = (
+        combined.groupby(["model", "horizon_days"])
+        .agg(**mean_cols)
+        .round(4)
+        .reset_index()
+    )
+
+    # Mark best model per horizon
+    for h_days, grp in mean_df.groupby("horizon_days"):
+        for m in metrics:
+            vals = grp[m].dropna()
+            if vals.empty:
+                continue
+            if m in _LOWER_IS_BETTER:
+                best_idx = vals.idxmin()
+            else:
+                best_idx = vals.idxmax()
+            mean_df.loc[best_idx, f"{m}_best"] = True
+
+    mean_df.to_csv(results_dir / "comparison_by_horizon_mean.csv", index=False)
+    logger.info("Mean comparison CSV saved (%d rows).", len(mean_df))
+
+    # ── 3. LaTeX table (mean per horizon, best in bold) ──────────────
+    latex_lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Cross-model comparison — mean metric values per horizon (best in \textbf{bold})}",
+        r"\label{tab:cross_model_comparison}",
+        r"\footnotesize",
+        r"\setlength{\tabcolsep}{3pt}",
+        r"\begin{tabular}{llrrrrrrr}",
+        r"\toprule",
+        r"Model & H (d) & RMSE (MW) & MAE (MW) & MAPE (\%) & MASE & nMAE & nRMSE & PCC \\",
+        r"\midrule",
+    ]
+
+    prev_horizon = None
+    for _, row in mean_df.sort_values(["horizon_days", "model"]).iterrows():
+        model_label = _MODEL_LABELS.get(row["model"], row["model"])
+        h = int(row["horizon_days"])
+
+        if prev_horizon is not None and h != prev_horizon:
+            latex_lines.append(r"\midrule")
+        prev_horizon = h
+
+        def _fmt(m, precision=2):
+            val = row.get(m, np.nan)
+            if np.isnan(val):
+                return "---"
+            s = f"{val:.{precision}f}"
+            if row.get(f"{m}_best", False):
+                return f"\\textbf{{{s}}}"
+            return s
+
+        latex_lines.append(
+            f"{model_label} & {h} & "
+            f"{_fmt('rmse', 1)} & {_fmt('mae', 1)} & {_fmt('mape_pct', 2)} & "
+            f"{_fmt('mase', 3)} & {_fmt('nmae', 4)} & {_fmt('nrmse', 4)} & "
+            f"{_fmt('pcc', 4)} \\\\"
+        )
+
+    latex_lines.extend([
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+    ])
+
+    latex_path = results_dir / "cross_model_comparison.tex"
+    with open(latex_path, "w") as f:
+        f.write("\n".join(latex_lines))
+    logger.info("LaTeX cross-model table → %s", latex_path)
+
+    # ── 4. Print formatted console table ─────────────────────────────
+    logger.info("\n" + "=" * 90)
+    logger.info("  CROSS-MODEL COMPARISON (mean across folds)")
+    logger.info("=" * 90)
+
+    # Print per horizon
+    for h_days in sorted(mean_df["horizon_days"].unique()):
+        h_grp = mean_df[mean_df["horizon_days"] == h_days].copy()
+        logger.info("\n  Horizon = %d days:", h_days)
+        for _, row in h_grp.iterrows():
+            label = _MODEL_LABELS.get(row["model"], row["model"])
+            parts = []
+            for m in metrics:
+                val = row.get(m, np.nan)
+                best = row.get(f"{m}_best", False)
+                if np.isnan(val):
+                    parts.append(f"{m}=---")
+                else:
+                    marker = " *" if best else ""
+                    parts.append(f"{m}={val:.4f}{marker}")
+            logger.info("    %-20s  %s", label, "  ".join(parts))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Aggregate baseline results.")
     parser.add_argument(
@@ -204,6 +362,9 @@ def main():
 
     with open(results_dir / "rocv_summary.json", "w") as f:
         json.dump(json_summary, f, indent=2, default=str)
+
+    # ── Cross-model fold × horizon comparison ────────────────────────
+    generate_fold_horizon_comparison(combined, results_dir)
 
     # Plots
     if not args.no_plots:

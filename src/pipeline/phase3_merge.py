@@ -29,8 +29,12 @@ Engineered features (post-join):
     - **Energy crisis flag**: binary step variable, 1 for 2022-01-01 → 2023-06-30.
     - **Cyclical temporal features**: sin/cos encoding for hour, day-of-week, month.
     - **Holiday flags**: Dutch public and school holiday indicators.
-    - **PCA components**: 15 principal components from all CBS + KNMI validated
-      features (95% cumulative variance); columns with >50% NaN excluded before fit.
+    - **PCA components (original, 2018–2025)**: 15 principal components from all
+      CBS + KNMI validated features (95% cumulative variance); columns with >50%
+      NaN excluded before fit.  Coverage limited to 2018+ due to CBS tariff data.
+    - **PCA components (full coverage, 2012–2025)**: 16 principal components from
+      the subset of CBS + KNMI validated features with complete 2012–2025
+      coverage (13 CBS tariff columns excluded; 95% cumulative variance).
 """
 
 import argparse
@@ -553,7 +557,27 @@ def add_energy_crisis_flag(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 _N_PCA_COMPONENTS = 15
+_N_PCA_FULL_COMPONENTS = 16
 _PCA_MAX_NULL_FRAC = 0.50   # drop columns with more than 50 % NaN
+
+# CBS tariff / energy-price columns that only have data from 2018+.
+# Excluding these from the "full coverage" PCA allows components that
+# span the entire 2012–2025 timeline.
+_CBS_TARIFF_EXCLUDE = [
+    "cbs_elec_energy_tax",
+    "cbs_elec_energy_tax_refund",
+    "cbs_elec_fixed_supply_rate",
+    "cbs_elec_fixed_supply_rate_dynamic",
+    "cbs_elec_ode_tax",
+    "cbs_elec_total_tax",
+    "cbs_elec_transport_rate",
+    "cbs_elec_variable_supply_rate_dynamic",
+    "cbs_gas_energy_tax",
+    "cbs_gas_fixed_supply_rate",
+    "cbs_gas_ode_tax",
+    "cbs_gas_total_tax",
+    "cbs_gas_transport_rate",
+]
 
 
 def add_pca_features(
@@ -561,6 +585,10 @@ def add_pca_features(
     n_components: int = _N_PCA_COMPONENTS,
 ) -> pd.DataFrame:
     """Add PCA components derived from all CBS + KNMI validated features.
+
+    **Original PCA** (``pca_cbs_knmi_01`` … ``pca_cbs_knmi_15``):
+    Coverage limited to **2018–2025** because some CBS tariff columns
+    only start in 2018 and PCA requires complete rows.
 
     Steps:
 
@@ -575,7 +603,7 @@ def add_pca_features(
     The elbow analysis (``analysis/pca_elbow.py``) showed that 15 components
     capture ~95 % of the combined CBS + KNMI validated variance.
     """
-    logger.info("Engineering PCA features (CBS + KNMI validated) …")
+    logger.info("Engineering PCA features (CBS + KNMI validated, original) …")
 
     # 1. Identify input columns
     cbs_cols = sorted(c for c in df.columns if c.startswith("cbs_"))
@@ -656,7 +684,118 @@ def add_pca_features(
 
     n_pca_nn = int(df[pca_col_names[0]].notna().sum())
     logger.info(
-        "  PCA: %d non-null rows (%.1f%% of dataset).",
+        "  PCA (original): %d non-null rows (%.1f%% of dataset).",
+        n_pca_nn, 100.0 * n_pca_nn / len(df),
+    )
+
+    return df
+
+
+def add_pca_features_full_coverage(
+    df: pd.DataFrame,
+    n_components: int = _N_PCA_FULL_COMPONENTS,
+) -> pd.DataFrame:
+    """Add full-coverage PCA components (2012–2025) from CBS + KNMI validated.
+
+    **Full-coverage PCA** (``pca_cbs_knmi_full_01`` … ``pca_cbs_knmi_full_16``):
+    Computed from the subset of CBS + KNMI validated features that have
+    complete 2012–2025 data.  The 13 CBS tariff/energy-price columns that
+    only start in 2018 are explicitly excluded, giving full temporal coverage.
+
+    Steps:
+
+    1. Identify all ``cbs_*`` and ``knmi_val_*`` columns.
+    2. Remove the 13 CBS tariff columns (2018+ only).
+    3. Drop remaining columns with > 50 % NaN.
+    4. Fit ``StandardScaler`` + ``PCA(n_components)`` on complete rows.
+    5. Transform all rows → ``pca_cbs_knmi_full_01`` … ``pca_cbs_knmi_full_16``.
+
+    The elbow analysis (``analysis/pca_elbow_full_coverage.py``) showed that
+    16 components capture ~95 % of the variance from 66 input features.
+    """
+    logger.info("Engineering PCA features (full coverage, 2012–2025) …")
+
+    # 1. Identify input columns
+    cbs_cols = sorted(c for c in df.columns if c.startswith("cbs_"))
+    knmi_val_cols = sorted(c for c in df.columns if c.startswith("knmi_val_"))
+
+    # 2. Exclude CBS tariff columns that start in 2018+
+    cbs_full = sorted(set(cbs_cols) - set(_CBS_TARIFF_EXCLUDE))
+    all_input_cols = sorted(set(cbs_full + knmi_val_cols))
+    n_excluded = len(set(cbs_cols) & set(_CBS_TARIFF_EXCLUDE))
+    logger.info(
+        "  PCA full-coverage input: %d CBS (-%d tariff excl.) + %d KNMI val = %d total.",
+        len(cbs_full), n_excluded, len(knmi_val_cols), len(all_input_cols),
+    )
+
+    # 3. Drop columns with > 50 % NaN
+    missing_frac = df[all_input_cols].isna().mean()
+    keep_cols = sorted(missing_frac[missing_frac <= _PCA_MAX_NULL_FRAC].index.tolist())
+    drop_cols = sorted(set(all_input_cols) - set(keep_cols))
+    if drop_cols:
+        logger.info(
+            "  PCA full: dropped %d additional columns (>%.0f%% NaN): %s",
+            len(drop_cols), _PCA_MAX_NULL_FRAC * 100,
+            ", ".join(drop_cols),
+        )
+    if not keep_cols:
+        logger.warning("  PCA full: no usable columns — skipping.")
+        for i in range(1, n_components + 1):
+            df[f"pca_cbs_knmi_full_{i:02d}"] = np.nan
+        return df
+
+    logger.info("  PCA full: retaining %d features for fitting.", len(keep_cols))
+
+    # 4. Fit on complete rows
+    complete_mask = df[keep_cols].notna().all(axis=1)
+    n_complete = int(complete_mask.sum())
+    logger.info("  PCA full: %d complete rows for fitting.", n_complete)
+
+    if n_complete < n_components:
+        logger.warning(
+            "  PCA full: only %d complete rows (need >= %d) — skipping.",
+            n_complete, n_components,
+        )
+        for i in range(1, n_components + 1):
+            df[f"pca_cbs_knmi_full_{i:02d}"] = np.nan
+        return df
+
+    X_fit = df.loc[complete_mask, keep_cols].values.astype(np.float64)
+
+    scaler = StandardScaler()
+    scaler.fit(X_fit)
+    X_fit_scaled = scaler.transform(X_fit)
+
+    pca = PCA(n_components=n_components)
+    pca.fit(X_fit_scaled)
+
+    cum_var = np.cumsum(pca.explained_variance_ratio_)
+    logger.info(
+        "  PCA full: %d components explain %.1f%% of variance.",
+        n_components, cum_var[-1] * 100,
+    )
+    for i, (var, cvar) in enumerate(
+        zip(pca.explained_variance_ratio_, cum_var), 1
+    ):
+        logger.info(
+            "    PC%02d: %.4f (cumulative %.4f)", i, var, cvar
+        )
+
+    # 5. Transform all rows (NaN where any input is missing)
+    pca_col_names = [f"pca_cbs_knmi_full_{i:02d}" for i in range(1, n_components + 1)]
+
+    for col_name in pca_col_names:
+        df[col_name] = np.nan
+
+    X_all = df.loc[complete_mask, keep_cols].values.astype(np.float64)
+    X_all_scaled = scaler.transform(X_all)
+    pca_values = pca.transform(X_all_scaled)
+
+    df.loc[complete_mask, pca_col_names] = pca_values
+
+    n_pca_nn = int(df[pca_col_names[0]].notna().sum())
+    logger.info(
+        "  PCA (full coverage): %d non-null rows (%.1f%% of dataset).",
         n_pca_nn, 100.0 * n_pca_nn / len(df),
     )
 
@@ -777,10 +916,14 @@ def _ordered_columns(columns: list) -> list:
     ordered.extend(extra_knmi_val)
     used.update(extra_knmi_val)
 
-    # Append PCA components in numerical order
-    pca_cols = sorted(c for c in existing if c.startswith("pca_cbs_knmi_") and c not in used)
-    ordered.extend(pca_cols)
-    used.update(pca_cols)
+    # Append PCA components in numerical order (original, then full-coverage)
+    pca_orig = sorted(c for c in existing if c.startswith("pca_cbs_knmi_") and not c.startswith("pca_cbs_knmi_full_") and c not in used)
+    ordered.extend(pca_orig)
+    used.update(pca_orig)
+
+    pca_full = sorted(c for c in existing if c.startswith("pca_cbs_knmi_full_") and c not in used)
+    ordered.extend(pca_full)
+    used.update(pca_full)
 
     for c in preferred_tail:
         if c in existing and c not in used:
@@ -880,7 +1023,8 @@ def main() -> None:
     df = add_lag_features(df)
 
     # 2d. PCA dimensionality reduction (CBS + KNMI validated)
-    df = add_pca_features(df)
+    df = add_pca_features(df)                        # original: 2018–2025
+    df = add_pca_features_full_coverage(df)           # full:     2012–2025
 
     # 2e. Add energy crisis step variable
     logger.info("Adding energy crisis flag …")
@@ -924,6 +1068,7 @@ def main() -> None:
     knmi_nn       = int(df["knmi_temp_c"].notna().sum())       if "knmi_temp_c"     in df.columns else 0
     knmi_val_nn   = int(df["knmi_val_temp_c"].notna().sum())   if "knmi_val_temp_c" in df.columns else 0
     pca_nn        = int(df["pca_cbs_knmi_01"].notna().sum())   if "pca_cbs_knmi_01" in df.columns else 0
+    pca_full_nn   = int(df["pca_cbs_knmi_full_01"].notna().sum()) if "pca_cbs_knmi_full_01" in df.columns else 0
     pub_hol_nn    = int(df["is_public_holiday"].sum())          if "is_public_holiday"  in df.columns else 0
     sch_hol_nn    = int(df["is_school_holiday"].sum())          if "is_school_holiday"  in df.columns else 0
     load = df["entsoe_load_mw"].dropna()
@@ -932,7 +1077,8 @@ def main() -> None:
     logger.info(
         "Coverage — ENTSO-E: %.1f%% | VIIRS A2 (sel): %.1f%% | VIIRS A2 (all): %.1f%% "
         "| VIIRS A1: %.1f%% | CBS Tariffs: %.1f%% | CBS GDP: %.1f%% | CBS CPI: %.1f%% "
-        "| CBS GEP: %.1f%% | KNMI: %.1f%% | KNMI Val: %.1f%% | PCA: %.1f%%",
+        "| CBS GEP: %.1f%% | KNMI: %.1f%% | KNMI Val: %.1f%% | PCA: %.1f%% "
+        "| PCA Full: %.1f%%",
         100 * entsoe_nn / total,
         100 * viirs_a2_nn / total,
         100 * viirs_a2all_nn / total,
@@ -941,6 +1087,7 @@ def main() -> None:
         100 * cbs_cpi_nn / total, 100 * cbs_gep_nn / total,
         100 * knmi_nn / total, 100 * knmi_val_nn / total,
         100 * pca_nn / total,
+        100 * pca_full_nn / total,
     )
 
     # Coverage assertion for the target variable
