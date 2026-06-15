@@ -130,6 +130,15 @@ _want = [
     "knmi_val_temp_c", "knmi_val_humidity_pct", "knmi_val_wind_speed_ms",
     "knmi_val_solar_rad_jcm2",
     "year", "month", "day", "hour", "day_of_week", "is_weekend",
+    # Cyclical temporal features
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos",
+    # Holiday flags
+    "is_public_holiday", "is_school_holiday",
+    # Lag features
+    "load_lag_12h", "load_lag_24h", "load_lag_1w", "load_lag_1y",
+    "solar_rad_lag_10h", "humidity_lag_12h", "temp_lag_107h",
+    # Event flags
+    "is_energy_crisis",
 ]
 hourly = pd.read_parquet(P_FINAL, columns=[c for c in _want if c in _avail])
 hourly["timestamp"] = pd.to_datetime(hourly["timestamp"])
@@ -662,6 +671,15 @@ _feat_want = [
     "cbs_gdp_yy","cbs_consumption_hh_yy","cbs_population_million",
     "knmi_temp_c","knmi_humidity_pct","knmi_wind_speed_ms","knmi_solar_rad_jcm2",
     "knmi_val_temp_c","knmi_val_humidity_pct","knmi_val_wind_speed_ms","knmi_val_solar_rad_jcm2",
+    # Cyclical temporal features
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos",
+    # Holiday flags
+    "is_public_holiday", "is_school_holiday",
+    # Lag features
+    "load_lag_12h", "load_lag_24h", "load_lag_1w", "load_lag_1y",
+    "solar_rad_lag_10h", "humidity_lag_12h", "temp_lag_107h",
+    # Event flags
+    "is_energy_crisis",
 ]
 feat = hourly[[c for c in _feat_want if c in hourly.columns]].copy()
 
@@ -1127,6 +1145,150 @@ if len(knmi) > 0 and len(knmi_val) > 0:
         print("  Insufficient overlap for comparison.")
 else:
     print("\n[9] Val vs Non-val comparison: skipped (missing data)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10  TEMPORAL CYCLICAL FEATURES & HOLIDAY FLAGS
+# ══════════════════════════════════════════════════════════════════════════════
+_temporal_cycl = [c for c in ["hour_sin","hour_cos","dow_sin","dow_cos",
+                              "month_sin","month_cos"] if c in hourly.columns]
+_holiday_flags = [c for c in ["is_public_holiday","is_school_holiday"] if c in hourly.columns]
+
+if _temporal_cycl or _holiday_flags:
+    print("\n[10] Temporal Cyclical Features & Holiday Flags")
+
+    # 10.1 ── Cyclical feature scatter + binned-mean vs load
+    if _temporal_cycl:
+        print("[10.1] Cyclical features vs load …", end=" ", flush=True)
+        t1 = time.time()
+        n_c = len(_temporal_cycl)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle("Cyclical Temporal Features vs Electricity Load (hourly)")
+        flat_ax = axes.flatten()
+        _colors = ["steelblue","firebrick","seagreen","darkorange","mediumpurple","teal"]
+        for i, col in enumerate(_temporal_cycl):
+            ax = flat_ax[i]
+            overlap = hourly[["entsoe_load_mw", col]].dropna()
+            if len(overlap) < 100:
+                ax.text(0.5,0.5,"Insufficient data",transform=ax.transAxes,
+                        ha="center",va="center"); continue
+            sample = overlap.sample(min(8000, len(overlap)), random_state=42)
+            ax.scatter(sample[col], sample["entsoe_load_mw"],
+                       s=2, alpha=0.12, color=_colors[i % len(_colors)], rasterized=True)
+            # Binned mean curve
+            bins = pd.cut(overlap[col], bins=30)
+            binned = overlap.groupby(bins, observed=True)["entsoe_load_mw"].mean()
+            bin_centers = [(b.left+b.right)/2 for b in binned.index]
+            ax.plot(bin_centers, binned.values, color="firebrick", lw=2.5, label="Binned mean")
+            r = float(overlap[col].corr(overlap["entsoe_load_mw"]))
+            ax.set_title(f"{col}  (r={r:.3f})", fontsize=10)
+            ax.set_xlabel(col); ax.set_ylabel("Load (MW)")
+            ax.legend(fontsize=8)
+            R.setdefault("temporal_cyclical_load_r", {})[col] = round(r, 4)
+        # Hide unused axes
+        for j in range(len(_temporal_cycl), len(flat_ax)):
+            flat_ax[j].set_visible(False)
+        plt.tight_layout(); savefig(fig, "temporal_01_cyclical_vs_load"); print(elapsed(t1))
+
+    # 10.2 ── Holiday impact on load
+    if _holiday_flags and "entsoe_load_mw" in hourly.columns:
+        print("[10.2] Holiday impact on load …", end=" ", flush=True)
+        t1 = time.time()
+        hol_df = hourly[["entsoe_load_mw"] + _holiday_flags].dropna(subset=["entsoe_load_mw"]).copy()
+        n_flags = len(_holiday_flags)
+        fig, axes = plt.subplots(1, n_flags + 1, figsize=(7 * (n_flags + 1), 6))
+        fig.suptitle("Electricity Load on Holiday vs Non-Holiday Days")
+
+        _flag_labels = {
+            "is_public_holiday": ("Public Holiday", "steelblue"),
+            "is_school_holiday": ("School Holiday", "seagreen"),
+        }
+        for i, flag_col in enumerate(_holiday_flags):
+            ax = axes[i]
+            label, color = _flag_labels.get(flag_col, (flag_col, "steelblue"))
+            sns.boxplot(data=hol_df, x=flag_col, y="entsoe_load_mw", ax=ax,
+                        palette=["lightgray", color], showfliers=False, linewidth=0.7)
+            ax.set_xticklabels(["No", "Yes"])
+            ax.set_xlabel(label); ax.set_ylabel("Load (MW)")
+            # Compute stats
+            no_hol  = hol_df.loc[hol_df[flag_col] == 0, "entsoe_load_mw"]
+            yes_hol = hol_df.loc[hol_df[flag_col] == 1, "entsoe_load_mw"]
+            if len(yes_hol) > 0 and len(no_hol) > 0:
+                diff_pct = (yes_hol.mean() - no_hol.mean()) / no_hol.mean() * 100
+                ax.set_title(f"{label}\nΔ mean = {diff_pct:+.1f}%")
+                R.setdefault("holiday_load_impact", {})[flag_col] = {
+                    "non_holiday_mean_mw": round(float(no_hol.mean()), 1),
+                    "holiday_mean_mw": round(float(yes_hol.mean()), 1),
+                    "diff_pct": round(diff_pct, 2),
+                    "non_holiday_count_h": int(len(no_hol)),
+                    "holiday_count_h": int(len(yes_hol)),
+                }
+            else:
+                ax.set_title(label)
+
+        # Combined: neither / public only / school only / both
+        if all(f in hol_df.columns for f in ["is_public_holiday", "is_school_holiday"]):
+            ax = axes[n_flags]
+            hol_df["_cat"] = "Normal"
+            hol_df.loc[(hol_df["is_school_holiday"] == 1) & (hol_df["is_public_holiday"] == 0), "_cat"] = "School only"
+            hol_df.loc[(hol_df["is_public_holiday"] == 1) & (hol_df["is_school_holiday"] == 0), "_cat"] = "Public only"
+            hol_df.loc[(hol_df["is_public_holiday"] == 1) & (hol_df["is_school_holiday"] == 1), "_cat"] = "Both"
+            order = ["Normal", "School only", "Public only", "Both"]
+            order = [o for o in order if o in hol_df["_cat"].unique()]
+            sns.boxplot(data=hol_df, x="_cat", y="entsoe_load_mw", order=order,
+                        ax=ax, palette="Set2", showfliers=False, linewidth=0.7)
+            ax.set_xlabel("Holiday category"); ax.set_ylabel("Load (MW)")
+            ax.set_title("Load by holiday category")
+            ax.tick_params(axis="x", rotation=20)
+            cat_means = hol_df.groupby("_cat")["entsoe_load_mw"].mean()
+            R["holiday_load_by_category"] = {
+                cat: round(float(cat_means.get(cat, 0)), 1) for cat in order
+            }
+        else:
+            axes[n_flags].set_visible(False)
+
+        plt.tight_layout(); savefig(fig, "temporal_02_holiday_load"); print(elapsed(t1))
+
+    # 10.3 ── Hourly load profile: holidays vs normal days
+    if "is_public_holiday" in hourly.columns and "hour" in hourly.columns:
+        print("[10.3] Holiday hourly profile …", end=" ", flush=True)
+        t1 = time.time()
+        prof = hourly[["entsoe_load_mw","hour","is_public_holiday"]].dropna(subset=["entsoe_load_mw"])
+        normal = prof[prof["is_public_holiday"]==0].groupby("hour")["entsoe_load_mw"].mean()
+        holiday = prof[prof["is_public_holiday"]==1].groupby("hour")["entsoe_load_mw"].mean()
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(normal.index, normal.values, "-o", color="steelblue", lw=2, ms=5, label="Normal days")
+        ax.plot(holiday.index, holiday.values, "-s", color="firebrick", lw=2, ms=5, label="Public holidays")
+        ax.fill_between(normal.index, normal.values, holiday.values, alpha=0.15, color="firebrick")
+        ax.set_xlabel("Hour (UTC)"); ax.set_ylabel("Mean Load (MW)")
+        ax.set_title("Average Hourly Load Profile: Public Holidays vs Normal Days")
+        ax.legend(fontsize=10); ax.set_xticks(range(24))
+        plt.tight_layout(); savefig(fig, "temporal_03_holiday_hourly_profile"); print(elapsed(t1))
+        R["holiday_hourly_profile"] = {
+            "normal": {int(h): round(float(v), 1) for h, v in normal.items()},
+            "public_holiday": {int(h): round(float(v), 1) for h, v in holiday.items()},
+        }
+
+    # 10.4 ── Correlation summary table for all temporal features
+    print("[10.4] Temporal feature correlation summary …", end=" ", flush=True)
+    t1 = time.time()
+    _all_temporal = _temporal_cycl + _holiday_flags + [
+        c for c in ["is_weekend"] if c in hourly.columns
+    ]
+    _temporal_corr = {}
+    for col in _all_temporal:
+        if col in hourly.columns:
+            sub = hourly[["entsoe_load_mw", col]].dropna()
+            if len(sub) > 100:
+                _temporal_corr[col] = round(float(sub["entsoe_load_mw"].corr(sub[col])), 4)
+    R["temporal_feature_correlations"] = _temporal_corr
+    print(f"{elapsed(t1)}")
+    print("  Temporal feature correlations with load:")
+    for col, r in sorted(_temporal_corr.items(), key=lambda x: abs(x[1]), reverse=True):
+        print(f"    {col:25s}  r = {r:+.4f}")
+
+else:
+    print("\n[10] Temporal features: skipped (columns not found in dataset)")
 
 
 # ── Write machine-readable results ────────────────────────────────────────────

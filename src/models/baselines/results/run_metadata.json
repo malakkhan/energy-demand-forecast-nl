@@ -1,9 +1,9 @@
 {
   "script": "train_baselines.py",
-  "started": "2026-06-02T17:28:51.001446",
+  "started": "2026-06-02T19:36:47.754285",
   "data_path": "/gpfs/work5/0/prjs2061/energy-demand-forecast-nl/data/processed/nl_hourly_dataset.parquet",
   "models_run": [
-    "van_de_sande_mlr"
+    "van_de_sande_prophet_lstm"
   ],
   "rocv": {
     "start_date": "2012-01-01",
@@ -21,5 +21,5 @@
       180
     ]
   },
-  "total_elapsed_s": 121.9
+  "total_elapsed_s": 6877.1
 }

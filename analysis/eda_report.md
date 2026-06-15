@@ -1,6 +1,6 @@
 # Netherlands Energy Demand Forecasting — Exploratory Data Analysis Report
 
-**Generated:** 2026-05-13  
+**Generated:** 2026-06-03  
 **Pipeline Version:** 3-phase Spark ETL + batch analysis  
 **Final Dataset:** `data/processed/nl_hourly_dataset.parquet`
 
@@ -21,7 +21,8 @@
 7. [KNMI Meteorological Observations](#7-knmi-meteorological-observations)
 8. [KNMI Validated vs Non-Validated Comparison](#8-knmi-validated-vs-non-validated-comparison)
 9. [Cross-Variable Analysis](#9-cross-variable-analysis)
-10. [Key Findings](#10-key-findings--recommendations)
+10. [Temporal Cyclical Features & Holiday Flags](#10-temporal-cyclical-features--holiday-flags)
+11. [Key Findings](#11-key-findings--recommendations)
 
 ---
 
@@ -32,7 +33,7 @@ The final merged dataset spans **14 years** of hourly observations for the Nethe
 | Property | Value |
 |----------|-------|
 | **Rows** | 122,736 hourly records |
-| **Columns** | 114 features |
+| **Columns** | 130 features |
 | **Time Span** | 2012-01-01 → 2025-12-31 (UTC) |
 | **File Size** | 9.2 MB (Parquet, Snappy compressed) |
 | **Temporal Resolution** | Hourly |
@@ -796,30 +797,136 @@ Solar radiation has the strongest lagged cross-correlation (r = −0.52 at lag �
 
 ---
 
-## 10. Key Findings & Recommendations
+## 10. Temporal Cyclical Features & Holiday Flags
 
-### 10.1 Key Findings
+Phase 3 generates cyclical (sin/cos) temporal features and public/school holiday binary flags directly on the hourly spine. These features encode time-of-day, day-of-week, and month-of-year as continuous periodic signals, and flag Dutch holidays that produce distinctive load patterns.
+
+### 10.1 Cyclical Feature Definitions
+
+| Feature | Formula | Period | What it captures |
+|---------|---------|--------|------------------|
+| `hour_sin` | sin(2π · hour / 24) | 24 h | Intra-day position (peaks at 06:00) |
+| `hour_cos` | cos(2π · hour / 24) | 24 h | Intra-day position (peaks at 00:00) |
+| `dow_sin` | sin(2π · dayofweek / 7) | 7 days | Weekly position (Monday = 0) |
+| `dow_cos` | cos(2π · dayofweek / 7) | 7 days | Weekly position (Monday = 0) |
+| `month_sin` | sin(2π · (month − 1) / 12) | 12 months | Annual position (peaks April) |
+| `month_cos` | cos(2π · (month − 1) / 12) | 12 months | Annual position (peaks January) |
+
+### 10.2 Cyclical Features vs Electricity Load
+
+![Cyclical features vs load](figures/temporal_01_cyclical_vs_load.png)
+
+**Pearson correlations with `entsoe_load_mw`:**
+
+| Feature | Pearson r | Interpretation |
+|---------|-----------|----------------|
+| `hour_cos` | **−0.535** | **Strongest temporal predictor** — load is lowest at midnight (cos=1), highest mid-day (cos ≈ −1) |
+| `month_cos` | **+0.341** | Winter peak (cos=1 in Jan) → higher load; summer trough (cos ≈ −1 in Jul) |
+| `dow_sin` | **+0.287** | Weekday load higher than weekend; captures Mon–Fri / Sat–Sun transition |
+| `hour_sin` | **−0.211** | Complements hour_cos; peaks at 06:00, captures the morning ramp shape |
+| `month_sin` | −0.112 | Weak; spring (positive) vs autumn (negative) asymmetry |
+| `dow_cos` | −0.099 | Weak; captures within-week pattern orthogonal to dow_sin |
+
+> [!NOTE]
+> `hour_cos` alone explains more variance in electricity load (r = −0.535) than any individual weather variable (`knmi_temp_c` at r = −0.207 is the strongest weather predictor). This confirms that the diurnal cycle is the dominant structural signal in electricity demand.
+
+### 10.3 Holiday Impact on Load
+
+![Holiday impact on load](figures/temporal_02_holiday_load.png)
+
+**Load reduction during holidays:**
+
+| Flag | Non-Holiday Mean (MW) | Holiday Mean (MW) | Δ Mean | Holiday Hours |
+|------|----------------------|-------------------|--------|---------------|
+| `is_public_holiday` | 12,773 | 11,227 | **−12.1%** | 3,431 |
+| `is_school_holiday` | 12,840 | 12,524 | **−2.5%** | 42,928 |
+
+**Load by holiday category:**
+
+| Category | Mean Load (MW) | Notes |
+|----------|---------------|-------|
+| Normal days | 12,893 | Working day, no holiday |
+| School holiday only | 12,550 | −2.7% vs normal |
+| Public holiday only | 10,955 | **−15.0%** vs normal |
+| Both (public + school) | 11,689 | −9.3% vs normal |
+
+> [!IMPORTANT]
+> Public holidays produce a dramatic **−12.1% load drop** (−1,546 MW on average), far exceeding the weekend effect (−7.2%). School holidays have a modest −2.5% impact, consistent with reduced commercial/industrial activity. When public and school holidays overlap (e.g. Christmas), the combined impact (−9.3%) is between the two individual effects, suggesting some demand suppression from the public holiday is already captured by the school holiday period.
+
+### 10.4 Hourly Load Profile: Public Holidays vs Normal Days
+
+![Holiday hourly profile](figures/temporal_03_holiday_hourly_profile.png)
+
+The shaded area shows the load reduction across each hour of the day:
+
+| Metric | Normal (MW) | Public Holiday (MW) | Difference |
+|--------|-------------|--------------------|-----------|
+| Night trough (02:00) | 10,363 | 9,852 | −511 MW (−4.9%) |
+| Morning ramp (07:00) | 13,782 | 11,275 | **−2,507 MW (−18.2%)** |
+| Daytime plateau (10:00) | 13,716 | 11,555 | **−2,162 MW (−15.8%)** |
+| Evening peak (16:00) | 14,418 | 12,589 | **−1,829 MW (−12.7%)** |
+| Late evening (21:00) | 12,342 | 11,495 | −847 MW (−6.9%) |
+
+The **morning ramp (07:00)** shows the largest absolute difference (−2,507 MW, −18.2%), reflecting the absence of commuting and commercial activity on public holidays. The nighttime trough is only −4.9% lower, as base load (residential heating, industrial processes) is relatively unaffected by holidays.
+
+### 10.5 Temporal Feature Correlation Summary
+
+All temporal features ranked by absolute correlation with electricity load:
+
+| Feature | Pearson r | Type |
+|---------|-----------|------|
+| `hour_cos` | **−0.535** | Cyclical |
+| `is_weekend` | **−0.352** | Binary |
+| `month_cos` | **+0.341** | Cyclical |
+| `dow_sin` | +0.287 | Cyclical |
+| `hour_sin` | −0.211 | Cyclical |
+| `is_public_holiday` | **−0.120** | Holiday flag |
+| `month_sin` | −0.112 | Cyclical |
+| `dow_cos` | −0.099 | Cyclical |
+| `is_school_holiday` | −0.071 | Holiday flag |
+
+### 10.6 Holiday Data Sources & Extrapolation
+
+| Feature | Source | Coverage |
+|---------|--------|----------|
+| `is_public_holiday` | Python `holidays` library (NL) | 2012–2025 (complete: 143 dates) |
+| `is_school_holiday` | OpenHolidays API (exact) | 2020–2025 |
+| `is_school_holiday` | Week-of-year extrapolation | 2012–2019 (approximate) |
+
+**School holiday extrapolation method:** For 2012–2019, school holidays are approximated using ISO-week-of-year windows derived from the stable 2020–2025 data: Christmas wk51–1, Spring wk6–9, May wk17–18, Summer wk27–35, Autumn wk41–44. These windows are set centrally by the Dutch Ministry of Education and have been nearly identical for decades.
+
+---
+
+## 11. Key Findings & Recommendations
+
+### 11.1 Key Findings
 
 1. **Electricity demand is strongly seasonal** — 58% of variance is seasonal (24h diurnal + 168h weekly cycles), with a clear weekday/weekend split and winter/summer pattern.
 
-2. **Temperature is the strongest weather predictor** (r = −0.21 at lag 0, up to −0.41 at optimal lag), confirming the NL heating-driven demand profile.
+2. **Hour-of-day is the single strongest predictor** — `hour_cos` achieves r = −0.535 vs load, exceeding any individual weather variable (temperature: r = −0.207). The cyclical sin/cos encoding captures the continuous 24h periodicity without the discontinuity of raw integer hours.
 
-3. **Solar radiation has strong lagged influence** (r = −0.52 at lag −10h) — daytime solar generation offsets grid demand with a phase delay.
+3. **Temperature is the strongest weather predictor** (r = −0.21 at lag 0, up to −0.41 at optimal lag), confirming the NL heating-driven demand profile.
 
-4. **2022 energy crisis is visible** — mean demand dropped to 11,460 MW (lowest since 2012), likely due to conservation behavior and high prices. This constitutes a structural break in the target series.
+4. **Solar radiation has strong lagged influence** (r = −0.52 at lag −10h) — daytime solar generation offsets grid demand with a phase delay.
 
-5. **Validated KNMI data is superior** — 100% spine coverage (vs 77.3% for non-validated), zero internal nulls, and r > 0.99 agreement with non-validated data on overlapping periods.
+5. **Public holidays reduce load by 12.1%** (−1,546 MW on average), with the morning ramp showing the largest impact (−18.2% at 07:00). School holidays have a modest −2.5% effect.
 
-6. **Severe multicollinearity exists** in the raw feature space — VIF values exceed 60,000 for humidity and temperature pairs.
+6. **2022 energy crisis is visible** — mean demand dropped to 11,460 MW (lowest since 2012), likely due to conservation behavior and high prices. This constitutes a structural break in the target series. A binary `is_energy_crisis` step variable flags 2022-01-01 through 2023-06-30 (13,104 hours, 10.7% of dataset).
 
-7. **`ntl_a1_sum` is the strongest NTL predictor** (r = +0.121), outperforming `ntl_a1_mean` (r = +0.108). Both peak in winter (Jan: 8.31 nW/cm²/sr mean, 2.37M sum) driven by longer nights at 52°N. A2-selective is weakly correlated with load (mean: r = +0.037, sum: r = +0.008). June is entirely absent from A2-selective — zero directly observed pixels with ≥10% coverage across the full 14-year record.
+7. **Validated KNMI data is superior** — 100% spine coverage (vs 77.3% for non-validated), zero internal nulls, and r > 0.99 agreement with non-validated data on overlapping periods.
 
-8. **10% minimum coverage filter** nulls out NTL mean/sum on days with <28,571 valid pixels (10% of 285,719). This reduced A2 selective coverage from 73.8% to 54.7% but dramatically improved A2-all's load correlation (mean: r = 0.112 vs 0.053 pre-filter). A1 was minimally affected (96.4% vs 97.1%).
+8. **Severe multicollinearity exists** in the raw feature space — VIF values exceed 60,000 for humidity and temperature pairs.
 
-9. **A2 non-selective achieves 97.5% hourly coverage** and now matches A1's load correlation strength (mean r = +0.112 vs A1 mean r = +0.108). Including imputed pixels eliminates the spurious summer peak and restores a physically plausible seasonal pattern (winter peak, summer trough). `ntl_a2_all_sum` also achieves r = +0.112.
+9. **`ntl_a1_sum` is the strongest NTL predictor** (r = +0.121), outperforming `ntl_a1_mean` (r = +0.108). Both peak in winter (Jan: 8.31 nW/cm²/sr mean, 2.37M sum) driven by longer nights at 52°N. A2-selective is weakly correlated with load (mean: r = +0.037, sum: r = +0.008). June is entirely absent from A2-selective — zero directly observed pixels with ≥10% coverage across the full 14-year record.
+
+10. **10% minimum coverage filter** nulls out NTL mean/sum on days with <28,571 valid pixels (10% of 285,719). This reduced A2 selective coverage from 73.8% to 54.7% but dramatically improved A2-all's load correlation (mean: r = 0.112 vs 0.053 pre-filter). A1 was minimally affected (96.4% vs 97.1%).
+
+11. **A2 non-selective achieves 97.5% hourly coverage** and now matches A1's load correlation strength (mean r = +0.112 vs A1 mean r = +0.108). Including imputed pixels eliminates the spurious summer peak and restores a physically plausible seasonal pattern (winter peak, summer trough). `ntl_a2_all_sum` also achieves r = +0.112.
+
+12. **Lag features capture strong autoregressive and cross-variable structure.** Load lags at −12h, −24h, −1 week, and −1 year exploit the dominant ACF peaks (ACF=0.961 at lag 1, 0.842 at lag 24, 0.924 at lag 168). Weather lags at CCF-optimal offsets capture the phase-delayed influence of solar radiation (r=−0.52 at −10h), humidity (r=+0.42 at −11h), and temperature (r=−0.40 at −107h).
 
 <!--
-### 10.2 Modeling Recommendations
+### 11.2 Modeling Recommendations
 
 > [!TIP]
 > **Feature selection for modeling:**
@@ -829,6 +936,7 @@ Solar radiation has the strongest lagged cross-correlation (r = −0.52 at lag �
 > - Consider PCA on the CBS feature block to reduce collinearity
 > - Include **lag features** for temperature (−83h) and solar radiation (−10h) based on CCF peaks
 > - **NTL ranking**: use `ntl_a1_sum` (r = +0.121) as the primary NTL feature; use **either** `ntl_a1_sum` **or** `ntl_a1_mean` (VIF ≈ 22B between them); consider `ntl_a2_all_mean` or `ntl_a2_all_sum` (r = +0.112, 97.5% coverage) as a gap-free alternative; avoid `ntl_a2_mean` and `ntl_a2_sum` (54.7% coverage, survivorship bias)
+> - Include **cyclical temporal features** (`hour_sin/cos`, `dow_sin/cos`, `month_sin/cos`) and **holiday flags** (`is_public_holiday`, `is_school_holiday`) — these are the strongest individual predictors of load
 
 **Additional recommendations:**
 
@@ -840,7 +948,7 @@ Solar radiation has the strongest lagged cross-correlation (r = −0.52 at lag �
 
 **R10 — Structural break for the 2022 energy crisis.** The 2022 demand trough (mean 11,460 MW, lowest since 2012) is a genuine structural break caused by price-driven industrial curtailment and household conservation. A model trained on 2012–2025 without a crisis indicator will mis-learn the 2022 period. Include a binary `energy_crisis` flag (True for approximately 2022–H1 2023) or use piecewise regression/changepoint detection around this break.
 
-**R11 — Explicit calendar and time features.** The 24h (ACF = 0.84) and 168h (ACF = 0.92) autocorrelations confirm that calendar structure is the dominant signal. Explicitly encoding `hour_of_day`, `day_of_week`, `month_of_year`, `is_public_holiday` (NL calendar), `week_of_year`, and `is_dst_transition` will substantially outperform any model that must learn these from raw timestamps. Dutch public holidays (King's Day, Liberation Day, etc.) produce load dips of ~2,000 MW and are not derivable from date arithmetic alone.
+**R11 — Explicit calendar and time features.** (✅ **Implemented**) The 24h (ACF = 0.84) and 168h (ACF = 0.92) autocorrelations confirm that calendar structure is the dominant signal. Cyclical sin/cos features for hour, day-of-week, and month now capture these patterns without discontinuities. Dutch public holidays (King's Day, Liberation Day, etc.) produce load dips of ~1,546 MW (−12.1%) and are encoded as `is_public_holiday`. School holidays produce a modest −2.5% effect via `is_school_holiday`.
 
 **R12 — Solar radiation phase correction as an explicit feature.** The CCF shows `knmi_val_solar_rad_jcm2` peaks at lag +158h (r = −0.544) with near-zero correlation at lag 0. Creating an explicit `solar_rad_lag_minus_10h` feature (the empirically optimal short lag from the non-validated CCF) captures the phase-delayed grid demand suppression from daytime PV generation without requiring the model to learn the lag internally.
 
@@ -852,7 +960,7 @@ Solar radiation has the strongest lagged cross-correlation (r = −0.52 at lag �
 **R14 — NTL as a long-run activity indicator, not a short-run predictor.** The CCF for A1 sum peaks at lag +142h (r = 0.133), not lag 0. A1 mean peaks at +141h (r = 0.120). The information NTL adds is about multi-day or weekly economic activity levels rather than hour-by-hour load. Consider constructing a monthly NTL feature (after night-length normalisation) and using it as an economic activity covariate alongside GDP and CPI, rather than treating it as a daily predictor.
 -->
 
-### 10.3 Data Quality Summary
+### 11.3 Data Quality Summary
 
 | Dataset | Gap % | Status |
 |---------|-------|--------|
@@ -863,7 +971,10 @@ Solar radiation has the strongest lagged cross-correlation (r = −0.52 at lag �
 | VIIRS A2 (non-selective) | 2.52%\* | ✅ Healthy |
 | VIIRS A2 (selective) | 45.35%\* | ⚠️ Cloud-limited + 10% coverage filter |
 | CBS (all series) | 0.00% | ✅ Complete |
+| Public holidays | 0.00% | ✅ Complete (2012–2025) |
+| School holidays | 0.00%\*\* | ✅ Complete (2020–2025 exact, 2012–2019 extrapolated) |
 
 \* Reported as hourly null % in the final merged dataset (daily gaps × 24h broadcast).
+\*\* School holiday data for 2012–2019 is extrapolated from stable week-of-year patterns; accuracy is approximate.
 
 All gaps are genuine upstream data absences — no download errors remain. The pipeline is fully operational and the dataset is ready for model training.

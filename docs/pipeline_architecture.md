@@ -67,12 +67,13 @@ flowchart TD
 
     subgraph P3["PHASE 3 — MERGE  ·  src/pipeline/phase3_merge.py"]
         direction TB
-        SPINE["🕐 Hourly UTC Spine\n2012-01-01 → today\n~126,000 rows\n+ 9 temporal features"]
-        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A2-all on date → ntl_a2_all_*\n4. VIIRS A1 on date → ntl_a1_*\n5. CBS on year,month (broadcast)\n6. KNMI on timestamp → knmi_*\n7. KNMI Val on timestamp → knmi_val_*"]
+        SPINE["🕐 Hourly UTC Spine\n2012-01-01 → today\n~126,000 rows\n+ 9 temporal features\n+ 6 cyclical sin/cos features"]
+        JOIN["🔀 Left Joins\n1. ENTSO-E on timestamp\n2. VIIRS A2 on date → ntl_a2_*\n3. VIIRS A2-all on date → ntl_a2_all_*\n4. VIIRS A1 on date → ntl_a1_*\n5. CBS on year,month (broadcast)\n6. KNMI on timestamp → knmi_*\n7. KNMI Val on timestamp → knmi_val_*\n8. Holiday flags on date"]
+        PCA_STEP["📐 PCA Reduction\nStandardScaler → PCA(15)\nAll cbs_* + knmi_val_* features\n(75 of 79 retained)\n→ pca_cbs_knmi_01…15"]
     end
 
     subgraph FINAL["📦 FINAL OUTPUT"]
-        OUT["nl_hourly_dataset.parquet\n~105 columns · ~126K rows\nPartitioned by year"]
+        OUT["nl_hourly_dataset.parquet\n145 columns · ~126K rows\nPartitioned by year"]
     end
 
     VA2_RAW --> VA2_1
@@ -123,7 +124,8 @@ flowchart TD
     KV2_O --> JOIN
     SPINE --> JOIN
 
-    JOIN --> OUT
+    JOIN --> PCA_STEP
+    PCA_STEP --> OUT
 
     style RAW fill:#1e293b,stroke:#475569,color:#e2e8f0
     style P1 fill:#1e1b4b,stroke:#4361ee,color:#c7d2fe
@@ -606,7 +608,8 @@ flowchart LR
     J5 -->|"LEFT JOIN\non timestamp"| J6
     KV --> J6
 
-    J6 --> OUT["📦 Final Dataset\n~105 columns\n~126K rows"]
+    J6 --> PCA_STEP["📐 PCA Reduction\nStandardScaler → PCA(15)\n75 CBS + KNMI val features\n→ pca_cbs_knmi_01…15"]
+    PCA_STEP --> OUT["📦 Final Dataset\n145 columns\n~126K rows"]
 ```
 
 #### Join Details
@@ -620,6 +623,7 @@ flowchart LR
 | 5 | CBS | `(year, month)` | All `cbs_*` columns | Left + broadcast |
 | 6 | KNMI | `timestamp` | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | Left equi-join |
 | 7 | KNMI Validated | `timestamp` | `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count` | Left equi-join |
+| 8 | Holiday calendars | `date` | `is_public_holiday`, `is_school_holiday` | Set-lookup on date |
 
 #### Temporal Feature Generation
 
@@ -636,6 +640,28 @@ Nine derived columns are added from the `timestamp`:
 | `day_of_year` | int | 75 |
 | `week_of_year` | int | 11 |
 | `quarter` | int | 1 |
+
+#### Cyclical (sin/cos) Temporal Features
+
+Six additional cyclical-encoded features are generated from the timestamp. These use sin/cos encoding so that periodic boundaries (e.g. hour 23 → 0, December → January) are continuous in feature space:
+
+| Feature | Formula | Period |
+|---|---|---|
+| `hour_sin` | sin(2π · hour / 24) | 24 h |
+| `hour_cos` | cos(2π · hour / 24) | 24 h |
+| `dow_sin` | sin(2π · dayofweek / 7) | 7 days (Monday=0) |
+| `dow_cos` | cos(2π · dayofweek / 7) | 7 days (Monday=0) |
+| `month_sin` | sin(2π · (month − 1) / 12) | 12 months |
+| `month_cos` | cos(2π · (month − 1) / 12) | 12 months |
+
+#### Holiday Flags
+
+Two binary holiday indicators are joined from calendar CSVs in `data/calendar/`:
+
+| Flag | Source | Coverage | Notes |
+|---|---|---|---|
+| `is_public_holiday` | Python `holidays` library → `nl_public_holidays.csv` | 2012–2025 (complete) | 143 unique dates; ~10 public holidays/year |
+| `is_school_holiday` | OpenHolidays API → `nl_holidays.csv` + week-of-year extrapolation | 2020–2025 (exact API data) + 2012–2019 (extrapolated) | National flag (any Dutch region on holiday); 5 periods/year (Christmas wk51–1, Spring wk6–9, May wk17–18, Summer wk27–35, Autumn wk41–44) |
 
 #### Column Ordering
 
@@ -654,9 +680,17 @@ Phase 3 arranges columns in a deterministic semantic order:
 11. Any additional `knmi_*` columns (non-validated, auto-appended in sorted order)
 12. KNMI validated meteorological (`knmi_val_temp_c`, `knmi_val_wind_speed_ms`, etc.)
 13. Any additional `knmi_val_*` columns (auto-appended in sorted order)
-14. Temporal features (`year`, `month`, `day`, `hour`, etc.)
+14. PCA components (`pca_cbs_knmi_01` through `pca_cbs_knmi_15`) — 15 principal components from CBS + KNMI validated features
+15. Temporal features (`year`, `month`, `day`, `hour`, etc.)
+16. Cyclical temporal features (`hour_sin`, `hour_cos`, `dow_sin`, `dow_cos`, `month_sin`, `month_cos`)
+17. Holiday flags (`is_public_holiday`, `is_school_holiday`)
+18. Load lag features (`load_lag_12h`, `load_lag_24h`, `load_lag_1w`, `load_lag_1y`)
+19. Weather lag features (`solar_rad_lag_10h`, `humidity_lag_12h`, `temp_lag_107h`)
+20. Event flags (`is_energy_crisis`)
 
 This ordering is forward-compatible: new `cbs_*` or `knmi_*` columns added in Phase 1 are automatically included without modifying Phase 3 code.
+
+See [`docs/feature_dictionary.csv`](../docs/feature_dictionary.csv) for the complete 145-column schema reference.
 
 #### Final Output Schema
 
@@ -685,6 +719,24 @@ data/processed/nl_hourly_dataset.parquet/
 | Meteorology | `knmi_temp_c`, `knmi_dewpoint_c`, `knmi_wind_speed_ms`, `knmi_wind_speed_hourly_ms`, `knmi_wind_gust_ms`, `knmi_solar_rad_jcm2`, `knmi_sunshine_h`, `knmi_humidity_pct`, `knmi_station_count` | KNMI | Hourly | National mean across 61 stations (non-validated) |
 | Meteorology (Validated) | `knmi_val_temp_c`, `knmi_val_dewpoint_c`, `knmi_val_wind_speed_ms`, `knmi_val_wind_speed_hourly_ms`, `knmi_val_wind_gust_ms`, `knmi_val_solar_rad_jcm2`, `knmi_val_sunshine_h`, `knmi_val_humidity_pct`, `knmi_val_station_count` | KNMI Validated | Hourly | National mean across 61 stations (expert-validated) |
 | Temporal | `year`, `month`, `day`, `hour`, `day_of_week`, `is_weekend`, `day_of_year`, `week_of_year`, `quarter` | Derived | Hourly | From timestamp |
+| Temporal (Cyclical) | `hour_sin`, `hour_cos`, `dow_sin`, `dow_cos`, `month_sin`, `month_cos` | Derived | Hourly | sin/cos encoded; periods 24h, 7d, 12mo |
+| Holiday | `is_public_holiday`, `is_school_holiday` | `holidays` lib + OpenHolidays API | Daily | Binary flags; school holidays use week-of-year extrapolation for 2012–2019 |
+| Lag (Autoregressive) | `load_lag_12h`, `load_lag_24h`, `load_lag_1w`, `load_lag_1y` | Derived from `entsoe_load_mw` | Hourly | pd.Series.shift(); first *N* rows null; captures 12h, daily, weekly, annual persistence |
+| Lag (Weather) | `solar_rad_lag_10h`, `humidity_lag_12h`, `temp_lag_107h` | Derived from validated KNMI | Hourly | CCF-optimal lags (§9.3); solar r=−0.52 at −10h, humidity r=+0.42 at −11h, temp r=−0.40 at −107h |
+| Event | `is_energy_crisis` | Derived from timestamp | Hourly | Step variable: 1 for 2022-01-01 → 2023-06-30; 13,104 hours (10.7% of dataset) |
+| PCA (Dimensionality Reduction) | `pca_cbs_knmi_01` through `pca_cbs_knmi_15` | Derived from 75 CBS + KNMI val features via sklearn PCA | Hourly | StandardScaler → PCA(15); 95% cumulative variance; 4 sparse columns excluded; NaN outside 2018–2025 coverage intersection |
+
+#### PCA Dimensionality Reduction
+
+After all source joins and lag feature engineering, Phase 3 computes **15 principal components** from the combined CBS + KNMI validated feature set:
+
+1. **Input selection**: All `cbs_*` (70) + `knmi_val_*` (9) = 79 columns
+2. **Sparse column exclusion**: Columns with >50% NaN are dropped (4 columns: `cbs_gas_ode_tax`, `cbs_elec_ode_tax`, `cbs_elec_fixed_supply_rate_dynamic`, `cbs_elec_variable_supply_rate_dynamic`), leaving 75 features
+3. **StandardScaler** fit on complete rows (~70K rows in the 2018–2025 coverage intersection)
+4. **PCA(n_components=15)** fit and transform → captures ~95% of total variance
+5. Output columns `pca_cbs_knmi_01` … `pca_cbs_knmi_15` are NaN for rows where any input feature is missing
+
+This dimensionality reduction was motivated by the PCA elbow analysis (`analysis/pca_elbow.py`), which showed that 15 components are sufficient to retain 95% of the combined CBS + KNMI validated variance from the original 75 features.
 
 ---
 
