@@ -28,6 +28,7 @@ Usage
 """
 
 import argparse
+import fcntl
 import json
 import logging
 import sys
@@ -400,6 +401,39 @@ def run_sarimax_lstm_fold(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Parallel-safe fold persistence
+# ═══════════════════════════════════════════════════════════════════════
+
+def save_fold_result_locked(
+    result_row: Dict,
+    results_list: List[Dict],
+    output_dir: Path,
+    model_name: str,
+) -> None:
+    """Append a fold result with file-locking for parallel-job safety."""
+    csv_path = output_dir / f"rocv_results_{model_name}.csv"
+    lock_path = output_dir / f".lock_{model_name}"
+
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if csv_path.exists():
+                disk_rows = pd.read_csv(csv_path).to_dict("records")
+            else:
+                disk_rows = []
+            disk_rows.append(result_row)
+            seen: Dict[tuple, Dict] = {}
+            for row in disk_rows:
+                key = (row["model"], int(row["fold"]), int(row["horizon_days"]))
+                seen[key] = row
+            deduped = list(seen.values())
+            pd.DataFrame(deduped).to_csv(csv_path, index=False)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+    results_list.append(result_row)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -409,6 +443,9 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing results, skipping completed folds. "
+                             "Safe for parallel per-horizon SLURM jobs.")
     parser.add_argument("--fold-step", type=int, default=FOLD_STEP_YEARS)
     args = parser.parse_args()
 
@@ -435,6 +472,15 @@ def main():
     logger.info("Features: %d total", len(ALL_FEATURES))
 
     results: List[Dict] = []
+    completed: set = set()
+    csv_path = output_dir / f"rocv_results_{model_name}.csv"
+    if args.resume and csv_path.exists():
+        existing_df = pd.read_csv(csv_path)
+        results = existing_df.to_dict("records")
+        for _, row in existing_df.iterrows():
+            completed.add((int(row["horizon_days"]), int(row["fold"])))
+        logger.info("Resumed: loaded %d existing results (%d unique horizon×fold pairs).",
+                     len(results), len(completed))
 
     for h_days in horizons:
         h_t0 = time.time()
@@ -451,6 +497,10 @@ def main():
             logger.info("  FOLD %d — train=[..,%s)  val=[%s,%s)  test=%s  horizon=%dd",
                         fold_idx, train_end.date(), train_end.date(),
                         val_end.date(), test_origin.date(), h_days)
+
+            if (h_days, fold_idx) in completed:
+                logger.info("    Already complete — skipping.")
+                continue
 
             fold_result = run_sarimax_lstm_fold(
                 df_shifted, train_end, val_end, test_origin, h_days,
@@ -472,7 +522,7 @@ def main():
                     "n_features": fold_result.get("n_features", 0),
                     "elapsed_s": round(fold_elapsed, 1),
                 }
-                save_fold_result(result_row, results, output_dir, model_name)
+                save_fold_result_locked(result_row, results, output_dir, model_name)
 
                 logger.info(
                     "    H=%3dd | RMSE=%7.1f  MAE=%7.1f  MAPE=%.2f%%  PCC=%.4f | "
@@ -490,7 +540,17 @@ def main():
 
         logger.info("  Horizon %d days complete in %.0fs.", h_days, time.time() - h_t0)
 
-    results_df = save_final_results(results, output_dir, model_name)
+    # In resume/parallel mode, reload from disk to include all jobs' results
+    if args.resume and csv_path.exists():
+        results_df = pd.read_csv(csv_path)
+        out_json = output_dir / f"rocv_results_{model_name}.json"
+        with open(out_json, "w") as f:
+            json.dump(results_df.to_dict("records"), f, indent=2, default=str)
+        logger.info("Results: %s (%d rows across %d horizons).",
+                     csv_path.name, len(results_df),
+                     results_df["horizon_days"].nunique())
+    else:
+        results_df = save_final_results(results, output_dir, model_name)
     print_summary_table(results_df, model_name)
 
     try:

@@ -206,7 +206,7 @@ class SARIMAXConfig:
     expensive; we therefore restrict training to the most recent
     ``max_train_hours`` hours within each fold's available history.
     """
-    order: Tuple[int, int, int] = (1, 0, 1)
+    order: Tuple[int, int, int] = (2, 0, 3)
     seasonal_order: Tuple[int, int, int, int] = (1, 0, 1, 168)
     max_train_hours: int = 24 * 365 * 2  # Last 2 years to cap runtime
     rolling_means_hours: List[int] = field(
@@ -230,7 +230,7 @@ class SARIMAXLSTMConfig:
     input_sequence_length: int = 720  # 30 days of hourly residuals
     lstm_units: int = 50
     epochs: int = 30
-    batch_size: int = 64
+    batch_size: int = 32
     learning_rate: float = 1e-3
 
 

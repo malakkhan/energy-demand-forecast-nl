@@ -24,7 +24,7 @@ mkdir -p "$REPO_ROOT/logs"
 
 module load 2023
 module load Python/3.11.3-GCCcore-12.3.0
-module load CUDA/12.1.1
+module load CUDA/12.4.0
 source "${REPO_ROOT}/.venv/bin/activate"
 
 echo "========================================"
@@ -35,6 +35,8 @@ echo "  GPUs     : ${SLURM_GPUS}"
 echo "  Memory   : ${SLURM_MEM_PER_NODE}MB"
 echo "  Started  : $(date)"
 echo "  Python   : $(python --version)"
+echo "  PyTorch  : $(python -c 'import torch; print(torch.__version__)')"
+echo "  CUDA avl : $(python -c 'import torch; print(torch.cuda.is_available())')"
 echo "========================================"
 echo ""
 
