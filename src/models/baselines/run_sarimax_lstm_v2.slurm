@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --gpus=1
-#SBATCH --mem=64G
+#SBATCH --mem=32G
 #SBATCH --time=24:00:00
 #SBATCH --output=/projects/prjs2061/energy-demand-forecast-nl/logs/sarimax_lstm_v2_%j.log
 #SBATCH --mail-type=END,FAIL
