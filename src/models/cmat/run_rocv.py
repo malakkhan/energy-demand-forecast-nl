@@ -1,0 +1,245 @@
+"""CMAT ROCV evaluation: runs all fold/horizon combinations.
+
+Usage:
+    python -m src.models.cmat.run_rocv --variant full --horizon 60 [--resume]
+    python -m src.models.cmat.run_rocv --variant full --horizon 60 --quick
+"""
+
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+# Baseline utilities
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from baselines import config as BC
+from baselines import evaluation as BE
+from baselines.data_loader import rocv_folds, split_fold
+
+from . import config as C
+from .config import CMATConfig, CMATVariant
+from .train import (
+    load_dataset,
+    train_one_fold,
+    save_fold_result_locked,
+    is_fold_done,
+)
+
+logger = logging.getLogger("cmat.run_rocv")
+
+
+def run_rocv(
+    variant: str = "full",
+    horizon_days: int = 60,
+    resume: bool = False,
+    quick: bool = False,
+    config_path: str = None,
+) -> None:
+    """Run ROCV evaluation for one CMAT variant at one horizon.
+
+    Parameters
+    ----------
+    variant : str
+        CMAT variant ("tab", "ntl", "early", "full").
+    horizon_days : int
+        Forecast horizon in days.
+    resume : bool
+        Skip already-completed folds.
+    quick : bool
+        Run only the first fold (for smoke testing).
+    config_path : str
+        Path to a best_config JSON from the Optuna search.
+        If None, uses default config.
+    """
+    variant_enum = CMATVariant(variant)
+    model_name = f"cmat_{variant}"
+    output_dir = C.OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("=" * 70)
+    logger.info("CMAT ROCV Evaluation")
+    logger.info("  Variant:  %s", variant)
+    logger.info("  Horizon:  %d days (%d hours)", horizon_days, horizon_days * 24)
+    logger.info("  Resume:   %s", resume)
+    logger.info("  Quick:    %s", quick)
+    logger.info("  Output:   %s", output_dir)
+    logger.info("=" * 70)
+
+    # Load config (from search or default)
+    if config_path:
+        from .search import load_best_config
+        cfg = load_best_config(variant, horizon_days, output_dir=str(Path(config_path).parent))
+        logger.info("Loaded best config from %s.", config_path)
+    else:
+        # Try to load from default search output location
+        try:
+            from .search import load_best_config
+            cfg = load_best_config(variant, horizon_days)
+            logger.info("Loaded best config from search results.")
+        except FileNotFoundError:
+            logger.info("No search results found — using default config.")
+            cfg = CMATConfig(
+                variant=variant_enum,
+                horizon_hours=horizon_days * 24,
+            )
+
+    # Ensure variant and horizon match
+    cfg.variant = variant_enum
+    cfg.horizon_hours = horizon_days * 24
+
+    # Load data
+    df = load_dataset()
+
+    # NTL image store (for spatial variants)
+    ntl_store = None
+    if cfg.uses_spatial:
+        from .ntl_images import NTLImageStore
+        ntl_store = NTLImageStore()
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
+    if device.type == "cuda":
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
+
+    # Generate folds
+    rocv_cfg = BC.ROCVConfig()
+    folds = list(rocv_folds(df, rocv_cfg))
+    logger.info("Total folds: %d (quick=%s).", len(folds), quick)
+
+    if quick:
+        folds = folds[:1]
+
+    results = []
+    t0_total = time.time()
+
+    for fold_idx, train_end, val_end, test_origin in folds:
+        # Check resume
+        if resume and is_fold_done(output_dir, model_name, fold_idx, horizon_days):
+            logger.info("Fold %d / H=%dd: SKIP (already done).", fold_idx, horizon_days)
+            continue
+
+        logger.info("─" * 60)
+        logger.info("Fold %d / H=%dd", fold_idx, horizon_days)
+        logger.info("  train_end:   %s", train_end.date())
+        logger.info("  val_end:     %s", val_end.date())
+        logger.info("  test_origin: %s", test_origin.date())
+
+        # Split data
+        train_df, val_df, test_df = split_fold(
+            df, train_end, val_end, test_origin, horizon_days
+        )
+
+        if len(train_df) == 0 or len(val_df) == 0 or len(test_df) == 0:
+            logger.warning("Fold %d: empty split — skipping.", fold_idx)
+            continue
+
+        # Check if we have enough data for context window
+        if len(train_df) < cfg.context_window_hours + 1:
+            logger.warning(
+                "Fold %d: insufficient training data (%d < %d) — skipping.",
+                fold_idx, len(train_df),
+                cfg.context_window_hours + 1,
+            )
+            continue
+
+        try:
+            t0_fold = time.time()
+            result = train_one_fold(
+                cfg, train_df, val_df, test_df,
+                ntl_store=ntl_store, device=device,
+                horizon_hours=horizon_days * 24,
+            )
+            fold_time = time.time() - t0_fold
+
+            if result is None:
+                logger.warning("Fold %d: train_one_fold returned None — skipping.", fold_idx)
+                continue
+
+            metrics = result["metrics"]
+            result_row = {
+                "model": model_name,
+                "fold": fold_idx,
+                "train_end": str(train_end.date()),
+                "horizon_days": horizon_days,
+                "rmse": metrics.rmse,
+                "mae": metrics.mae,
+                "mape_pct": metrics.mape_pct,
+                "mase": metrics.mase,
+                "nmae": metrics.nmae,
+                "nrmse": metrics.nrmse,
+                "pcc": metrics.pcc,
+                "n_samples": metrics.n_samples,
+                "best_val_loss": result["best_val_loss"],
+                "n_params": result["n_params"],
+                "n_epochs": result["n_epochs"],
+                "train_time_s": fold_time,
+            }
+
+            save_fold_result_locked(result_row, results, output_dir, model_name)
+            logger.info(
+                "Fold %d done in %.1fs: RMSE=%.2f  MAE=%.2f  MAPE=%.2f%%  PCC=%.4f",
+                fold_idx, fold_time, metrics.rmse, metrics.mae,
+                metrics.mape_pct, metrics.pcc,
+            )
+
+        except Exception as exc:
+            logger.error("Fold %d failed: %s", fold_idx, exc, exc_info=True)
+            continue
+
+    total_time = time.time() - t0_total
+    logger.info("=" * 70)
+    logger.info(
+        "ROCV complete: %d folds in %.1fs (%.1f min).",
+        len(results), total_time, total_time / 60,
+    )
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="CMAT ROCV evaluation — run all folds for one horizon."
+    )
+    parser.add_argument(
+        "--variant", type=str, default="full",
+        choices=["tab", "ntl", "early", "full"],
+        help="CMAT variant to evaluate."
+    )
+    parser.add_argument(
+        "--horizon", type=int, required=True,
+        help="Forecast horizon in days (60, 75, ..., 180)."
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip already-completed folds."
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="Run only the first fold (smoke test)."
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to best_config JSON from Optuna search."
+    )
+    args = parser.parse_args()
+
+    run_rocv(
+        variant=args.variant,
+        horizon_days=args.horizon,
+        resume=args.resume,
+        quick=args.quick,
+        config_path=args.config,
+    )
+
+
+if __name__ == "__main__":
+    main()
