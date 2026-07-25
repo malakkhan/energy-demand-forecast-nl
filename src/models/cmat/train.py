@@ -139,19 +139,50 @@ def get_feature_columns(df: pd.DataFrame, cfg: CMATConfig) -> Tuple[List[str], L
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# IQR-Based Outlier Clipping
+# ═══════════════════════════════════════════════════════════════════════════
+
+def clip_iqr(
+    df: pd.DataFrame,
+    numerical_cols: List[str],
+    multiplier: float = 1.5,
+) -> pd.DataFrame:
+    """Clip outliers at Q1 − k×IQR and Q3 + k×IQR (winsorize, not NaN).
+
+    Matches thesis specification: values beyond the fences are *clamped*
+    to the fence values rather than replaced with NaN.
+    """
+    df = df.copy()
+    n_clipped = 0
+    for col in numerical_cols:
+        if col not in df.columns:
+            continue
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - multiplier * iqr
+        upper = q3 + multiplier * iqr
+        mask = (df[col] < lower) | (df[col] > upper)
+        n_clipped += mask.sum()
+        df[col] = df[col].clip(lower=lower, upper=upper)
+    logger.info("IQR clipping: %d values clipped across %d cols.",
+                n_clipped, len(numerical_cols))
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Dataset
 # ═══════════════════════════════════════════════════════════════════════════
 
 class CMATDataset(Dataset):
     """PyTorch Dataset for CMAT: produces tabular context windows + targets.
 
-    Follows the same single-step prediction protocol as the baselines:
-    features are pre-shifted by the forecast horizon at the *data* level
-    (via ``prepare_shifted_data``), so each sliding window of W hours
-    predicts the target load **one step ahead** in the shifted frame.
+    Preprocessing follows the thesis specification:
+      1. IQR outlier clipping (applied upstream in train_one_fold)
+      2. Forward-fill for residual NaNs
+      3. Min-Max normalization to [0, 1] — bounds from training fold only
 
-    This produces the correct number of test samples:
-        test set has H hours → H - W sliding windows.
+    Each sliding window of W hours predicts the target load one step ahead.
     """
 
     def __init__(
@@ -163,10 +194,10 @@ class CMATDataset(Dataset):
         ntl_store=None,
         ntl_mean: float = 0.0,
         ntl_std: float = 1.0,
-        target_mean: float = 0.0,
-        target_std: float = 1.0,
-        cont_mean: np.ndarray = None,
-        cont_std: np.ndarray = None,
+        target_min: float = 0.0,
+        target_max: float = 1.0,
+        cont_min: np.ndarray = None,
+        cont_max: np.ndarray = None,
         horizon_hours: int = 0,
     ):
         super().__init__()
@@ -174,8 +205,8 @@ class CMATDataset(Dataset):
         self.ntl_store = ntl_store
         self.ntl_mean = ntl_mean
         self.ntl_std = ntl_std
-        self.target_mean = target_mean
-        self.target_std = target_std
+        self.target_min = target_min
+        self.target_max = target_max
         self.horizon_hours = horizon_hours
 
         W = cfg.context_window_hours
@@ -183,16 +214,18 @@ class CMATDataset(Dataset):
         # Extract arrays from dataframe
         self.timestamps = df.index.to_pydatetime()
 
-        # Continuous features → float32
+        # Continuous features → float32, Min-Max [0,1]
         cont_vals = df[cont_cols].values.astype(np.float32)
-        # Normalise continuous features (z-score)
-        if cont_mean is not None and cont_std is not None:
-            self.cont_mean = cont_mean
-            self.cont_std = cont_std
+        if cont_min is not None and cont_max is not None:
+            self.cont_min = cont_min
+            self.cont_max = cont_max
         else:
-            self.cont_mean = np.nanmean(cont_vals, axis=0)
-            self.cont_std = np.nanstd(cont_vals, axis=0) + 1e-8
-        cont_vals = (cont_vals - self.cont_mean) / self.cont_std
+            self.cont_min = np.nanmin(cont_vals, axis=0)
+            self.cont_max = np.nanmax(cont_vals, axis=0)
+        denom = (self.cont_max - self.cont_min)
+        denom[denom < 1e-8] = 1.0  # avoid division by zero for constant cols
+        cont_vals = (cont_vals - self.cont_min) / denom
+        cont_vals = np.clip(cont_vals, 0.0, 1.0)  # clip val/test that exceed train range
         cont_vals = np.nan_to_num(cont_vals, nan=0.0)
         self.cont_data = cont_vals
 
@@ -206,10 +239,14 @@ class CMATDataset(Dataset):
                                             C.CATEGORICAL_CARDINALITIES["year"] - 1)
         self.cat_data = cat_vals.astype(np.int64)
 
-        # Target values (z-score normalised)
+        # Target values (Min-Max [0,1])
         target_vals = df[C.TARGET].values.astype(np.float32)
         self.raw_target = target_vals.copy()
-        self.target_data = (target_vals - target_mean) / target_std
+        target_denom = target_max - target_min
+        if target_denom < 1e-8:
+            target_denom = 1.0
+        self.target_denom = target_denom
+        self.target_data = (target_vals - target_min) / target_denom
 
         # Sliding window: each sample uses W context hours → predict 1 step
         self.W = W
@@ -362,9 +399,10 @@ def train_one_fold(
 ) -> Dict:
     """Train CMAT on one ROCV fold and return metrics.
 
-    The data is expected to be pre-split into train/val/test.
-    Features should already be in the dataframe (including horizon-shifted
-    lags if applicable). Each sample predicts 1 step ahead (H_pred=1).
+    Preprocessing (applied here, matching thesis spec):
+      1. IQR outlier clipping on training data (predictors only)
+      2. Forward-fill residual NaNs across all splits
+      3. Min-Max normalization to [0, 1] — bounds from training fold only
 
     Returns a dict with keys matching the baselines evaluation format.
     """
@@ -377,11 +415,25 @@ def train_one_fold(
     # Feature columns
     cont_cols, cat_cols = get_feature_columns(train_df, cfg)
 
-    # Compute normalisation stats from training data
-    cont_mean = np.nanmean(train_df[cont_cols].values.astype(np.float32), axis=0)
-    cont_std = np.nanstd(train_df[cont_cols].values.astype(np.float32), axis=0) + 1e-8
-    target_mean = float(train_df[C.TARGET].mean())
-    target_std = float(train_df[C.TARGET].std()) + 1e-8
+    # ── Step 1: IQR outlier clipping on training data ──
+    # Clip outliers to Q1 − 1.5×IQR and Q3 + 1.5×IQR
+    # Bounds computed and applied on training fold only
+    train_df = clip_iqr(train_df, cont_cols)
+
+    # ── Step 2: Forward-fill residual NaNs ──
+    for split_df in [train_df, val_df, test_df]:
+        for col in cont_cols + [C.TARGET]:
+            if col in split_df.columns:
+                split_df[col] = split_df[col].ffill().bfill()
+
+    # ── Step 3: Min-Max normalization [0,1] — bounds from training only ──
+    train_cont_vals = train_df[cont_cols].values.astype(np.float32)
+    cont_min = np.nanmin(train_cont_vals, axis=0)
+    cont_max = np.nanmax(train_cont_vals, axis=0)
+    target_min = float(train_df[C.TARGET].min())
+    target_max = float(train_df[C.TARGET].max())
+
+    logger.info("Preprocessing: IQR clip → ffill → MinMax[0,1] (fit on train).")
 
     # NTL normalisation (from training dates)
     ntl_mean, ntl_std = 0.0, 1.0
@@ -398,8 +450,8 @@ def train_one_fold(
     dataset_kwargs = dict(
         cfg=cfg, cont_cols=cont_cols, cat_cols=cat_cols,
         ntl_store=ntl_store, ntl_mean=ntl_mean, ntl_std=ntl_std,
-        target_mean=target_mean, target_std=target_std,
-        cont_mean=cont_mean, cont_std=cont_std,
+        target_min=target_min, target_max=target_max,
+        cont_min=cont_min, cont_max=cont_max,
         horizon_hours=horizon_hours,
     )
     train_ds = CMATDataset(train_df, **dataset_kwargs)
@@ -497,9 +549,12 @@ def train_one_fold(
         model, test_loader, criterion, device
     )
 
-    # Inverse normalisation
-    preds_mw = preds_norm * target_std + target_mean
-    targets_mw = targets_norm * target_std + target_mean
+    # Inverse Min-Max normalisation: x_original = x_norm * (max - min) + min
+    target_range = target_max - target_min
+    if target_range < 1e-8:
+        target_range = 1.0
+    preds_mw = preds_norm * target_range + target_min
+    targets_mw = targets_norm * target_range + target_min
 
     # Compute metrics (same as baselines)
     metrics = BE.compute_metrics(targets_mw, preds_mw)
