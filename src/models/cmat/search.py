@@ -31,12 +31,14 @@ def _build_config_from_trial(
     trial: optuna.Trial,
     variant: CMATVariant,
     horizon_days: int,
+    min_context_window: int = 1,
 ) -> CMATConfig:
     """Sample hyperparameters from Optuna trial with constraint pruning."""
 
-    # Categorical parameters
-    W = trial.suggest_categorical("context_window_hours",
-                                  SEARCH_SPACE["context_window_hours"])
+    # Categorical parameters (optionally constrained)
+    w_choices = [w for w in SEARCH_SPACE["context_window_hours"]
+                 if w >= min_context_window]
+    W = trial.suggest_categorical("context_window_hours", w_choices)
     d = trial.suggest_categorical("embed_dim", SEARCH_SPACE["embed_dim"])
     h_s = trial.suggest_categorical("self_attn_heads",
                                     SEARCH_SPACE["self_attn_heads"])
@@ -91,6 +93,7 @@ def run_search(
     study_name: str = None,
     storage: str = None,
     output_dir: str = None,
+    min_context_window: int = 1,
 ) -> dict:
     """Run Optuna hyperparameter search for one horizon.
 
@@ -152,7 +155,8 @@ def run_search(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def objective(trial: optuna.Trial) -> float:
-        cfg = _build_config_from_trial(trial, variant_enum, horizon_days)
+        cfg = _build_config_from_trial(trial, variant_enum, horizon_days,
+                                       min_context_window=min_context_window)
 
         try:
             result = train_one_fold(
@@ -184,24 +188,64 @@ def run_search(
         load_if_exists=True,
     )
 
-    study.optimize(objective, n_trials=n_trials)
+    # ── Crash-safe persistence ──
+    # Save the best config after EVERY completed trial so that
+    # wall-time kills, OOM, or cancellations never lose data.
 
-    # Save best config
+    def _save_current_best(study: optuna.Study, label: str = "callback"):
+        """Write the current best trial to disk."""
+        try:
+            best_trial = study.best_trial
+        except ValueError:
+            return  # no completed trials yet
+
+        best_params = best_trial.params.copy()
+        best_params["variant"] = variant
+        best_params["horizon_days"] = horizon_days
+        best_params["best_val_loss"] = best_trial.value
+        best_params["best_trial_number"] = best_trial.number
+        for k, v in best_trial.user_attrs.items():
+            best_params[f"test_{k}"] = v
+
+        out_json = output_path / f"best_config_{variant}_h{horizon_days}d.json"
+        with open(out_json, "w") as f:
+            json.dump(best_params, f, indent=2)
+        logger.info("[%s] Best config saved → %s (trial %d, val=%.6f)",
+                    label, out_json, best_trial.number, best_trial.value)
+
+    def _after_trial_callback(study, trial):
+        """Optuna callback: persist best config after every finished trial."""
+        if trial.state == optuna.trial.TrialState.COMPLETE:
+            n_complete = len([t for t in study.trials
+                             if t.state == optuna.trial.TrialState.COMPLETE])
+            logger.info("Completed trials so far: %d/%d", n_complete, n_trials)
+            _save_current_best(study, label=f"after_trial_{n_complete}")
+
+    # Register SIGTERM handler (SLURM sends SIGTERM before wall-time kill)
+    import signal
+
+    def _sigterm_handler(signum, frame):
+        logger.warning("Received signal %d — saving best config before exit.", signum)
+        _save_current_best(study, label="SIGTERM")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGUSR1, _sigterm_handler)  # SLURM also uses USR1
+
+    study.optimize(objective, n_trials=n_trials, callbacks=[_after_trial_callback])
+
+    # Final save (redundant but explicit)
+    _save_current_best(study, label="final")
+
     best_trial = study.best_trial
     best_params = best_trial.params.copy()
     best_params["variant"] = variant
     best_params["horizon_days"] = horizon_days
     best_params["best_val_loss"] = best_trial.value
     best_params["best_trial_number"] = best_trial.number
-
-    # Add user attrs
     for k, v in best_trial.user_attrs.items():
         best_params[f"test_{k}"] = v
 
-    out_json = output_path / f"best_config_{variant}_h{horizon_days}d.json"
-    with open(out_json, "w") as f:
-        json.dump(best_params, f, indent=2)
-    logger.info("Best config saved → %s", out_json)
     logger.info("Best trial: %s", best_params)
 
     return best_params
@@ -279,6 +323,10 @@ def main():
         "--output-dir", type=str, default=None,
         help="Output directory for best config JSON."
     )
+    parser.add_argument(
+        "--min-context-window", type=int, default=1,
+        help="Minimum context window (hours). Prunes W values below this."
+    )
     args = parser.parse_args()
 
     run_search(
@@ -288,6 +336,7 @@ def main():
         search_fold=args.fold,
         storage=args.storage,
         output_dir=args.output_dir,
+        min_context_window=args.min_context_window,
     )
 
 
