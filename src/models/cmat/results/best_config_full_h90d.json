@@ -14,10 +14,10 @@
   "horizon_days": 90,
   "best_val_loss": 0.009794628803296271,
   "best_trial_number": 4,
+  "test_rmse": 543.887229879022,
+  "test_mae": 452.7884050851845,
+  "test_mape": 3.529147872062825,
+  "test_pcc": 0.9799643768189373,
   "test_n_params": 529960,
-  "test_n_epochs": 9,
-  "test_rmse": 543.89,
-  "test_mae": 452.79,
-  "test_mape": 3.53,
-  "test_pcc": 0.98
+  "test_n_epochs": 9
 }

@@ -38,8 +38,12 @@ if [[ "${1:-rocv}" == "search" ]]; then
     shift
     echo "Mode: Optuna hyperparameter search"
     python3 -u -m src.models.cmat.search "$@"
-else
+elif [[ "${1:-}" == "rocv" ]]; then
+    shift
     echo "Mode: ROCV evaluation"
+    python3 -u -m src.models.cmat.run_rocv "$@"
+else
+    echo "Mode: ROCV evaluation (default)"
     python3 -u -m src.models.cmat.run_rocv "$@"
 fi
 

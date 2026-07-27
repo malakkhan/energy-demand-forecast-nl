@@ -182,7 +182,10 @@ class CMATDataset(Dataset):
       2. Forward-fill for residual NaNs
       3. Min-Max normalization to [0, 1] — bounds from training fold only
 
-    Each sliding window of W hours predicts the target load H hours ahead.
+    Features are pre-shifted by H hours upstream (in train_one_fold) so that
+    at each row t the features correspond to time t−H while the target is
+    the load at time t.  Each sliding window of W hours therefore produces
+    a direct H-ahead forecast.
     """
 
     def __init__(
@@ -248,19 +251,18 @@ class CMATDataset(Dataset):
         self.target_denom = target_denom
         self.target_data = (target_vals - target_min) / target_denom
 
-        # Sliding window: each sample uses W context hours → predict H hours ahead
+        # Sliding window: features already shifted by H upstream, so target at i+W
+        # represents the load H hours ahead of the context features.
         self.W = W
-        self.H = max(1, horizon_hours)  # target offset in hours
         self.n_total = len(df)
 
-        # Valid indices: [i, i+W) context, target at i+W+H-1
-        # Need at least W + H data points from index i
-        max_start = self.n_total - W - self.H
+        # Valid indices: [i, i+W) context, target at i+W
+        max_start = self.n_total - W - 1
         self.valid_indices = list(range(max(0, 0), max(0, max_start + 1)))
 
         logger.info(
-            "CMATDataset: %d samples, W=%d, H=%d, cont=%d, cat=%d.",
-            len(self.valid_indices), W, self.H,
+            "CMATDataset: %d samples, W=%d, H_shift=%d, cont=%d, cat=%d.",
+            len(self.valid_indices), W, horizon_hours,
             self.cont_data.shape[1], self.cat_data.shape[1],
         )
 
@@ -274,8 +276,9 @@ class CMATDataset(Dataset):
         x_cont = torch.from_numpy(self.cont_data[i:i + self.W])  # (W, N_cont)
         x_cat = torch.from_numpy(self.cat_data[i:i + self.W])    # (W, N_cat)
 
-        # Target: single value H hours after end of context window
-        target = torch.tensor(self.target_data[i + self.W + self.H - 1], dtype=torch.float32)
+        # Target: load at i+W.  Because features were shifted by H hours
+        # upstream, this value is the load H hours ahead of the features.
+        target = torch.tensor(self.target_data[i + self.W], dtype=torch.float32)
 
         sample = {
             "x_cont": x_cont,
@@ -402,9 +405,13 @@ def train_one_fold(
     """Train CMAT on one ROCV fold and return metrics.
 
     Preprocessing (applied here, matching thesis spec):
-      1. IQR outlier clipping on training data (predictors only)
-      2. Forward-fill residual NaNs across all splits
-      3. Min-Max normalization to [0, 1] — bounds from training fold only
+      1. Feature shifting: shift continuous predictors by H hours so that
+         at row t the features correspond to time t−H while the target
+         remains the load at t.  This makes each sample a direct H-ahead
+         forecast, matching the baseline (Prophet-LSTM) protocol.
+      2. IQR outlier clipping on training data (predictors only)
+      3. Forward-fill residual NaNs across all splits
+      4. Min-Max normalization to [0, 1] — bounds from training fold only
 
     Returns a dict with keys matching the baselines evaluation format.
     """
@@ -416,6 +423,21 @@ def train_one_fold(
 
     # Feature columns
     cont_cols, cat_cols = get_feature_columns(train_df, cfg)
+
+    # ── Step 0: Feature shifting by horizon ──
+    # Shift continuous predictors by H hours so that at each row t the
+    # features correspond to time t−H while the target stays at t.
+    # This matches the baseline protocol (prepare_shifted_dataset).
+    H = horizon_hours
+    if H > 0:
+        for split_df in [train_df, val_df, test_df]:
+            for col in cont_cols:
+                split_df[col] = split_df[col].shift(H)
+        # Drop rows where shifted features are NaN (first H rows of train)
+        train_df = train_df.iloc[H:].copy()
+        # val/test should be fine since they start after train
+        logger.info("Feature shifting: shifted %d cols by %d hours (H=%dd).",
+                    len(cont_cols), H, H // 24)
 
     # ── Step 1: IQR outlier clipping on training data ──
     # Clip outliers to Q1 − 1.5×IQR and Q3 + 1.5×IQR
