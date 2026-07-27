@@ -91,6 +91,10 @@ def run_rocv(
     cfg.variant = variant_enum
     cfg.horizon_hours = horizon_days * 24
 
+    # Use search-level training budget to stay within SBU limits
+    cfg.max_epochs = 30
+    cfg.early_stop_patience = 5
+
     # Load data
     df = load_dataset()
 

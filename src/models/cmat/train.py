@@ -182,7 +182,7 @@ class CMATDataset(Dataset):
       2. Forward-fill for residual NaNs
       3. Min-Max normalization to [0, 1] — bounds from training fold only
 
-    Each sliding window of W hours predicts the target load one step ahead.
+    Each sliding window of W hours predicts the target load H hours ahead.
     """
 
     def __init__(
@@ -248,17 +248,19 @@ class CMATDataset(Dataset):
         self.target_denom = target_denom
         self.target_data = (target_vals - target_min) / target_denom
 
-        # Sliding window: each sample uses W context hours → predict 1 step
+        # Sliding window: each sample uses W context hours → predict H hours ahead
         self.W = W
+        self.H = max(1, horizon_hours)  # target offset in hours
         self.n_total = len(df)
 
-        # Valid indices: [i, i+W) context, target at i+W
-        max_start = self.n_total - W - 1
+        # Valid indices: [i, i+W) context, target at i+W+H-1
+        # Need at least W + H data points from index i
+        max_start = self.n_total - W - self.H
         self.valid_indices = list(range(max(0, 0), max(0, max_start + 1)))
 
         logger.info(
-            "CMATDataset: %d samples, W=%d, cont=%d, cat=%d.",
-            len(self.valid_indices), W,
+            "CMATDataset: %d samples, W=%d, H=%d, cont=%d, cat=%d.",
+            len(self.valid_indices), W, self.H,
             self.cont_data.shape[1], self.cat_data.shape[1],
         )
 
@@ -272,8 +274,8 @@ class CMATDataset(Dataset):
         x_cont = torch.from_numpy(self.cont_data[i:i + self.W])  # (W, N_cont)
         x_cat = torch.from_numpy(self.cat_data[i:i + self.W])    # (W, N_cat)
 
-        # Target: single value at i+W (one-step-ahead in shifted frame)
-        target = torch.tensor(self.target_data[i + self.W], dtype=torch.float32)
+        # Target: single value H hours after end of context window
+        target = torch.tensor(self.target_data[i + self.W + self.H - 1], dtype=torch.float32)
 
         sample = {
             "x_cont": x_cont,
