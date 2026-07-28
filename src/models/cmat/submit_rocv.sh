@@ -1,6 +1,6 @@
 #!/bin/bash
-# Sequential ROCV submission: submit ONE job at a time, wait for completion.
-# This avoids the SLURM cancellation issue.
+# Sequential Full ROCV: 3 horizons (60, 120, 180) × 5 folds (6-10)
+# Budget: ~10K SBU of 31K remaining
 #
 # Usage: nohup bash submit_rocv.sh &> logs/sequential_rocv.log &
 set -euo pipefail
@@ -12,51 +12,40 @@ LOG="${REPO_ROOT}/logs/sequential_rocv.log"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" | tee -a "$LOG"; }
 
-# All jobs: variant:horizon:walltime
+# Jobs: variant:horizon:walltime
+# Only Full variant, 3 key horizons, latter 5 folds (6-10)
 declare -a JOBS=(
-    # Full — all 9 horizons, 24h wall time
     "full:60:24:00:00"
-    "full:75:24:00:00"
-    "full:90:24:00:00"
-    "full:105:24:00:00"
     "full:120:24:00:00"
-    "full:135:24:00:00"
-    "full:150:24:00:00"
-    "full:165:24:00:00"
     "full:180:24:00:00"
-    # Early — all 9 horizons, 24h wall time
-    "early:60:24:00:00"
-    "early:75:24:00:00"
-    "early:90:24:00:00"
-    "early:105:24:00:00"
-    "early:120:24:00:00"
-    "early:135:24:00:00"
-    "early:150:24:00:00"
-    "early:165:24:00:00"
-    "early:180:24:00:00"
 )
 
+START_FOLD=6
+MAX_FOLDS=5
 TOTAL=${#JOBS[@]}
-log "Starting sequential ROCV: $TOTAL jobs"
+
+log "Starting sequential ROCV: $TOTAL jobs (folds $START_FOLD to $((START_FOLD + MAX_FOLDS - 1)))"
 
 for IDX in "${!JOBS[@]}"; do
     IFS=':' read -r VARIANT HORIZON WALLTIME <<< "${JOBS[$IDX]}"
     JOB_NAME="cmat-rocv-${VARIANT}-h${HORIZON}"
     JOB_NUM=$((IDX + 1))
 
-    # ── Skip if all 11 folds already complete ──
+    # ── Skip if target folds already complete ──
     CSV="${RESULTS_DIR}/rocv_results_cmat_${VARIANT}.csv"
     if [ -f "$CSV" ]; then
         DONE=$(python3 -c "
 import pandas as pd
 df=pd.read_csv('$CSV')
-print(len(df[df['horizon_days']==${HORIZON}]))
+target_folds = list(range($START_FOLD, $START_FOLD + $MAX_FOLDS))
+done = len(df[(df['horizon_days']==$HORIZON) & (df['fold_idx'].isin(target_folds))])
+print(done)
 " 2>/dev/null || echo 0)
-        if [ "$DONE" -ge 11 ]; then
-            log "[$JOB_NUM/$TOTAL] SKIP $JOB_NAME (all 11 folds done)"
+        if [ "$DONE" -ge "$MAX_FOLDS" ]; then
+            log "[$JOB_NUM/$TOTAL] SKIP $JOB_NAME (all $MAX_FOLDS target folds done)"
             continue
         fi
-        log "[$JOB_NUM/$TOTAL] $JOB_NAME: $DONE/11 folds done, resuming..."
+        log "[$JOB_NUM/$TOTAL] $JOB_NAME: $DONE/$MAX_FOLDS target folds done"
     fi
 
     # ── Wait for queue to be empty ──
@@ -65,13 +54,15 @@ print(len(df[df['horizon_days']==${HORIZON}]))
         if [ "$RUNNING" -eq 0 ]; then
             break
         fi
-        sleep 60
+        log "[$JOB_NUM/$TOTAL] Waiting for queue to clear ($RUNNING jobs running)..."
+        sleep 120
     done
 
     # ── Submit ──
     OUTPUT=$(sbatch --job-name="$JOB_NAME" --time="$WALLTIME" \
         --output="${REPO_ROOT}/logs/${JOB_NAME}_%j.log" \
-        "$SLURM_SCRIPT" rocv --variant "$VARIANT" --horizon "$HORIZON" --resume 2>&1)
+        "$SLURM_SCRIPT" rocv --variant "$VARIANT" --horizon "$HORIZON" \
+        --resume --start-fold "$START_FOLD" --max-folds "$MAX_FOLDS" 2>&1)
     
     JOB_ID=$(echo "$OUTPUT" | grep -o '[0-9]*$' || echo "FAILED")
     if [ "$JOB_ID" = "FAILED" ]; then
@@ -79,7 +70,7 @@ print(len(df[df['horizon_days']==${HORIZON}]))
         sleep 30
         continue
     fi
-    log "[$JOB_NUM/$TOTAL] SUBMITTED $JOB_NAME → job $JOB_ID"
+    log "[$JOB_NUM/$TOTAL] SUBMITTED $JOB_NAME → job $JOB_ID (folds $START_FOLD-$((START_FOLD+MAX_FOLDS-1)))"
 
     # ── Wait for job to finish ──
     sleep 30  # give SLURM time to schedule
@@ -111,12 +102,14 @@ log "Sequential ROCV complete! All $TOTAL jobs processed."
 
 # Final summary
 log "=== Results ==="
-for V in full early; do
-    CSV="${RESULTS_DIR}/rocv_results_cmat_${V}.csv"
-    if [ -f "$CSV" ]; then
-        COUNT=$(wc -l < "$CSV")
-        log "  $V: $((COUNT - 1)) fold-horizon rows"
-    else
-        log "  $V: NO RESULTS FILE"
-    fi
-done
+CSV="${RESULTS_DIR}/rocv_results_cmat_full.csv"
+if [ -f "$CSV" ]; then
+    python3 -c "
+import pandas as pd
+df = pd.read_csv('$CSV')
+for h in [60, 120, 180]:
+    subset = df[df['horizon_days'] == h]
+    if len(subset) > 0:
+        print(f'  H={h:>3d}d: {len(subset)} folds, MAPE={subset[\"mape_pct\"].mean():.2f}% ± {subset[\"mape_pct\"].std():.2f}%')
+" 2>/dev/null || true
+fi

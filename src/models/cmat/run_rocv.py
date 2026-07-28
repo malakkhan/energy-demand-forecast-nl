@@ -38,6 +38,8 @@ def run_rocv(
     resume: bool = False,
     quick: bool = False,
     config_path: str = None,
+    start_fold: int = 0,
+    max_folds: int = 0,
 ) -> None:
     """Run ROCV evaluation for one CMAT variant at one horizon.
 
@@ -51,6 +53,10 @@ def run_rocv(
         Skip already-completed folds.
     quick : bool
         Run only the first fold (for smoke testing).
+    start_fold : int
+        Index of the first fold to run (0-based). Default 0.
+    max_folds : int
+        Maximum number of folds to run. 0 = all folds.
     config_path : str
         Path to a best_config JSON from the Optuna search.
         If None, uses default config.
@@ -117,6 +123,14 @@ def run_rocv(
 
     if quick:
         folds = folds[:1]
+    else:
+        # Apply fold range limits
+        if start_fold > 0:
+            folds = [f for f in folds if f[0] >= start_fold]
+            logger.info("Starting from fold %d (%d folds remaining).", start_fold, len(folds))
+        if max_folds > 0:
+            folds = folds[:max_folds]
+            logger.info("Limiting to %d folds.", max_folds)
 
     results = []
     t0_total = time.time()
@@ -234,6 +248,14 @@ def main():
         "--config", type=str, default=None,
         help="Path to best_config JSON from Optuna search."
     )
+    parser.add_argument(
+        "--start-fold", type=int, default=0,
+        help="Index of the first fold to run (0-based). Default: 0."
+    )
+    parser.add_argument(
+        "--max-folds", type=int, default=0,
+        help="Maximum number of folds to run. 0 = all. Default: 0."
+    )
     args = parser.parse_args()
 
     run_rocv(
@@ -242,6 +264,8 @@ def main():
         resume=args.resume,
         quick=args.quick,
         config_path=args.config,
+        start_fold=args.start_fold,
+        max_folds=args.max_folds,
     )
 
 
