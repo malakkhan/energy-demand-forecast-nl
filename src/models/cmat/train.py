@@ -498,12 +498,12 @@ def train_one_fold(
 
     # Data loaders — use more workers and prefetching for GPU throughput
     is_cuda = device.type == "cuda"
-    num_workers = min(8, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
+    num_workers = min(16, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
     # If NTL images are preloaded into RAM, workers just do numpy slicing (fast)
     loader_kwargs = dict(
         pin_memory=is_cuda,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -531,6 +531,15 @@ def train_one_fold(
 
     n_params = model.count_parameters()
     logger.info("Model parameters: %s", f"{n_params:,}")
+
+    # Compile model for GPU kernel fusion (~15-30% speedup)
+    # Disabled due to missing 'nvcc' in SLURM environment (InductorError).
+    # if is_cuda and hasattr(torch, 'compile'):
+    #     try:
+    #         model = torch.compile(model)
+    #         logger.info("torch.compile() enabled.")
+    #     except Exception as exc:
+    #         logger.warning("torch.compile() failed, continuing without: %s", exc)
 
     # Optimiser
     optimizer = torch.optim.AdamW(

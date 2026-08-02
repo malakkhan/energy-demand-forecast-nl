@@ -208,6 +208,16 @@ def run_rocv(
                 metrics.mape_pct, metrics.pcc,
             )
 
+            # ── Budget protection: abort if fold took too long ──
+            MAX_FOLD_SECONDS = 2.5 * 3600  # 2.5 hours
+            if fold_time > MAX_FOLD_SECONDS:
+                logger.warning(
+                    "⚠️  BUDGET GUARD: Fold %d took %.1fh (limit=2.5h). "
+                    "Stopping to protect SBU budget. %d folds saved so far.",
+                    fold_idx, fold_time / 3600, len(results),
+                )
+                break
+
         except Exception as exc:
             logger.error("Fold %d failed: %s", fold_idx, exc, exc_info=True)
             continue

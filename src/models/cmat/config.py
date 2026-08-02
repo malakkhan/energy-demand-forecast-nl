@@ -4,6 +4,7 @@ Defines the four ablation variants and all hyperparameters from
 Table 4 (thesis), plus the Optuna search space specification.
 """
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -14,7 +15,11 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DATA_ROOT = REPO_ROOT / "data" / "processed" / "nl_hourly_dataset.parquet"
-VIIRS_DIR = REPO_ROOT.parent / "data" / "viirs" / "A2"
+# Allow runtime override via CMAT_VIIRS_DIR env var (for NVMe staging)
+VIIRS_DIR = Path(os.environ.get(
+    "CMAT_VIIRS_DIR",
+    str(REPO_ROOT.parent / "data" / "viirs" / "A2"),
+))
 GEOJSON_PATH = REPO_ROOT / "data" / "geo" / "gadm41_NLD_0.json"
 OUTPUT_DIR = REPO_ROOT / "src" / "models" / "cmat" / "results"
 
