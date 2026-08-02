@@ -204,49 +204,43 @@ class SpatialPatchEncoder(nn.Module):
         d = self.patch_embed.out_channels
         device = images.device
 
-        all_tokens = []
-
         spe = self.spe()  # (N_p, d)
 
-        for k in range(D_W):
-            # Patch embed: (B, 1, H, W) → (B, d, n_h, n_w) → (B, N_p, d)
-            img_k = images[:, k]  # (B, 1, H, W)
-            patches = self.patch_embed(img_k)  # (B, d, n_h, n_w)
-            patches = patches.flatten(2).transpose(1, 2)  # (B, N_p, d)
+        # Batch all D_W images through conv2d in one call
+        # (B, D_W, 1, H, W) → (B*D_W, 1, H, W)
+        imgs_flat = images.reshape(B * D_W, 1, images.shape[3], images.shape[4])
+        patches_flat = self.patch_embed(imgs_flat)          # (B*D_W, d, n_h, n_w)
+        patches_flat = patches_flat.flatten(2).transpose(1, 2)  # (B*D_W, N_p, d)
+        # Reshape back: (B, D_W, N_p, d)
+        all_patches = patches_flat.reshape(B, D_W, self.n_patches, d)
 
-            # Add SPE and DPE
-            dpe_k = self.dpe(k)  # (d,)
-            tokens = patches + spe.unsqueeze(0) + dpe_k  # (B, N_p, d)
+        # Add SPE (same for all days) and DPE (per-day)
+        # SPE: (1, 1, N_p, d) broadcast over B and D_W
+        all_patches = all_patches + spe.unsqueeze(0).unsqueeze(0)
+        # DPE: (D_W, d) → (1, D_W, 1, d) broadcast over B and N_p
+        dpe_indices = torch.arange(D_W, device=device)
+        dpe_all = self.dpe.day_embed(dpe_indices)  # (D_W, d)
+        all_patches = all_patches + dpe_all.unsqueeze(0).unsqueeze(2)
 
-            # Dynamic image masking during training
-            if mask_ratio > 0 and self.training:
-                n_mask = int(self.n_patches * mask_ratio)
-                n_keep = self.n_patches - n_mask
-                # Per-batch random mask
-                noise = torch.rand(B, self.n_patches, device=device)
-                ids_sorted = noise.argsort(dim=1)
-                ids_keep = ids_sorted[:, :n_keep]  # (B, n_keep)
-                ids_mask = ids_sorted[:, n_keep:]  # (B, n_mask)
+        # Dynamic image masking during training
+        if mask_ratio > 0 and self.training:
+            n_mask = int(self.n_patches * mask_ratio)
+            # Apply masking per (batch, day) pair
+            # (B, D_W, N_p) noise → sort → replace masked with [MASK] token
+            noise = torch.rand(B, D_W, self.n_patches, device=device)
+            ids_sorted = noise.argsort(dim=2)
+            ids_mask = ids_sorted[:, :, n_mask:]  # (B, D_W, n_mask)
+            # Build mask token replacements
+            mask_tokens = self.mask_token.reshape(1, 1, 1, d).expand(
+                B, D_W, self.n_patches - n_mask + n_mask, -1  # placeholder shape
+            )
+            # Scatter mask tokens
+            ids_mask_exp = ids_sorted[:, :, n_mask:].unsqueeze(-1).expand(-1, -1, -1, d)
+            mask_fill = self.mask_token.reshape(1, 1, 1, d).expand_as(ids_mask_exp)
+            all_patches.scatter_(2, ids_mask_exp, mask_fill)
 
-                # Gather kept tokens
-                ids_keep_exp = ids_keep.unsqueeze(-1).expand(-1, -1, d)
-                kept = torch.gather(tokens, 1, ids_keep_exp)
-
-                # Replace masked tokens with [MASK]
-                mask_tokens = self.mask_token.unsqueeze(0).unsqueeze(0).expand(
-                    B, n_mask, -1
-                )
-
-                # Reconstruct full sequence with mask tokens in-place
-                full = tokens.clone()
-                ids_mask_exp = ids_mask.unsqueeze(-1).expand(-1, -1, d)
-                full.scatter_(1, ids_mask_exp, mask_tokens)
-                tokens = full
-
-            all_tokens.append(tokens)
-
-        # Concatenate across days: (B, D_W * N_p, d)
-        Z_img = torch.cat(all_tokens, dim=1)
+        # Reshape to (B, D_W * N_p, d)
+        Z_img = all_patches.reshape(B, D_W * self.n_patches, d)
         return Z_img
 
 

@@ -33,7 +33,11 @@ def _build_config_from_trial(
     horizon_days: int,
     min_context_window: int = 1,
 ) -> CMATConfig:
-    """Sample hyperparameters from Optuna trial with constraint pruning."""
+    """Sample hyperparameters from Optuna trial with constraint pruning.
+
+    For Tab/NTL variants, spatial params (P, ρ_img, h_c) are NOT searched
+    since those modules are inactive — saves search budget.
+    """
 
     # Categorical parameters (optionally constrained)
     w_choices = [w for w in SEARCH_SPACE["context_window_hours"]
@@ -42,16 +46,25 @@ def _build_config_from_trial(
     d = trial.suggest_categorical("embed_dim", SEARCH_SPACE["embed_dim"])
     h_s = trial.suggest_categorical("self_attn_heads",
                                     SEARCH_SPACE["self_attn_heads"])
-    h_c = trial.suggest_categorical("cross_attn_heads",
-                                    SEARCH_SPACE["cross_attn_heads"])
     L = trial.suggest_categorical("transformer_depth",
                                   SEARCH_SPACE["transformer_depth"])
-    P = trial.suggest_categorical("ntl_patch_size",
-                                  SEARCH_SPACE["ntl_patch_size"])
-    rho = trial.suggest_categorical("image_mask_ratio",
-                                    SEARCH_SPACE["image_mask_ratio"])
     p_drop = trial.suggest_categorical("dropout", SEARCH_SPACE["dropout"])
     B = trial.suggest_categorical("batch_size", SEARCH_SPACE["batch_size"])
+
+    # Spatial parameters: only search for variants that use them
+    uses_spatial = variant in (CMATVariant.EARLY_FUSION, CMATVariant.FULL)
+    if uses_spatial:
+        h_c = trial.suggest_categorical("cross_attn_heads",
+                                        SEARCH_SPACE["cross_attn_heads"])
+        P = trial.suggest_categorical("ntl_patch_size",
+                                      SEARCH_SPACE["ntl_patch_size"])
+        rho = trial.suggest_categorical("image_mask_ratio",
+                                        SEARCH_SPACE["image_mask_ratio"])
+    else:
+        # Fixed defaults — these have no effect on Tab/NTL
+        h_c = 4
+        P = 16
+        rho = 0.75
 
     # Log-uniform continuous parameters
     lr_lo, lr_hi = SEARCH_SPACE["learning_rate"]
@@ -59,10 +72,14 @@ def _build_config_from_trial(
     wd_lo, wd_hi = SEARCH_SPACE["weight_decay"]
     wd = trial.suggest_float("weight_decay", wd_lo, wd_hi, log=True)
 
-    # Constraint pruning: h_s and h_c must divide d
-    if d % h_s != 0 or d % h_c != 0:
+    # Constraint pruning: h_s must divide d (h_c checked only if spatial)
+    if d % h_s != 0:
         raise optuna.TrialPruned(
-            f"Head divisibility violated: d={d}, h_s={h_s}, h_c={h_c}"
+            f"Head divisibility violated: d={d}, h_s={h_s}"
+        )
+    if uses_spatial and d % h_c != 0:
+        raise optuna.TrialPruned(
+            f"Head divisibility violated: d={d}, h_c={h_c}"
         )
 
     return CMATConfig(

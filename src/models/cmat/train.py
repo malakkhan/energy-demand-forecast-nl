@@ -320,31 +320,39 @@ def train_epoch(
     criterion: PinballLoss,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scaler: torch.amp.GradScaler = None,
 ) -> float:
-    """Train for one epoch. Returns average loss."""
+    """Train for one epoch with optional AMP. Returns average loss."""
     model.train()
     total_loss = 0.0
     n_batches = 0
+    use_amp = scaler is not None
 
     for batch in loader:
-        x_cont = batch["x_cont"].to(device)
-        x_cat = batch["x_cat"].to(device)
-        target = batch["target"].to(device)  # (B,)
+        x_cont = batch["x_cont"].to(device, non_blocking=True)
+        x_cat = batch["x_cat"].to(device, non_blocking=True)
+        target = batch["target"].to(device, non_blocking=True)
 
         images = None
         if "images" in batch:
-            images = batch["images"].to(device)
+            images = batch["images"].to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        y_pred = model(x_cont, x_cat, images=images, H_pred=1)  # (B, 1, 3)
-        # Reshape for loss: target (B,) → (B, 1)
-        loss = criterion(y_pred, target.unsqueeze(-1))
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
 
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            y_pred = model(x_cont, x_cat, images=images, H_pred=1)
+            loss = criterion(y_pred, target.unsqueeze(-1))
 
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
@@ -358,8 +366,9 @@ def evaluate(
     loader: DataLoader,
     criterion: PinballLoss,
     device: torch.device,
+    use_amp: bool = False,
 ) -> Tuple[float, np.ndarray, np.ndarray]:
-    """Evaluate on a dataset. Returns (loss, predictions_q50, targets)."""
+    """Evaluate on a dataset with optional AMP. Returns (loss, predictions_q50, targets)."""
     model.eval()
     total_loss = 0.0
     n_batches = 0
@@ -367,22 +376,23 @@ def evaluate(
     all_targets = []
 
     for batch in loader:
-        x_cont = batch["x_cont"].to(device)
-        x_cat = batch["x_cat"].to(device)
-        target = batch["target"].to(device)  # (B,)
+        x_cont = batch["x_cont"].to(device, non_blocking=True)
+        x_cat = batch["x_cat"].to(device, non_blocking=True)
+        target = batch["target"].to(device, non_blocking=True)
 
         images = None
         if "images" in batch:
-            images = batch["images"].to(device)
+            images = batch["images"].to(device, non_blocking=True)
 
-        y_pred = model(x_cont, x_cat, images=images, H_pred=1)  # (B, 1, 3)
-        loss = criterion(y_pred, target.unsqueeze(-1))
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            y_pred = model(x_cont, x_cat, images=images, H_pred=1)
+            loss = criterion(y_pred, target.unsqueeze(-1))
+
         total_loss += loss.item()
         n_batches += 1
 
-        # Extract median quantile (index 1 = τ=0.50)
-        preds_q50 = y_pred[:, 0, 1].cpu().numpy()  # (B,)
-        targets_np = target.cpu().numpy()             # (B,)
+        preds_q50 = y_pred[:, 0, 1].float().cpu().numpy()
+        targets_np = target.float().cpu().numpy()
         all_preds.append(preds_q50)
         all_targets.append(targets_np)
 
@@ -486,20 +496,31 @@ def train_one_fold(
         logger.warning("Test dataset has 0 samples — skipping fold.")
         return None
 
-    # Data loaders
-    num_workers = min(4, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
+    # Data loaders — use more workers and prefetching for GPU throughput
+    is_cuda = device.type == "cuda"
+    num_workers = min(8, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
+    # If NTL images are preloaded into RAM, workers just do numpy slicing (fast)
+    loader_kwargs = dict(
+        pin_memory=is_cuda,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=(device.type == "cuda"),
-        drop_last=True,
+        num_workers=num_workers, drop_last=True, **loader_kwargs,
     )
+    val_workers = min(4, num_workers)
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=0, pin_memory=(device.type == "cuda"),
+        num_workers=val_workers,
+        pin_memory=is_cuda,
+        persistent_workers=(val_workers > 0),
     )
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=0, pin_memory=(device.type == "cuda"),
+        num_workers=val_workers,
+        pin_memory=is_cuda,
+        persistent_workers=(val_workers > 0),
     )
 
     # Build model (H_pred=1: single-step prediction)
@@ -525,6 +546,12 @@ def train_one_fold(
 
     criterion = PinballLoss(C.QUANTILES).to(device)
 
+    # AMP (mixed precision) — bf16 on A100 for ~2x speedup
+    use_amp = is_cuda and torch.cuda.is_bf16_supported()
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+    if use_amp:
+        logger.info("AMP enabled (bfloat16).")
+
     # Training loop with early stopping
     best_val_loss = float("inf")
     patience_counter = 0
@@ -533,10 +560,10 @@ def train_one_fold(
     t0 = time.time()
     for epoch in range(1, cfg.max_epochs + 1):
         train_loss = train_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, scaler=scaler
         )
         val_loss, _, _ = evaluate(
-            model, val_loader, criterion, device
+            model, val_loader, criterion, device, use_amp=use_amp
         )
         scheduler.step()
 

@@ -109,6 +109,9 @@ def run_rocv(
     if cfg.uses_spatial:
         from .ntl_images import NTLImageStore
         ntl_store = NTLImageStore()
+        # Preload all images into RAM — eliminates GPFS I/O during training
+        logger.info("Preloading NTL images into RAM...")
+        ntl_store.preload_all()
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

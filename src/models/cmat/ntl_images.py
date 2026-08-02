@@ -98,12 +98,36 @@ class NTLImageStore:
             self._read_image_uncached
         )
 
+        # Optional: preloaded image array (set via preload_all())
+        self._preloaded: Optional[Dict[date, np.ndarray]] = None
+
         logger.info(
             "NTLImageStore: %d images indexed, mask shape %s, "
             "cache_size=%d.",
             len(self._date_index),
             self._nl_mask.shape if self._nl_mask is not None else "N/A",
             cache_size,
+        )
+
+    def preload_all(self) -> None:
+        """Load ALL NTL images into RAM for fast access during training.
+
+        Memory: ~5080 images × 768 × 992 × 4B ≈ 14.7 GB.
+        This eliminates per-sample HDF5 I/O from GPFS.
+        """
+        import time as _time
+        t0 = _time.time()
+        dates = sorted(self._date_index.keys())
+        self._preloaded = {}
+        for i, d in enumerate(dates):
+            self._preloaded[d] = self._read_image_uncached(d)
+            if (i + 1) % 500 == 0:
+                logger.info("  Preloaded %d / %d images...", i + 1, len(dates))
+        elapsed = _time.time() - t0
+        mem_gb = len(self._preloaded) * C.NTL_IMG_H * C.NTL_IMG_W * 4 / 1e9
+        logger.info(
+            "NTL preload complete: %d images in %.1fs (%.1f GB RAM).",
+            len(self._preloaded), elapsed, mem_gb,
         )
 
     # ------------------------------------------------------------------
@@ -213,10 +237,16 @@ class NTLImageStore:
         return img
 
     def get_image(self, d: date) -> np.ndarray:
-        """Get a single NTL image with caching.
+        """Get a single NTL image (preloaded > LRU cache > disk).
 
         Returns shape (NTL_IMG_H, NTL_IMG_W), dtype float32.
         """
+        if self._preloaded is not None:
+            img = self._preloaded.get(d)
+            if img is not None:
+                return img
+            # Date not in preloaded set → return zero image
+            return np.zeros((C.NTL_IMG_H, C.NTL_IMG_W), dtype=np.float32)
         return self._get_image_cached(d)
 
     def get_images_for_window(
