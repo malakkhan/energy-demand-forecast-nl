@@ -97,6 +97,10 @@ def run_rocv(
     cfg.variant = variant_enum
     cfg.horizon_hours = horizon_days * 24
 
+    # Force the winning context window value (168h / 7 days) instead of the optuna result
+    logger.info("Overriding context_window_hours from %d to 168 (optimal based on analysis).", cfg.context_window_hours)
+    cfg.context_window_hours = 168
+
     # Use search-level training budget to stay within SBU limits
     cfg.max_epochs = 30
     cfg.early_stop_patience = 5
