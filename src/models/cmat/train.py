@@ -498,7 +498,7 @@ def train_one_fold(
 
     # Data loaders — use more workers and prefetching for GPU throughput
     is_cuda = device.type == "cuda"
-    num_workers = min(16, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
+    num_workers = min(8, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
     # If NTL images are preloaded into RAM, workers just do numpy slicing (fast)
     loader_kwargs = dict(
         pin_memory=is_cuda,
@@ -518,9 +518,9 @@ def train_one_fold(
     )
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=val_workers,
+        num_workers=8,
         pin_memory=is_cuda,
-        persistent_workers=(val_workers > 0),
+        persistent_workers=(8 > 0),
     )
 
     # Build model (H_pred=1: single-step prediction)

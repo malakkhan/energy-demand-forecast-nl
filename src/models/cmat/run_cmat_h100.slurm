@@ -2,7 +2,7 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=120G
+#SBATCH --mem=160G
 #SBATCH --time=08:00:00
 #SBATCH --constraint=scratch-node
 #SBATCH --output=logs/cmat_%j.log
