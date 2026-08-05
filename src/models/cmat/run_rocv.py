@@ -40,6 +40,7 @@ def run_rocv(
     config_path: str = None,
     start_fold: int = 0,
     max_folds: int = 0,
+    seed: int = 42,
 ) -> None:
     """Run ROCV evaluation for one CMAT variant at one horizon.
 
@@ -97,13 +98,12 @@ def run_rocv(
     cfg.variant = variant_enum
     cfg.horizon_hours = horizon_days * 24
 
-    # Force the winning context window value (168h / 7 days) instead of the optuna result
-    logger.info("Overriding context_window_hours from %d to 168 (optimal based on analysis).", cfg.context_window_hours)
-    cfg.context_window_hours = 168
-
-    # Use search-level training budget to stay within SBU limits
-    cfg.max_epochs = 30
-    cfg.early_stop_patience = 5
+    # Use generous training budget to let the model escape flat-mean minima
+    cfg.max_epochs = 50
+    cfg.early_stop_patience = 15
+    cfg.min_epochs_before_es = 10
+    cfg.seed = seed
+    logger.info("  Seed:     %d", seed)
 
     # Load data
     df = load_dataset()
@@ -203,6 +203,7 @@ def run_rocv(
                 "n_params": result["n_params"],
                 "n_epochs": result["n_epochs"],
                 "train_time_s": fold_time,
+                "seed": cfg.seed,
             }
 
             save_fold_result_locked(result_row, results, output_dir, model_name)
@@ -273,6 +274,10 @@ def main():
         "--max-folds", type=int, default=0,
         help="Maximum number of folds to run. 0 = all. Default: 0."
     )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility. Default: 42."
+    )
     args = parser.parse_args()
 
     run_rocv(
@@ -283,6 +288,7 @@ def main():
         config_path=args.config,
         start_fold=args.start_fold,
         max_folds=args.max_folds,
+        seed=args.seed,
     )
 
 

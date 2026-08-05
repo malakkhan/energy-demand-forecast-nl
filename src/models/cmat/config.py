@@ -152,8 +152,9 @@ class CMATConfig:
     learning_rate: float = 3e-4          # η
     weight_decay: float = 3e-5           # λ
     batch_size: int = 64                 # B
-    max_epochs: int = 100
-    early_stop_patience: int = 10
+    max_epochs: int = 50
+    early_stop_patience: int = 15
+    min_epochs_before_es: int = 10       # Don't allow early stopping before this
 
     # Cosine annealing
     cosine_T_0: int = 10                 # warm restart period
@@ -164,6 +165,9 @@ class CMATConfig:
 
     # Forecast horizon (set per-experiment)
     horizon_hours: int = 60 * 24         # H_pred
+
+    # Reproducibility
+    seed: int = 42                       # random seed for torch/numpy/cuda
 
     def __post_init__(self):
         """Validate head divisibility constraints."""
@@ -196,19 +200,40 @@ class CMATConfig:
 
 
 # ---------------------------------------------------------------------------
-# Optuna search space
+# Optuna search space  (v2 — constrained based on ROCV analysis)
+#
+# Findings from v1 search across all 9 horizons:
+#   - W >= 96h is required for weekly seasonality capture (PCC > 0.96)
+#   - embed_dim=128 (500-700K params) >> embed_dim=256 (2.7M+ params)
+#   - image_mask_ratio <= 0.75 lets the model actually see satellite data
+#   - depth >= 2 avoids shallow underfitting
 # ---------------------------------------------------------------------------
 
+# Original broad space (kept for reference):
+# SEARCH_SPACE_V1 = {
+#     "context_window_hours": [1, 6, 12, 24, 48, 96, 168],
+#     "embed_dim": [64, 128, 256],
+#     "self_attn_heads": [2, 4, 8],
+#     "cross_attn_heads": [2, 4, 8],
+#     "transformer_depth": [1, 2, 3],
+#     "ntl_patch_size": [8, 16, 32],
+#     "image_mask_ratio": [0.50, 0.75, 0.90],
+#     "dropout": [0.1, 0.2, 0.3],
+#     "learning_rate": (1e-4, 1e-3),
+#     "weight_decay": (1e-5, 1e-4),
+#     "batch_size": [32, 64, 128],
+# }
+
 SEARCH_SPACE = {
-    "context_window_hours": [1, 6, 12, 24, 48, 96, 168],
-    "embed_dim": [64, 128, 256],
+    "context_window_hours": [96, 168],
+    "embed_dim": [64, 128],
     "self_attn_heads": [2, 4, 8],
     "cross_attn_heads": [2, 4, 8],
-    "transformer_depth": [1, 2, 3],
+    "transformer_depth": [2, 3],
     "ntl_patch_size": [8, 16, 32],
-    "image_mask_ratio": [0.50, 0.75, 0.90],
+    "image_mask_ratio": [0.25, 0.50, 0.75],
     "dropout": [0.1, 0.2, 0.3],
     "learning_rate": (1e-4, 1e-3),       # log-uniform
     "weight_decay": (1e-5, 1e-4),        # log-uniform
-    "batch_size": [32, 64, 128],
+    "batch_size": [32, 64],
 }

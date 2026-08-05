@@ -12,6 +12,7 @@ Handles:
 
 import fcntl
 import logging
+import random
 import math
 import sys
 import time
@@ -403,6 +404,15 @@ def evaluate(
     return avg_loss, preds, targets
 
 
+def _set_seed(seed: int) -> None:
+    """Seed all RNGs for reproducible training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def train_one_fold(
     cfg: CMATConfig,
     train_df: pd.DataFrame,
@@ -428,8 +438,11 @@ def train_one_fold(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    logger.info("Training CMAT (variant=%s) on fold: train=%d, val=%d, test=%d.",
-                cfg.variant.value, len(train_df), len(val_df), len(test_df))
+    # ── Reproducibility: seed all RNGs ──
+    _set_seed(cfg.seed)
+
+    logger.info("Training CMAT (variant=%s, seed=%d) on fold: train=%d, val=%d, test=%d.",
+                cfg.variant.value, cfg.seed, len(train_df), len(val_df), len(test_df))
 
     # Feature columns
     cont_cols, cat_cols = get_feature_columns(train_df, cfg)
@@ -438,14 +451,23 @@ def train_one_fold(
     # Shift continuous predictors by H hours so that at each row t the
     # features correspond to time t−H while the target stays at t.
     # This matches the baseline protocol (prepare_shifted_dataset).
+    #
+    # IMPORTANT: We must shift on the CONCATENATED timeline, not on each
+    # split independently.  split_fold() returns .copy(), so shift(H) on
+    # an isolated test_df (which has exactly H rows) would produce 100%
+    # NaN.  By concatenating first, the shift can pull valid data from
+    # the preceding split.
     H = horizon_hours
     if H > 0:
-        for split_df in [train_df, val_df, test_df]:
-            for col in cont_cols:
-                split_df[col] = split_df[col].shift(H)
-        # Drop rows where shifted features are NaN (first H rows of train)
-        train_df = train_df.iloc[H:].copy()
-        # val/test should be fine since they start after train
+        full_df = pd.concat([train_df, val_df, test_df])
+        for col in cont_cols:
+            full_df[col] = full_df[col].shift(H)
+
+        # Re-split using the original indices
+        train_df = full_df.loc[train_df.index].iloc[H:].copy()  # drop first H NaN rows
+        val_df = full_df.loc[val_df.index].copy()
+        test_df = full_df.loc[test_df.index].copy()
+
         logger.info("Feature shifting: shifted %d cols by %d hours (H=%dd).",
                     len(cont_cols), H, H // 24)
 
@@ -583,12 +605,13 @@ def train_one_fold(
                 optimizer.param_groups[0]["lr"],
             )
 
-        # Early stopping
+        # Early stopping (with minimum epoch guard)
         if val_loss < best_val_loss - 1e-6:
             best_val_loss = val_loss
             patience_counter = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
+        elif epoch >= cfg.min_epochs_before_es:
+            # Only start counting patience after minimum epochs
             patience_counter += 1
 
         if patience_counter >= cfg.early_stop_patience:

@@ -96,9 +96,11 @@ def _build_config_from_trial(
         batch_size=B,
         variant=variant,
         horizon_hours=horizon_days * 24,
-        # Reduced epochs for search (full training uses more)
-        max_epochs=30,
-        early_stop_patience=5,
+        # Training budget for search — must be generous enough to
+        # let the model escape flat-mean local minima (needs ~10+ epochs)
+        max_epochs=50,
+        early_stop_patience=15,
+        min_epochs_before_es=10,
     )
 
 
@@ -184,13 +186,23 @@ def run_search(
             if result is None:
                 raise optuna.TrialPruned("Empty test set")
             val_loss = result["best_val_loss"]
+            pcc = result["metrics"].pcc
             trial.set_user_attr("rmse", result["metrics"].rmse)
             trial.set_user_attr("mae", result["metrics"].mae)
             trial.set_user_attr("mape", result["metrics"].mape_pct)
-            trial.set_user_attr("pcc", result["metrics"].pcc)
+            trial.set_user_attr("pcc", pcc)
             trial.set_user_attr("n_params", result["n_params"])
             trial.set_user_attr("n_epochs", result["n_epochs"])
-            return val_loss
+
+            # Composite objective: penalize flat-mean predictions (low PCC).
+            # val_loss * (2 - PCC):  PCC=1.0 → 1.0x, PCC=0.0 → 2.0x penalty.
+            # This prevents Optuna from selecting configs that "cheat" by
+            # predicting the mean to get low val_loss but useless forecasts.
+            pcc_penalty = 2.0 - max(0.0, pcc)  # clamp negative PCC
+            composite = val_loss * pcc_penalty
+            logger.info("Trial %d: val_loss=%.6f, PCC=%.4f, composite=%.6f",
+                        trial.number, val_loss, pcc, composite)
+            return composite
         except Exception as exc:
             logger.error("Trial %d failed: %s", trial.number, exc)
             raise optuna.TrialPruned(str(exc))
