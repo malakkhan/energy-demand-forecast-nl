@@ -144,7 +144,7 @@ def run_rocv(
 
     for fold_idx, train_end, val_end, test_origin in folds:
         # Check resume
-        if resume and is_fold_done(output_dir, model_name, fold_idx, horizon_days):
+        if resume and is_fold_done(output_dir, model_name, fold_idx, horizon_days, seed=cfg.seed):
             logger.info("Fold %d / H=%dd: SKIP (already done).", fold_idx, horizon_days)
             continue
 

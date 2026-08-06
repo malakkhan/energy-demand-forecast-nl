@@ -20,8 +20,8 @@
 
 set -euo pipefail
 
-REPO_ROOT=/scratch-shared/prjs2061_copy/energy-demand-forecast-nl
-VIIRS_SRC=/scratch-shared/prjs2061_copy/data/viirs/A2
+REPO_ROOT=/projects/prjs2061/energy-demand-forecast-nl
+VIIRS_SRC=/projects/prjs2061/data/viirs/A2
 
 cd "$REPO_ROOT"
 source .venv/bin/activate
@@ -37,18 +37,28 @@ echo "  TMPDIR:  $TMPDIR"
 echo "  Args:    $@"
 echo "═══════════════════════════════════════════════════════"
 
-# ── Stage VIIRS data to NVMe scratch ──
-echo "Staging VIIRS data to NVMe ($TMPDIR) ..."
-STAGE_START=$(date +%s)
-VIIRS_LOCAL="$TMPDIR/viirs/A2"
-mkdir -p "$VIIRS_LOCAL"
-rsync -a --info=progress2 "$VIIRS_SRC/" "$VIIRS_LOCAL/"
-STAGE_END=$(date +%s)
-echo "Staging complete: $((STAGE_END - STAGE_START))s"
-echo "Local VIIRS: $(du -sh "$VIIRS_LOCAL" | cut -f1)"
+# ── Stage VIIRS data to NVMe scratch (only for spatial variants) ──
+NEEDS_VIIRS=false
+for arg in "$@"; do
+    if [[ "$arg" == "full" || "$arg" == "early_fusion" ]]; then
+        NEEDS_VIIRS=true
+    fi
+done
 
-export CMAT_VIIRS_DIR="$VIIRS_LOCAL"
-echo "CMAT_VIIRS_DIR=$CMAT_VIIRS_DIR"
+if [ "$NEEDS_VIIRS" = true ]; then
+    echo "Staging VIIRS data to NVMe ($TMPDIR) ..."
+    STAGE_START=$(date +%s)
+    VIIRS_LOCAL="$TMPDIR/viirs/A2"
+    mkdir -p "$VIIRS_LOCAL"
+    rsync -a --info=progress2 "$VIIRS_SRC/" "$VIIRS_LOCAL/"
+    STAGE_END=$(date +%s)
+    echo "Staging complete: $((STAGE_END - STAGE_START))s"
+    echo "Local VIIRS: $(du -sh "$VIIRS_LOCAL" | cut -f1)"
+    export CMAT_VIIRS_DIR="$VIIRS_LOCAL"
+    echo "CMAT_VIIRS_DIR=$CMAT_VIIRS_DIR"
+else
+    echo "Skipping VIIRS staging (non-spatial variant)."
+fi
 
 # ── Run Python Script ──
 if [[ "${1:-rocv}" == "search" ]]; then

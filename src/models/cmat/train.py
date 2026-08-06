@@ -683,7 +683,8 @@ def save_fold_result_locked(
             # Deduplicate by (model, fold, horizon_days)
             seen: Dict[tuple, Dict] = {}
             for row in disk_rows:
-                key = (row["model"], int(row["fold"]), int(row["horizon_days"]))
+                key = (row["model"], int(row["fold"]), int(row["horizon_days"]),
+                       int(row.get("seed", 42)))
                 seen[key] = row
             deduped = list(seen.values())
             pd.DataFrame(deduped).to_csv(csv_path, index=False)
@@ -697,6 +698,7 @@ def is_fold_done(
     model_name: str,
     fold_idx: int,
     horizon_days: int,
+    seed: int = None,
 ) -> bool:
     """Check if a fold/horizon combo has already been completed."""
     csv_path = output_dir / f"rocv_results_{model_name}.csv"
@@ -705,6 +707,8 @@ def is_fold_done(
     try:
         df = pd.read_csv(csv_path)
         match = df[(df["fold"] == fold_idx) & (df["horizon_days"] == horizon_days)]
+        if "seed" in df.columns and seed is not None:
+            match = match[match["seed"] == seed]
         return len(match) > 0
     except Exception:
         return False
