@@ -421,6 +421,7 @@ def train_one_fold(
     ntl_store=None,
     device: torch.device = None,
     horizon_hours: int = 0,
+    fold_idx: int = 0,
 ) -> Dict:
     """Train CMAT on one ROCV fold and return metrics.
 
@@ -626,6 +627,27 @@ def train_one_fold(
     if best_state is not None:
         model.load_state_dict(best_state)
         model = model.to(device)
+
+    # Save checkpoint for post-hoc analysis (permutation importance, etc.)
+    ckpt_dir = Path(C.OUTPUT_DIR) / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    seed = cfg.seed
+    ckpt_path = ckpt_dir / f"ckpt_{cfg.variant.value}_h{horizon_hours // 24}d_f{fold_idx}_s{seed}.pt"
+    torch.save({
+        "model_state_dict": best_state,
+        "config": cfg,
+        "cont_min": cont_min,
+        "cont_max": cont_max,
+        "target_min": target_min,
+        "target_max": target_max,
+        "ntl_mean": ntl_mean,
+        "ntl_std": ntl_std,
+        "fold_idx": fold_idx,
+        "horizon_days": horizon_hours // 24,
+        "seed": seed,
+        "n_params": n_params,
+    }, ckpt_path)
+    logger.info("Saved checkpoint → %s", ckpt_path)
 
     # Evaluate on test set
     test_loss, preds_norm, targets_norm = evaluate(

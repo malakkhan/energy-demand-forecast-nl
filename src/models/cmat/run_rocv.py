@@ -178,6 +178,7 @@ def run_rocv(
                 cfg, train_df, val_df, test_df,
                 ntl_store=ntl_store, device=device,
                 horizon_hours=horizon_days * 24,
+                fold_idx=fold_idx,
             )
             fold_time = time.time() - t0_fold
 
@@ -214,12 +215,13 @@ def run_rocv(
             )
 
             # ── Budget protection: abort if fold took too long ──
-            MAX_FOLD_SECONDS = 2.5 * 3600  # 2.5 hours
+            MAX_FOLD_SECONDS = 8.0 * 3600 if cfg.variant.value == "full" else 2.5 * 3600
             if fold_time > MAX_FOLD_SECONDS:
+                limit_h = MAX_FOLD_SECONDS / 3600
                 logger.warning(
-                    "⚠️  BUDGET GUARD: Fold %d took %.1fh (limit=2.5h). "
+                    "⚠️  BUDGET GUARD: Fold %d took %.1fh (limit=%.1fh). "
                     "Stopping to protect SBU budget. %d folds saved so far.",
-                    fold_idx, fold_time / 3600, len(results),
+                    fold_idx, fold_time / 3600, limit_h, len(results),
                 )
                 break
 
