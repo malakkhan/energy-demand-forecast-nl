@@ -2,11 +2,12 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=160G
+#SBATCH --mem=60G
 #SBATCH --time=08:00:00
 #SBATCH --constraint=scratch-node
 #SBATCH --output=logs/cmat_%j.log
 #SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=malak.khan@student.uva.nl
 
 # ============================================================
 # CMAT GPU SLURM Job — H100 + NVMe staging
