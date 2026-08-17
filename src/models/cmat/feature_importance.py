@@ -33,6 +33,18 @@ logging.basicConfig(
 )
 
 
+def _eval_to_metrics(model, test_ds, device, batch_size, target_min, target_max):
+    """Helper: evaluate model and return metrics."""
+    from src.models.baselines import evaluation as BE
+    criterion = torch.nn.MSELoss()
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    _, p_norm, t_norm = evaluate(model, loader, criterion, device)
+    target_range = max(target_max - target_min, 1e-8)
+    p_mw = p_norm * target_range + target_min
+    t_mw = t_norm * target_range + target_min
+    return BE.compute_metrics(t_mw, p_mw)
+
+
 def permutation_importance(
     model: torch.nn.Module,
     test_ds: CMATDataset,
@@ -42,6 +54,7 @@ def permutation_importance(
     n_repeats: int = 5,
     target_min: float = 0.0,
     target_max: float = 1.0,
+    include_images: bool = False,
 ) -> pd.DataFrame:
     """Compute permutation importance for all continuous features.
 
@@ -50,58 +63,63 @@ def permutation_importance(
       2. Re-evaluate the model
       3. Measure RMSE/PCC degradation vs. baseline
 
+    If include_images=True, also measures importance of the NTL image branch
+    by shuffling the image tensor across samples.
+
     Returns a DataFrame with columns:
       feature, baseline_rmse, shuffled_rmse_mean, shuffled_rmse_std,
       importance_rmse, baseline_pcc, shuffled_pcc_mean, shuffled_pcc_std,
       importance_pcc
     """
     model.eval()
-    criterion = torch.nn.MSELoss()
 
     # Baseline evaluation
-    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-    base_loss, preds_norm, targets_norm = evaluate(model, loader, criterion, device)
-
-    target_range = target_max - target_min
-    if target_range < 1e-8:
-        target_range = 1.0
-    preds_mw = preds_norm * target_range + target_min
-    targets_mw = targets_norm * target_range + target_min
-
-    from src.models.baselines import evaluation as BE
-    base_metrics = BE.compute_metrics(targets_mw, preds_mw)
+    base_metrics = _eval_to_metrics(
+        model, test_ds, device, batch_size, target_min, target_max
+    )
     logger.info("Baseline: RMSE=%.2f, PCC=%.4f, MAPE=%.2f%%",
                 base_metrics.rmse, base_metrics.pcc, base_metrics.mape_pct)
 
     # Original continuous data (we'll restore after each permutation)
     original_cont = test_ds.cont_data.copy()
-    n_features = len(feature_names)
+
+    # Build the list of features to test
+    features_to_test = list(enumerate(feature_names))
+    if include_images:
+        features_to_test.append((-1, "ntl_images"))  # sentinel index
+    n_features = len(features_to_test)
 
     results = []
 
-    for feat_idx, feat_name in enumerate(feature_names):
+    for step, (feat_idx, feat_name) in enumerate(features_to_test):
         rmse_scores = []
         pcc_scores = []
 
         for rep in range(n_repeats):
-            # Shuffle feature feat_idx across all samples
-            # This shuffles the entire column in the raw array, which means
-            # different time windows get each other's feature values
-            test_ds.cont_data = original_cont.copy()
-            perm = np.random.permutation(len(test_ds.cont_data))
-            test_ds.cont_data[:, feat_idx] = original_cont[perm, feat_idx]
+            if feat_idx == -1:
+                # Shuffle NTL images: we monkey-patch the NTLStore to return
+                # shuffled images by permuting the date→index mapping.
+                # Simpler approach: temporarily swap ntl_store with a shuffling wrapper.
+                _orig_store = test_ds.ntl_store
+                test_ds.ntl_store = _ShuffledNTLStore(_orig_store)
+            else:
+                # Shuffle tabular feature
+                test_ds.cont_data = original_cont.copy()
+                perm = np.random.permutation(len(test_ds.cont_data))
+                test_ds.cont_data[:, feat_idx] = original_cont[perm, feat_idx]
 
             # Re-evaluate
-            loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-            _, p_norm, t_norm = evaluate(model, loader, criterion, device)
-            p_mw = p_norm * target_range + target_min
-            t_mw = t_norm * target_range + target_min
-            m = BE.compute_metrics(t_mw, p_mw)
+            m = _eval_to_metrics(
+                model, test_ds, device, batch_size, target_min, target_max
+            )
             rmse_scores.append(m.rmse)
             pcc_scores.append(m.pcc)
 
-        # Restore original data
-        test_ds.cont_data = original_cont.copy()
+            # Restore
+            if feat_idx == -1:
+                test_ds.ntl_store = _orig_store
+            else:
+                test_ds.cont_data = original_cont.copy()
 
         rmse_mean = np.mean(rmse_scores)
         rmse_std = np.std(rmse_scores)
@@ -127,16 +145,43 @@ def permutation_importance(
 
         logger.info(
             "[%2d/%d] %-25s  ΔRMSE=%+8.1f  ΔPCC=%+.4f",
-            feat_idx + 1, n_features, feat_name, imp_rmse, imp_pcc,
+            step + 1, n_features, feat_name, imp_rmse, imp_pcc,
         )
 
     df = pd.DataFrame(results).sort_values("importance_rmse", ascending=False)
     return df
 
 
+class _ShuffledNTLStore:
+    """Wrapper that returns images from random dates (breaking temporal signal)."""
+    def __init__(self, real_store):
+        self._store = real_store
+        self._all_dates = list(real_store._date_to_idx.keys()) \
+            if hasattr(real_store, '_date_to_idx') else None
+
+    def get_images_for_window(self, end_date, n_days):
+        """Return images for random dates instead of the requested window."""
+        if self._all_dates is not None:
+            random_dates = np.random.choice(self._all_dates, size=n_days, replace=True)
+            # Stack images from random dates
+            imgs = np.stack([
+                self._store.get_images_for_window(end_date=d, n_days=1)[0]
+                for d in random_dates
+            ])
+            return imgs
+        else:
+            # Fallback: get normal images and shuffle along the time axis
+            imgs = self._store.get_images_for_window(end_date=end_date, n_days=n_days)
+            np.random.shuffle(imgs)  # shuffle in-place along axis 0
+            return imgs
+
+    def get_normalisation_stats(self, *args, **kwargs):
+        return self._store.get_normalisation_stats(*args, **kwargs)
+
+
 def main():
     parser = argparse.ArgumentParser(description="CMAT Permutation Feature Importance")
-    parser.add_argument("--variant", required=True, choices=["tab", "ntl"])
+    parser.add_argument("--variant", required=True, choices=["tab", "ntl", "full", "early"])
     parser.add_argument("--horizon", required=True, type=int)
     parser.add_argument("--fold", required=True, type=int)
     parser.add_argument("--seed", type=int, default=42)
@@ -163,6 +208,8 @@ def main():
     cont_max = ckpt["cont_max"]
     target_min = ckpt["target_min"]
     target_max = ckpt["target_max"]
+    ntl_mean = ckpt.get("ntl_mean", 0.0)
+    ntl_std = ckpt.get("ntl_std", 1.0)
 
     # ── Rebuild model ──
     model = CMAT(cfg).to(device)
@@ -171,6 +218,15 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     logger.info("Model loaded: %s params", f"{ckpt['n_params']:,}")
+
+    # ── Load NTL images if needed ──
+    ntl_store = None
+    uses_spatial = cfg.uses_spatial
+    if uses_spatial:
+        from .ntl_images import NTLImageStore
+        ntl_store = NTLImageStore()
+        ntl_store.preload_all()
+        logger.info("NTL images loaded (mean=%.2f, std=%.2f)", ntl_mean, ntl_std)
 
     # ── Recreate test dataset for this fold ──
     horizon_days = args.horizon
@@ -215,7 +271,7 @@ def main():
     # Build test dataset with saved normalization stats
     dataset_kwargs = dict(
         cfg=cfg, cont_cols=cont_cols, cat_cols=cat_cols,
-        ntl_store=None, ntl_mean=0.0, ntl_std=1.0,
+        ntl_store=ntl_store, ntl_mean=ntl_mean, ntl_std=ntl_std,
         target_min=target_min, target_max=target_max,
         cont_min=cont_min, cont_max=cont_max,
         horizon_hours=horizon_hours,
@@ -234,6 +290,7 @@ def main():
         n_repeats=args.n_repeats,
         target_min=target_min,
         target_max=target_max,
+        include_images=uses_spatial,
     )
 
     elapsed = time.time() - t0
