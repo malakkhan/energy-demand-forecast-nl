@@ -125,7 +125,7 @@ class ROCVConfig:
     Expanding window with configurable origin step.  The first fold
     uses ``min_train_years`` of data for training and the next full
     calendar year for validation.  The origin advances by
-    ``fold_step_years`` each fold.
+    ``fold_step_months`` each fold.
 
     Parameters
     ----------
@@ -133,18 +133,21 @@ class ROCVConfig:
         First date in the dataset (inclusive).
     min_train_years : int
         Minimum training history required to initialise the first fold.
-    fold_step_years : int
-        How many years the origin advances between folds.  Set to 1 for
-        annual advancement; change for finer granularity in the future.
+    fold_step_months : int
+        How many months the origin advances between folds.  13-month step
+        cycles through all calendar months to avoid seasonal sampling bias.
     forecast_horizons_days : List[int]
         Horizons to evaluate (60, 75, 90, … , 180 days).
     """
     start_date: str = "2012-01-01"
     min_train_years: int = 2
-    fold_step_years: int = 1  # Toggle-able: 1 = annual, could be fractional
+    fold_step_months: int = 13  # 13-month step cycles through calendar months
     forecast_horizons_days: List[int] = field(
         default_factory=lambda: list(range(60, 181, 15))
     )  # [60, 75, 90, 105, 120, 135, 150, 165, 180]
+
+# Random seeds for reproducibility (all models evaluated with 3 seeds)
+RANDOM_SEEDS = [42, 123, 7]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

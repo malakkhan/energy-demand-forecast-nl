@@ -30,7 +30,7 @@ TARGET = "entsoe_load_mw"
 # ---------------------------------------------------------------------------
 ROCV_START = "2012-01-01"
 MIN_TRAIN_YEARS = 2
-FOLD_STEP_YEARS = 1
+FOLD_STEP_MONTHS = 13  # cycles through calendar months
 HORIZONS_DAYS = list(range(60, 181, 15))  # [60, 75, ..., 180]
 
 # ---------------------------------------------------------------------------
@@ -49,12 +49,12 @@ NL_LON_MIN, NL_LON_MAX = 3.2, 7.3
 # Feature definitions (36 total = 32 continuous + 4 categorical)
 # ---------------------------------------------------------------------------
 
-# 32 continuous features:
+# 16 continuous features (PCA added dynamically per fold):
 #   6 cyclical sin/cos: hour_sin, hour_cos, dow_sin, dow_cos, month_sin, month_cos
 #   3 ordinal temporal: day_of_year, week_of_year, quarter
 #   4 autoregressive load lags: load_lag_12h, load_lag_24h, load_lag_1w, load_lag_1y
 #   3 CCF-optimal weather lags: solar_rad_lag_10h, humidity_lag_12h, temp_lag_107h
-#   16 PCA components: pca_cbs_knmi_full_01 ... pca_cbs_knmi_full_16
+#   PCA components: fitted per-fold on training data (95% variance threshold)
 CONTINUOUS_FEATURES: List[str] = [
     # Cyclical temporal (6)
     "hour_sin", "hour_cos",
@@ -66,49 +66,50 @@ CONTINUOUS_FEATURES: List[str] = [
     "load_lag_12h", "load_lag_24h", "load_lag_1w", "load_lag_1y",
     # CCF-optimal weather lags (3)
     "solar_rad_lag_10h", "humidity_lag_12h", "temp_lag_107h",
-    # PCA components (16)
-    "pca_cbs_knmi_full_01", "pca_cbs_knmi_full_02", "pca_cbs_knmi_full_03",
-    "pca_cbs_knmi_full_04", "pca_cbs_knmi_full_05", "pca_cbs_knmi_full_06",
-    "pca_cbs_knmi_full_07", "pca_cbs_knmi_full_08", "pca_cbs_knmi_full_09",
-    "pca_cbs_knmi_full_10", "pca_cbs_knmi_full_11", "pca_cbs_knmi_full_12",
-    "pca_cbs_knmi_full_13", "pca_cbs_knmi_full_14", "pca_cbs_knmi_full_15",
-    "pca_cbs_knmi_full_16",
+    # PCA components are now computed per-fold at training time (see train.py).
+    # Raw CBS/KNMI columns are read from the dataset and PCA is fitted on
+    # training data only to avoid future data leakage.
 ]
 
 # 4 categorical features with their cardinalities
 CATEGORICAL_FEATURES: List[str] = [
     "is_public_holiday",   # 2 levels (0, 1)
     "is_school_holiday",   # 2 levels (0, 1)
-    "is_energy_crisis",    # 2 levels (0, 1)
     "year",                # 14 levels (2012–2025)
 ]
 CATEGORICAL_CARDINALITIES: Dict[str, int] = {
     "is_public_holiday": 2,
     "is_school_holiday": 2,
-    "is_energy_crisis": 2,
     "year": 14,  # 2012–2025
 }
 # Offset for year feature so 2012 maps to index 0
 YEAR_OFFSET = 2012
 
 ALL_FEATURES = CONTINUOUS_FEATURES + CATEGORICAL_FEATURES
-N_CONTINUOUS = len(CONTINUOUS_FEATURES)   # 32
-N_CATEGORICAL = len(CATEGORICAL_FEATURES)  # 4
+N_CONTINUOUS = len(CONTINUOUS_FEATURES)   # 16 (PCA added dynamically)
+N_CATEGORICAL = len(CATEGORICAL_FEATURES)  # 3
 
 # Features that need horizon-shifting (lag features + PCA)
 LAG_FEATURES = [
     "load_lag_12h", "load_lag_24h", "load_lag_1w", "load_lag_1y",
     "solar_rad_lag_10h", "humidity_lag_12h", "temp_lag_107h",
 ]
-PCA_FEATURES = [f"pca_cbs_knmi_full_{i:02d}" for i in range(1, 17)]
-FEATURES_TO_SHIFT = LAG_FEATURES + PCA_FEATURES
+# PCA_FEATURES removed — PCA is now fitted per-fold on training data.
+# The per-fold PCA columns are added to FEATURES_TO_SHIFT dynamically.
+FEATURES_TO_SHIFT = LAG_FEATURES  # PCA columns added at runtime
+
+# Raw CBS + KNMI columns used as PCA input (fitted per-fold on training data).
+# Columns with >50% NaN in the training fold are dropped before fitting.
+PCA_VARIANCE_THRESHOLD = 0.95  # Select n_components for this cumulative variance
+PCA_MAX_NULL_FRAC = 0.50       # Drop columns with more NaN than this
 
 # NTL aggregate feature for CMAT-NTL variant
 NTL_AGGREGATE_FEATURE = "ntl_a2_all_mean"
 
 # Quantiles for probabilistic forecasting
-QUANTILES = [0.05, 0.50, 0.95]
-N_QUANTILES = len(QUANTILES)
+# Point forecasting (MSE loss, single output)
+# Previously: QUANTILES = [0.05, 0.50, 0.95]
+N_QUANTILES = 1
 
 # FFN expansion factor (standard transformer convention)
 FFN_EXPANSION = 4

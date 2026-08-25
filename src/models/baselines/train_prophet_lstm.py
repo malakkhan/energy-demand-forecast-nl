@@ -297,7 +297,7 @@ def main():
         "rocv": {
             "start_date": rocv_cfg.start_date,
             "min_train_years": rocv_cfg.min_train_years,
-            "fold_step_years": rocv_cfg.fold_step_years,
+            "fold_step_months": rocv_cfg.fold_step_months,
             "horizons_days": rocv_cfg.forecast_horizons_days,
         },
         "prophet": {

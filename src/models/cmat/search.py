@@ -186,11 +186,11 @@ def run_search(
             if result is None:
                 raise optuna.TrialPruned("Empty test set")
             val_loss = result["best_val_loss"]
-            pcc = result["metrics"].pcc
-            trial.set_user_attr("rmse", result["metrics"].rmse)
-            trial.set_user_attr("mae", result["metrics"].mae)
-            trial.set_user_attr("mape", result["metrics"].mape_pct)
-            trial.set_user_attr("pcc", pcc)
+            pcc = result["val_metrics"].pcc  # Use VALIDATION PCC, not test
+            trial.set_user_attr("val_rmse", result["val_metrics"].rmse)
+            trial.set_user_attr("val_pcc", result["val_metrics"].pcc)
+            trial.set_user_attr("test_rmse", result["metrics"].rmse)
+            trial.set_user_attr("test_pcc", result["metrics"].pcc)
             trial.set_user_attr("n_params", result["n_params"])
             trial.set_user_attr("n_epochs", result["n_epochs"])
 

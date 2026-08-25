@@ -46,7 +46,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.models.baselines import config as C
-from src.models.baselines.data_loader import clear_outliers_iqr
+from src.models.baselines.data_loader import clear_outliers_iqr, fit_fold_pca
 from src.models.baselines.evaluation import (
     compute_metrics,
     plot_metric_evolution,
@@ -76,13 +76,13 @@ TEMPORAL_FEATURES: List[str] = [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos",
     "month_sin", "month_cos",
     "year",
-    "is_public_holiday", "is_school_holiday", "is_energy_crisis",
+    "is_public_holiday", "is_school_holiday",
 ]
 LAG_FEATURES: List[str] = [
     "load_lag_12h", "load_lag_24h", "load_lag_1w", "load_lag_1y",
     "solar_rad_lag_10h", "humidity_lag_12h", "temp_lag_107h",
 ]
-PCA_FEATURES: List[str] = [f"pca_cbs_knmi_full_{i:02d}" for i in range(1, 17)]
+PCA_FEATURES: List[str] = []  # populated per-fold at runtime
 
 ALL_FEATURES: List[str] = TEMPORAL_FEATURES + LAG_FEATURES + PCA_FEATURES
 assert len(ALL_FEATURES) == 36
@@ -93,7 +93,7 @@ CYCLICAL_FEATURES = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", 
 _MAX_NAN_FRAC = 0.50
 ROCV_START = "2012-01-01"
 MIN_TRAIN_YEARS = 2
-FOLD_STEP_YEARS = 1
+FOLD_STEP_MONTHS = 13  # 13-month step cycles through calendar months
 HORIZONS_DAYS = list(range(60, 181, 15))
 
 
@@ -134,7 +134,7 @@ def apply_horizon_shift(df: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
     return df_shifted
 
 
-def rocv_folds_with_val(df, horizons_days, fold_step=FOLD_STEP_YEARS):
+def rocv_folds_with_val(df, horizons_days, fold_step=FOLD_STEP_MONTHS):
     start = pd.Timestamp(ROCV_START)
     data_end = df["timestamp"].max()
     max_horizon_td = pd.Timedelta(days=max(horizons_days))
@@ -144,7 +144,7 @@ def rocv_folds_with_val(df, horizons_days, fold_step=FOLD_STEP_YEARS):
     fold_idx = 0
     while test_origin + max_horizon_td <= data_end:
         yield fold_idx, train_end, val_end, test_origin
-        train_end += pd.DateOffset(years=fold_step)
+        train_end += pd.DateOffset(months=fold_step)
         val_end = train_end + pd.DateOffset(years=1)
         test_origin = val_end
         fold_idx += 1
@@ -270,7 +270,6 @@ def compute_future_temporal_features(
     future_df["year"] = future_ts.year.astype(float)
     future_df["is_public_holiday"] = 0.0
     future_df["is_school_holiday"] = 0.0
-    future_df["is_energy_crisis"] = 0.0
 
     # Build feature array in the same column order as the scaler
     result = np.zeros((n_hours, len(feature_cols)), dtype=np.float64)
@@ -296,6 +295,7 @@ def run_seq2seq_fold(
     val_end: pd.Timestamp,
     test_origin: pd.Timestamp,
     horizon_days: int,
+    seed: int = 42,
 ) -> Dict:
     """Execute one Seq2Seq fold."""
     cfg = C.Seq2SeqConfig()
@@ -348,6 +348,12 @@ def run_seq2seq_fold(
 
     if len(train_df) == 0 or len(test_df) == 0:
         return {"n_train": len(train_df), "n_test": len(test_df)}
+
+    # ── 3b. Per-fold PCA (fitted on training data only) ────────────
+    pca_cols, train_df, val_df, test_df = fit_fold_pca(train_df, val_df, test_df)
+    if pca_cols:
+        feature_cols = feature_cols + pca_cols
+        logger.info("Added %d per-fold PCA cols. Total features: %d.", len(pca_cols), len(feature_cols))
 
     # ── 4. Scale — SEPARATE scalers for features and target ──────────
     n_features = len(feature_cols)
@@ -523,14 +529,21 @@ def run_seq2seq_fold(
     y_pred_mw = target_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
     y_true_mw = test_df[TARGET].values[:len(y_pred_mw)]
 
+    infer_time_s = time.time() - t_infer_start if "t_infer_start" in locals() else 0.0
     metrics = compute_metrics(y_true_mw, y_pred_mw)
 
     return {
         "predictions_mw": y_pred_mw,
         "actuals_mw": y_true_mw,
         "timestamps": test_df["timestamp"].values[:len(y_pred_mw)] if "timestamp" in test_df.columns else None,
-        "n_train": len(train_df),
-        "n_test": len(y_true_mw),
+        "n_train_rows": len(train_df),
+        "n_val_rows": len(val_df),
+        "n_test_rows": len(test_df),
+        "n_train": len(train_dataset) if "train_dataset" in locals() else len(train_df),
+        "n_val": len(val_dataset) if "val_dataset" in locals() else len(val_df),
+        "n_test": len(test_dataset) if "test_dataset" in locals() else len(y_true_mw),
+        "train_time_s": round(train_time_s, 2) if "train_time_s" in locals() else 0.0,
+        "infer_time_s": round(infer_time_s, 2) if "infer_time_s" in locals() else 0.0,
         "metrics": metrics,
         "n_features": len(feature_cols),
     }
@@ -595,7 +608,7 @@ def main():
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing results, skipping completed folds. "
                              "Safe for parallel per-horizon SLURM jobs.")
-    parser.add_argument("--fold-step", type=int, default=FOLD_STEP_YEARS)
+    parser.add_argument("--fold-step", type=int, default=FOLD_STEP_MONTHS)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir) if args.output_dir else C.OUTPUT_DIR
@@ -631,11 +644,19 @@ def main():
         logger.info("Resumed: loaded %d existing results (%d unique horizon×fold pairs).",
                      len(results), len(completed))
 
-    for h_days in horizons:
-        h_t0 = time.time()
-        logger.info("━" * 60)
-        logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
-        logger.info("━" * 60)
+            for seed in RANDOM_SEEDS:
+            import torch, random, numpy
+            torch.manual_seed(seed)
+            random.seed(seed)
+            numpy.random.seed(seed)
+            logger.info("=' * 40)")
+            logger.info("SEED = %d", seed)
+            logger.info("=' * 40)")
+for h_days in horizons:
+                h_t0 = time.time()
+                logger.info("━" * 60)
+                logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
+                logger.info("━" * 60)
 
         df_shifted = apply_horizon_shift(df, h_days)
 
@@ -662,12 +683,16 @@ def main():
                 result_row = {
                     "model": model_name,
                     "fold": fold_idx,
+                    "seed": seed if "seed" in locals() else "N/A",
                     "cutoff": str(test_origin.date()),
                     "horizon_days": h_days,
                     "horizon_hours": h_days * 24,
                     "n_train": fold_result.get("n_train", 0),
                     "n_test": fold_result.get("n_test", 0),
                     **metrics.to_dict(),
+                    "n_val": fold_result.get("n_val", 0),
+                    "train_time_s": fold_result.get("train_time_s", 0.0),
+                    "infer_time_s": fold_result.get("infer_time_s", 0.0),
                     "n_features": fold_result.get("n_features", 0),
                     "elapsed_s": round(fold_elapsed, 1),
                 }

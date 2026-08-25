@@ -51,7 +51,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.models.baselines import config as C
-from src.models.baselines.data_loader import clear_outliers_iqr
+from src.models.baselines.data_loader import clear_outliers_iqr, fit_fold_pca
 from src.models.baselines.evaluation import (
     compute_metrics,
     plot_metric_evolution,
@@ -81,7 +81,7 @@ TEMPORAL_FEATURES: List[str] = [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos",
     "month_sin", "month_cos",
     "year",
-    "is_public_holiday", "is_school_holiday", "is_energy_crisis",
+    "is_public_holiday", "is_school_holiday",
 ]
 LAG_FEATURES: List[str] = [
     "load_lag_12h", "load_lag_24h", "load_lag_1w", "load_lag_1y",
@@ -95,7 +95,7 @@ assert len(ALL_FEATURES) == 36
 _MAX_NAN_FRAC = 0.50
 ROCV_START = "2012-01-01"
 MIN_TRAIN_YEARS = 2
-FOLD_STEP_YEARS = 1
+FOLD_STEP_MONTHS = 13  # 13-month step cycles through calendar months
 HORIZONS_DAYS = list(range(60, 181, 15))
 
 # SARIMAX caps
@@ -139,7 +139,7 @@ def apply_horizon_shift(df: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
     return df_shifted
 
 
-def rocv_folds_with_val(df, horizons_days, fold_step=FOLD_STEP_YEARS):
+def rocv_folds_with_val(df, horizons_days, fold_step=FOLD_STEP_MONTHS):
     start = pd.Timestamp(ROCV_START)
     data_end = df["timestamp"].max()
     max_horizon_td = pd.Timedelta(days=max(horizons_days))
@@ -149,7 +149,7 @@ def rocv_folds_with_val(df, horizons_days, fold_step=FOLD_STEP_YEARS):
     fold_idx = 0
     while test_origin + max_horizon_td <= data_end:
         yield fold_idx, train_end, val_end, test_origin
-        train_end += pd.DateOffset(years=fold_step)
+        train_end += pd.DateOffset(months=fold_step)
         val_end = train_end + pd.DateOffset(years=1)
         test_origin = val_end
         fold_idx += 1
@@ -183,6 +183,7 @@ def run_sarimax_lstm_fold(
     val_end: pd.Timestamp,
     test_origin: pd.Timestamp,
     horizon_days: int,
+    seed: int = 42,
 ) -> Dict:
     """Execute one SARIMAX-LSTM fold."""
     from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -240,6 +241,12 @@ def run_sarimax_lstm_fold(
         return {"n_train": len(train_df), "n_test": len(test_df)}
 
     # ══════════════════════════════════════════════════════════════════
+    # Per-fold PCA (fitted on training data only)
+    pca_cols, train_df, val_df, test_df = fit_fold_pca(train_df, val_df, test_df)
+    if pca_cols:
+        feature_cols = feature_cols + pca_cols
+        logger.info("Added %d per-fold PCA cols. Total features: %d.", len(pca_cols), len(feature_cols))
+
     # Stage 1: SARIMAX
     # ══════════════════════════════════════════════════════════════════
 
@@ -446,7 +453,7 @@ def main():
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing results, skipping completed folds. "
                              "Safe for parallel per-horizon SLURM jobs.")
-    parser.add_argument("--fold-step", type=int, default=FOLD_STEP_YEARS)
+    parser.add_argument("--fold-step", type=int, default=FOLD_STEP_MONTHS)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir) if args.output_dir else C.OUTPUT_DIR
@@ -482,11 +489,19 @@ def main():
         logger.info("Resumed: loaded %d existing results (%d unique horizon×fold pairs).",
                      len(results), len(completed))
 
-    for h_days in horizons:
-        h_t0 = time.time()
-        logger.info("━" * 60)
-        logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
-        logger.info("━" * 60)
+            for seed in RANDOM_SEEDS:
+            import torch, random, numpy
+            torch.manual_seed(seed)
+            random.seed(seed)
+            numpy.random.seed(seed)
+            logger.info("=' * 40)")
+            logger.info("SEED = %d", seed)
+            logger.info("=' * 40)")
+for h_days in horizons:
+                h_t0 = time.time()
+                logger.info("━" * 60)
+                logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
+                logger.info("━" * 60)
 
         df_shifted = apply_horizon_shift(df, h_days)
 
@@ -513,12 +528,16 @@ def main():
                 result_row = {
                     "model": model_name,
                     "fold": fold_idx,
+                    "seed": seed if "seed" in locals() else "N/A",
                     "cutoff": str(test_origin.date()),
                     "horizon_days": h_days,
                     "horizon_hours": h_days * 24,
                     "n_train": fold_result.get("n_train", 0),
                     "n_test": fold_result.get("n_test", 0),
                     **metrics.to_dict(),
+                    "n_val": fold_result.get("n_val", 0),
+                    "train_time_s": fold_result.get("train_time_s", 0.0),
+                    "infer_time_s": fold_result.get("infer_time_s", 0.0),
                     "n_features": fold_result.get("n_features", 0),
                     "elapsed_s": round(fold_elapsed, 1),
                 }

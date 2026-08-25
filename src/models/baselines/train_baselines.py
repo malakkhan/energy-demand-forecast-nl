@@ -270,7 +270,7 @@ def main():
     )
     parser.add_argument(
         "--fold-step", type=int, default=None,
-        help="Override fold_step_years in ROCV config.",
+        help="Override fold_step_months in ROCV config.",
     )
     args = parser.parse_args()
 
@@ -288,10 +288,10 @@ def main():
     # ── ROCV config ──
     rocv_cfg = C.ROCVConfig()
     if args.fold_step is not None:
-        rocv_cfg.fold_step_years = args.fold_step
+        rocv_cfg.fold_step_months = args.fold_step
 
     logger.info("ROCV horizons: %s days", rocv_cfg.forecast_horizons_days)
-    logger.info("ROCV fold step: %d year(s)", rocv_cfg.fold_step_years)
+    logger.info("ROCV fold step: %d year(s)", rocv_cfg.fold_step_months)
 
     # ── Run models ──
     models = [args.model] if args.model else C.ALL_MODELS
@@ -331,7 +331,7 @@ def main():
         "rocv": {
             "start_date": rocv_cfg.start_date,
             "min_train_years": rocv_cfg.min_train_years,
-            "fold_step_years": rocv_cfg.fold_step_years,
+            "fold_step_months": rocv_cfg.fold_step_months,
             "horizons_days": rocv_cfg.forecast_horizons_days,
         },
         "total_elapsed_s": round(time.time() - t0, 1),

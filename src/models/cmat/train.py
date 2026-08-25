@@ -37,6 +37,8 @@ from baselines.data_loader import (
 )
 
 from . import config as C
+from sklearn.decomposition import PCA as _PCA
+from sklearn.preprocessing import StandardScaler as _StandardScaler
 from .config import CMATConfig, CMATVariant
 from .model import CMAT
 
@@ -47,46 +49,8 @@ logger = logging.getLogger("cmat.train")
 # Pinball Loss (Quantile Regression)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class PinballLoss(nn.Module):
-    """Pinball (quantile) loss for multiple quantiles.
-
-    L_τ(y, ŷ) = τ(y - ŷ)  if y - ŷ ≥ 0
-              = (τ-1)(y - ŷ)  otherwise
-    """
-
-    def __init__(self, quantiles: List[float] = None):
-        super().__init__()
-        self.quantiles = quantiles or C.QUANTILES
-        self.register_buffer(
-            "tau", torch.tensor(self.quantiles, dtype=torch.float32)
-        )
-
-    def forward(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        y_pred : (B, H_pred, n_quantiles)
-        y_true : (B, H_pred)
-
-        Returns
-        -------
-        loss : scalar
-        """
-        # Expand y_true to match quantile dimension
-        y_true = y_true.unsqueeze(-1)  # (B, H_pred, 1)
-        errors = y_true - y_pred       # (B, H_pred, n_quantiles)
-
-        # Pinball loss per quantile
-        losses = torch.where(
-            errors >= 0,
-            self.tau * errors,
-            (self.tau - 1) * errors,
-        )
-        return losses.mean()
+# PinballLoss removed -- replaced with nn.MSELoss for point forecasting.
+# Previously used quantile regression (tau = 0.05, 0.50, 0.95).
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -342,7 +306,7 @@ def train_epoch(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             y_pred = model(x_cont, x_cat, images=images, H_pred=1)
-            loss = criterion(y_pred, target.unsqueeze(-1))
+            loss = criterion(y_pred.squeeze(-1).squeeze(-1), target)
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -387,14 +351,14 @@ def evaluate(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             y_pred = model(x_cont, x_cat, images=images, H_pred=1)
-            loss = criterion(y_pred, target.unsqueeze(-1))
+            loss = criterion(y_pred.squeeze(-1).squeeze(-1), target)
 
         total_loss += loss.item()
         n_batches += 1
 
-        preds_q50 = y_pred[:, 0, 1].float().cpu().numpy()
+        preds_point = y_pred.squeeze(-1).squeeze(-1).float().cpu().numpy()
         targets_np = target.float().cpu().numpy()
-        all_preds.append(preds_q50)
+        all_preds.append(preds_point)
         all_targets.append(targets_np)
 
     avg_loss = total_loss / max(1, n_batches)
@@ -412,6 +376,83 @@ def _set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+
+
+def _fit_fold_pca(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    variance_threshold: float = C.PCA_VARIANCE_THRESHOLD,
+    max_null_frac: float = C.PCA_MAX_NULL_FRAC,
+) -> Tuple[List[str], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fit PCA on training data only; transform all splits.
+
+    Selects n_components to explain >= variance_threshold of variance.
+    Returns the new PCA column names and updated dataframes.
+    """
+    # Identify raw CBS + KNMI validated columns in the dataset
+    all_cols = train_df.columns.tolist()
+    raw_cols = sorted([
+        c for c in all_cols
+        if (c.startswith("cbs_") or c.startswith("knmi_val_"))
+        and not c.startswith("pca_")
+    ])
+
+    if not raw_cols:
+        logger.warning("No CBS/KNMI columns found for per-fold PCA.")
+        return [], train_df, val_df, test_df
+
+    # Drop columns with too many NaNs in training data
+    train_null_frac = train_df[raw_cols].isna().mean()
+    keep_cols = sorted(train_null_frac[train_null_frac <= max_null_frac].index.tolist())
+
+    if len(keep_cols) < 2:
+        logger.warning("Too few CBS/KNMI columns with sufficient coverage (%d). Skipping PCA.", len(keep_cols))
+        return [], train_df, val_df, test_df
+
+    logger.info("Per-fold PCA: %d/%d raw columns retained (>%.0f%% coverage).",
+                len(keep_cols), len(raw_cols), (1 - max_null_frac) * 100)
+
+    # Fit on complete training rows only
+    train_complete = train_df[keep_cols].dropna()
+    if len(train_complete) < 10:
+        logger.warning("Too few complete training rows for PCA (%d). Skipping.", len(train_complete))
+        return [], train_df, val_df, test_df
+
+    X_train = train_complete.values.astype(np.float64)
+    scaler = _StandardScaler().fit(X_train)
+    X_scaled = scaler.transform(X_train)
+
+    # Fit full PCA to determine n_components for 95% variance
+    pca_full = _PCA().fit(X_scaled)
+    cum_var = np.cumsum(pca_full.explained_variance_ratio_)
+    n_components = int(np.searchsorted(cum_var, variance_threshold) + 1)
+    n_components = min(n_components, len(keep_cols))
+
+    logger.info("Per-fold PCA: %d components explain %.1f%% variance (threshold=%.0f%%).",
+                n_components, cum_var[n_components - 1] * 100, variance_threshold * 100)
+
+    # Refit with selected n_components
+    pca = _PCA(n_components=n_components).fit(X_scaled)
+
+    # Transform all splits
+    pca_col_names = [f"pca_fold_{i:02d}" for i in range(1, n_components + 1)]
+
+    for split_df in [train_df, val_df, test_df]:
+        # Initialise with NaN
+        for col in pca_col_names:
+            split_df[col] = np.nan
+
+        # Transform complete rows
+        complete_mask = split_df[keep_cols].notna().all(axis=1)
+        if complete_mask.any():
+            X = split_df.loc[complete_mask, keep_cols].values.astype(np.float64)
+            X_s = scaler.transform(X)
+            pca_vals = pca.transform(X_s)
+            split_df.loc[complete_mask, pca_col_names] = pca_vals
+
+    return pca_col_names, train_df, val_df, test_df
 
 def train_one_fold(
     cfg: CMATConfig,
@@ -476,6 +517,15 @@ def train_one_fold(
     # Clip outliers to Q1 − 1.5×IQR and Q3 + 1.5×IQR
     # Bounds computed and applied on training fold only
     train_df = clip_iqr(train_df, cont_cols)
+
+    # ── Step 1b: Per-fold PCA (fitted on training data only) ──
+    pca_col_names, train_df, val_df, test_df = _fit_fold_pca(
+        train_df, val_df, test_df,
+    )
+    if pca_col_names:
+        cont_cols = cont_cols + pca_col_names
+        logger.info("Added %d per-fold PCA columns. Total continuous: %d.",
+                    len(pca_col_names), len(cont_cols))
 
     # ── Step 2: Forward-fill residual NaNs ──
     for split_df in [train_df, val_df, test_df]:
@@ -576,7 +626,7 @@ def train_one_fold(
         optimizer, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult,
     )
 
-    criterion = PinballLoss(C.QUANTILES).to(device)
+    criterion = nn.MSELoss().to(device)
 
     # AMP (mixed precision) — bf16 on A100 for ~2x speedup
     use_amp = is_cuda and torch.cuda.is_bf16_supported()
@@ -649,6 +699,18 @@ def train_one_fold(
     }, ckpt_path)
     logger.info("Saved checkpoint → %s", ckpt_path)
 
+    # Evaluate on validation set (for Optuna objective — no test leakage)
+    val_loss_final, val_preds_norm, val_targets_norm = evaluate(
+        model, val_loader, criterion, device
+    )
+    val_preds_mw = val_preds_norm * target_range + target_min
+    val_targets_mw = val_targets_norm * target_range + target_min
+    val_metrics = BE.compute_metrics(val_targets_mw, val_preds_mw)
+    logger.info(
+        "Val metrics: RMSE=%.2f  MAE=%.2f  MAPE=%.2f%%  PCC=%.4f",
+        val_metrics.rmse, val_metrics.mae, val_metrics.mape_pct, val_metrics.pcc,
+    )
+
     # Evaluate on test set
     test_loss, preds_norm, targets_norm = evaluate(
         model, test_loader, criterion, device
@@ -670,6 +732,7 @@ def train_one_fold(
 
     return {
         "metrics": metrics,
+        "val_metrics": val_metrics,
         "preds_mw": preds_mw,
         "targets_mw": targets_mw,
         "best_val_loss": best_val_loss,

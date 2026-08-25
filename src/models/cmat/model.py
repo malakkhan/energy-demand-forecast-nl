@@ -337,7 +337,7 @@ class FactorisedDecoder(nn.Module):
     where W_H ∈ R^{W × H_pred} and W_τ ∈ R^{d × 3}.
     """
 
-    def __init__(self, d_model: int, max_window: int, n_quantiles: int = 3):
+    def __init__(self, d_model: int, max_window: int, n_quantiles: int = 1):
         super().__init__()
         self.d_model = d_model
         self.n_quantiles = n_quantiles

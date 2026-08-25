@@ -482,7 +482,7 @@ def rocv_folds(
       issued.  The actual test targets are at
       ``test_origin + horizon_days`` for each horizon.
 
-    The origin advances by ``fold_step_years`` each iteration.
+    The origin advances by ``fold_step_months`` each iteration.
     """
     start = pd.Timestamp(cfg.start_date)
     data_end = (
@@ -500,7 +500,7 @@ def rocv_folds(
     while val_end + pd.Timedelta(days=max_horizon) <= data_end:
         yield fold_idx, train_end, val_end, val_end
 
-        train_end += pd.DateOffset(years=cfg.fold_step_years)
+        train_end += pd.DateOffset(months=cfg.fold_step_months)
         val_end = train_end + pd.DateOffset(years=1)
         fold_idx += 1
 
@@ -560,3 +560,74 @@ def _merge_weather(df: pd.DataFrame) -> pd.DataFrame:
 
 def _weather_cols(df: pd.DataFrame) -> List[str]:
     return sorted(c for c in df.columns if c.startswith("weather_"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Per-fold PCA (fitted on training data only to avoid future leakage)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def fit_fold_pca(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame = None,
+    test_df: pd.DataFrame = None,
+    variance_threshold: float = 0.95,
+    max_null_frac: float = 0.50,
+) -> tuple:
+    """Fit PCA on training data only; transform all provided splits.
+
+    Selects n_components to explain >= variance_threshold of variance.
+    Returns (pca_col_names, train_df, val_df, test_df).
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+
+    # Identify raw CBS + KNMI columns
+    raw_cols = sorted([
+        c for c in train_df.columns
+        if (c.startswith("cbs_") or c.startswith("knmi_val_"))
+        and not c.startswith("pca_")
+    ])
+
+    if not raw_cols:
+        logger.warning("No CBS/KNMI columns found for per-fold PCA.")
+        return [], train_df, val_df, test_df
+
+    # Drop columns with too many NaNs in training data
+    train_null_frac = train_df[raw_cols].isna().mean()
+    keep_cols = sorted(train_null_frac[train_null_frac <= max_null_frac].index.tolist())
+
+    if len(keep_cols) < 2:
+        logger.warning("Too few CBS/KNMI cols (%d). Skipping PCA.", len(keep_cols))
+        return [], train_df, val_df, test_df
+
+    # Fit on complete training rows
+    train_complete = train_df[keep_cols].dropna()
+    if len(train_complete) < 10:
+        return [], train_df, val_df, test_df
+
+    X_train = train_complete.values.astype(np.float64)
+    scaler = StandardScaler().fit(X_train)
+    X_scaled = scaler.transform(X_train)
+
+    # Determine n_components for target variance
+    pca_full = PCA().fit(X_scaled)
+    cum_var = np.cumsum(pca_full.explained_variance_ratio_)
+    n_components = int(np.searchsorted(cum_var, variance_threshold) + 1)
+    n_components = min(n_components, len(keep_cols))
+
+    logger.info("Per-fold PCA: %d components (%.1f%% variance) from %d features.",
+                n_components, cum_var[n_components - 1] * 100, len(keep_cols))
+
+    pca = PCA(n_components=n_components).fit(X_scaled)
+    pca_col_names = [f"pca_fold_{i:02d}" for i in range(1, n_components + 1)]
+
+    splits = [train_df] + ([val_df] if val_df is not None else []) + ([test_df] if test_df is not None else [])
+    for split_df in splits:
+        for col in pca_col_names:
+            split_df[col] = np.nan
+        mask = split_df[keep_cols].notna().all(axis=1)
+        if mask.any():
+            X = split_df.loc[mask, keep_cols].values.astype(np.float64)
+            split_df.loc[mask, pca_col_names] = pca.transform(scaler.transform(X))
+
+    return pca_col_names, train_df, val_df, test_df

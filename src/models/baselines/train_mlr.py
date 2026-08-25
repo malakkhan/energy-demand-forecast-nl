@@ -50,7 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.models.baselines import config as C
-from src.models.baselines.data_loader import clear_outliers_iqr
+from src.models.baselines.data_loader import clear_outliers_iqr, fit_fold_pca
 from src.models.baselines.evaluation import (
     compute_metrics,
     plot_metric_evolution,
@@ -90,7 +90,6 @@ TEMPORAL_FEATURES: List[str] = [
     # Holiday / event flags — tied to the calendar date of the target
     "is_public_holiday",
     "is_school_holiday",
-    "is_energy_crisis",
 ]
 
 # Pre-computed lag features — SHIFTED by horizon_h to avoid data leakage.
@@ -111,11 +110,13 @@ LAG_FEATURES: List[str] = [
 # features — SHIFTED by horizon_h (these embed exogenous information).
 # Uses the **full-coverage** PCA (2012–2025) that excludes 13 CBS
 # tariff columns starting in 2018.  16 components capture ~95% variance.
-PCA_FEATURES: List[str] = [f"pca_cbs_knmi_full_{i:02d}" for i in range(1, 17)]
+# PCA_FEATURES removed — PCA is now fitted per-fold on training data.
+# Per-fold PCA columns are added dynamically via data_loader.fit_fold_pca().
+PCA_FEATURES: List[str] = []  # populated per-fold at runtime
 
 # Union of all features in a fixed, deterministic order.
 ALL_FEATURES: List[str] = TEMPORAL_FEATURES + LAG_FEATURES + PCA_FEATURES
-assert len(ALL_FEATURES) == 36, f"Expected 36 features, got {len(ALL_FEATURES)}"
+# Feature count is dynamic (depends on per-fold PCA n_components)
 
 # ── Pre-training thresholds ──────────────────────────────────────────
 _MAX_NAN_FRAC = 0.50  # drop column if >50 % NaN in training set
@@ -123,7 +124,7 @@ _MAX_NAN_FRAC = 0.50  # drop column if >50 % NaN in training set
 # ── ROCV defaults ────────────────────────────────────────────────────
 ROCV_START = "2012-01-01"
 MIN_TRAIN_YEARS = 2       # minimum history before any fold
-FOLD_STEP_YEARS = 1       # origin advances by 1 year per fold
+FOLD_STEP_MONTHS = 13  # 13-month step cycles through calendar months
 HORIZONS_DAYS = list(range(60, 181, 15))  # [60, 75, 90, … , 180]
 
 
@@ -224,7 +225,7 @@ def apply_horizon_shift(
 def rocv_folds_merged(
     df: pd.DataFrame,
     horizons_days: List[int],
-    fold_step: int = FOLD_STEP_YEARS,
+    fold_step: int = FOLD_STEP_MONTHS,
 ):
     """Generate expanding-window ROCV folds with validation merged
     into training.
@@ -257,7 +258,7 @@ def rocv_folds_merged(
     fold_idx = 0
     while test_origin + max_horizon_td <= data_end:
         yield fold_idx, test_origin
-        test_origin += pd.DateOffset(years=fold_step)
+        test_origin += pd.DateOffset(months=fold_step)
         fold_idx += 1
 
 
@@ -354,16 +355,26 @@ def run_mlr_fold(
         len(feature_cols), len(train_df), len(test_df),
     )
 
+    # ── 4b. Per-fold PCA (fitted on training data only) ───────────
+    pca_cols, train_df, _, test_df = fit_fold_pca(train_df, None, test_df)
+    if pca_cols:
+        usable_cols = usable_cols + pca_cols
+        logger.info("Added %d per-fold PCA cols. Total features: %d.", len(pca_cols), len(usable_cols))
+
     # ── 5. Fit ───────────────────────────────────────────────────────
     X_train = train_df[feature_cols].values
     y_train = train_df[TARGET].values
 
     model = LinearRegression()
+    t_train_start = time.time()
     model.fit(X_train, y_train)
+    train_time_s = time.time() - t_train_start
 
     # ── 6. Predict ───────────────────────────────────────────────────
     X_test = test_df[feature_cols].values
+    t_infer_start = time.time()
     y_pred = model.predict(X_test)
+    infer_time_s = time.time() - t_infer_start
     y_true = test_df[TARGET].values
 
     # ── 7. Evaluate ──────────────────────────────────────────────────
@@ -380,6 +391,8 @@ def run_mlr_fold(
         "timestamps": test_timestamps,
         "n_train": len(train_df),
         "n_test": len(test_df),
+        "train_time_s": round(train_time_s, 2),
+        "infer_time_s": round(infer_time_s, 2),
         "metrics": metrics,
         "model": model,
         "n_features": len(feature_cols),
@@ -412,8 +425,8 @@ def main():
         help="Quick test: single fold, single horizon.",
     )
     parser.add_argument(
-        "--fold-step", type=int, default=FOLD_STEP_YEARS,
-        help=f"Override fold_step_years (default: {FOLD_STEP_YEARS}).",
+        "--fold-step", type=int, default=FOLD_STEP_MONTHS,
+        help=f"Override fold_step_months (default: {FOLD_STEP_MONTHS}).",
     )
     args = parser.parse_args()
 
@@ -438,7 +451,7 @@ def main():
         horizons = [horizons[0]]
 
     logger.info("Horizons: %s days", horizons)
-    logger.info("Fold step: %d year(s)", args.fold_step)
+    logger.info("Fold step: %d month(s)", args.fold_step)
     logger.info(
         "Features: %d total  (%d temporal + %d lag + %d PCA)",
         len(ALL_FEATURES), len(TEMPORAL_FEATURES),
@@ -480,6 +493,9 @@ def main():
                     "horizon_hours": h_days * 24,
                     "n_train": fold_result.get("n_train", 0),
                     "n_test": fold_result.get("n_test", 0),
+                    "train_time_s": fold_result.get("train_time_s", 0.0),
+                    "infer_time_s": fold_result.get("infer_time_s", 0.0),
+                    "seed": "N/A",
                     **metrics.to_dict(),
                     "n_features": fold_result.get("n_features", 0),
                     "elapsed_s": round(fold_elapsed, 1),
@@ -538,7 +554,7 @@ def main():
         "rocv": {
             "start_date": ROCV_START,
             "min_train_years": MIN_TRAIN_YEARS,
-            "fold_step_years": args.fold_step,
+            "fold_step_months": args.fold_step,
             "horizons_days": horizons,
             "validation_merged_into_training": True,
         },
