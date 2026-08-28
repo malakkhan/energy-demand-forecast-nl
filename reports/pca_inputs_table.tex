@@ -1,0 +1,70 @@
+\section{PCA Input Features}
+\label{sec:apx:second_appendix}
+
+\begin{table}[htbp]
+\centering
+\caption{Complete enumeration of the 66 exogenous features (9 KNMI validated meteorological $+$ 57 CBS socioeconomic) input to the per-fold PCA. Candidate columns comprise all 79 raw KNMI/CBS covariates; within each ROCV fold, columns exceeding 50\% missingness over that fold's training window are excluded, which retains the same 66 columns in every fold for all models except MLR: because MLR merges the validation year into its training window, its window extends one year further, and in its latest folds 9 of the 13 tariff columns clear the coverage threshold and enter its PCA (75 columns). PCA is refitted per fold on standardized complete training rows only and applied unchanged to the validation and test splits; the number of retained components is the minimum reaching ${\geq}95$\% cumulative explained variance, ranging from 7 (earliest, shortest training windows) to 16 (latest folds). Sub-annual CBS sources (quarterly, semi-annual) are forward-filled to monthly granularity before joining the
+hourly spine; annual population is forward-filled across 12 months. \texttt{knmi\_val\_station\_count} serves as a data-quality proxy (${\sim}61$ reporting stations, occasionally fewer during outages). The 13 CBS tariff columns first reported in 2018 are thus excluded by the missingness filter throughout, except for the MLR case noted above. Residual row-level missingness is handled without imputation at the PCA level: the scaler and components are fitted on complete training rows only, and only rows with all retained covariates present are projected; the few remaining rows receive the components of the most recent projectable row via causal forward-filling within their split.}
+
+\label{tab:pca_inputs}
+\footnotesize
+\begin{tabularx}{\columnwidth}{r l X l}
+\toprule
+\textbf{\#} & \textbf{Column} & \textbf{Description} & \textbf{Freq.} \\
+\midrule
+\multicolumn{4}{l}{\textit{KNMI Validated Meteorological (9) --- station-averaged national means}} \\
+\addlinespace[2pt]
+1  & \texttt{knmi\_val\_temp\_c}             & Air temperature at 1.5\,m (\textdegree C) & Hourly \\
+2  & \texttt{knmi\_val\_dewpoint\_c}          & Dew point temperature (\textdegree C) & Hourly \\
+3  & \texttt{knmi\_val\_wind\_speed\_ms}       & 10-min mean wind speed (m/s) & Hourly \\
+4  & \texttt{knmi\_val\_wind\_speed\_hourly\_ms} & Hourly mean wind speed (m/s) & Hourly \\
+5  & \texttt{knmi\_val\_wind\_gust\_ms}        & Maximum wind gust (m/s) & Hourly \\
+6  & \texttt{knmi\_val\_solar\_rad\_jcm2}      & Global solar radiation (J/cm$^2$) & Hourly \\
+7  & \texttt{knmi\_val\_sunshine\_h}           & Sunshine duration (h) & Hourly \\
+8  & \texttt{knmi\_val\_humidity\_pct}         & Relative humidity (\%) & Hourly \\
+9  & \texttt{knmi\_val\_station\_count}        & Number of reporting stations & Hourly \\
+\midrule
+\multicolumn{4}{l}{\textit{CBS Consumer Price Index (3) --- 2015\,=\,100}} \\
+\addlinespace[2pt]
+10 & \texttt{cbs\_cpi\_energy}       & CPI: energy basket (gas + electricity) & Monthly \\
+11 & \texttt{cbs\_cpi\_electricity}  & CPI: electricity component & Monthly \\
+12 & \texttt{cbs\_cpi\_gas}          & CPI: gas component & Monthly \\
+\midrule
+\multicolumn{4}{l}{\textit{CBS GDP / National Accounts (36) --- volume growth rates (\%)}} \\
+\addlinespace[2pt]
+13--14 & \texttt{cbs\_gdp\_yy / \_qq}          & Gross Domestic Product (YoY / QoQ) & Quarterly \\
+15--16 & \texttt{cbs\_gdp\_wda\_yy / ...}       & GDP, working-day adjusted (YoY) & Quarterly \\
+17--18 & \texttt{cbs\_disposable\_total\_yy/\_qq} & Disposable for final expenditure & Quarterly \\
+19--20 & \texttt{cbs\_final\_exp\_total\_yy/\_qq} & Total final expenditure & Quarterly \\
+21--22 & \texttt{cbs\_natl\_final\_exp\_yy/\_qq}  & National final expenditure & Quarterly \\
+23--24 & \texttt{cbs\_consumption\_total\_yy/\_qq} & Total final consumption & Quarterly \\
+25--26 & \texttt{cbs\_consumption\_hh\_yy/\_qq}  & Household consumption (incl.\ NPISHs) & Quarterly \\
+27--28 & \texttt{cbs\_consumption\_gov\_yy/\_qq} & Government consumption & Quarterly \\
+29--30 & \texttt{cbs\_capform\_total\_yy/\_qq}   & Gross fixed capital formation (total) & Quarterly \\
+31--32 & \texttt{cbs\_capform\_enterprise\_yy/\_qq} & Capital formation (enterprises + HH) & Quarterly \\
+33--34 & \texttt{cbs\_capform\_gov\_yy/\_qq}     & Capital formation (government) & Quarterly \\
+35--36 & \texttt{cbs\_inventories\_yy/\_qq}      & Changes in inventories incl.\ valuables & Quarterly \\
+37--38 & \texttt{cbs\_exports\_total\_yy/\_qq}   & Total exports of goods \& services & Quarterly \\
+39--40 & \texttt{cbs\_exports\_goods\_yy/\_qq}   & Exports of goods & Quarterly \\
+41--42 & \texttt{cbs\_exports\_services\_yy/\_qq} & Exports of services & Quarterly \\
+43--44 & \texttt{cbs\_imports\_total\_yy/\_qq}   & Total imports of goods \& services & Quarterly \\
+45--46 & \texttt{cbs\_imports\_goods\_yy/\_qq}   & Imports of goods & Quarterly \\
+47--48 & \texttt{cbs\_imports\_services\_yy/\_qq} & Imports of services & Quarterly \\
+\midrule
+\multicolumn{4}{l}{\textit{CBS Gas \& Electricity Prices (18) --- EUR per unit, incl.\ VAT}} \\
+\addlinespace[2pt]
+49--51 & \texttt{cbs\_gep\_gas\_hh\_\{total,supply,network\}}     & Gas, household band & Semi-ann. \\
+52--54 & \texttt{cbs\_gep\_gas\_nnh\_med\_\{...\}}  & Gas, non-household medium & Semi-ann. \\
+55--57 & \texttt{cbs\_gep\_gas\_nnh\_lrg\_\{...\}}  & Gas, non-household large & Semi-ann. \\
+58--60 & \texttt{cbs\_gep\_elec\_hh\_\{...\}}      & Electricity, household band & Semi-ann. \\
+61--63 & \texttt{cbs\_gep\_elec\_nnh\_med\_\{...\}} & Electricity, non-household medium & Semi-ann. \\
+64--66 & \texttt{cbs\_gep\_elec\_nnh\_lrg\_\{...\}} & Electricity, non-household large & Semi-ann. \\
+\midrule
+\multicolumn{4}{l}{\textit{CBS Population (1)}} \\
+\addlinespace[2pt]
+67 & \texttt{cbs\_population\_million} & National population ($\times 10^6$) & Annual \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\clearpage

@@ -165,17 +165,48 @@ def run_search(
     logger.info("Fold %d: train=%d, val=%d, test=%d.",
                 fold_idx, len(train_df), len(val_df), len(test_df))
 
-    # NTL store (only for spatial variants)
+    # NTL store (only for spatial variants). Preload into RAM once up front
+    # — otherwise every batch of every epoch of every trial hits GPFS I/O
+    # for image reads, which historically made Full/Early search trials
+    # take hours instead of minutes (run_rocv.py already does this).
     ntl_store = None
     if variant_enum in (CMATVariant.EARLY_FUSION, CMATVariant.FULL):
         from .ntl_images import NTLImageStore
         ntl_store = NTLImageStore()
+        logger.info("Preloading NTL images into RAM...")
+        ntl_store.preload_all()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ── Duplicate-config bookkeeping ──
+    # Maps a canonical key of trial.params → the recorded objective value
+    # for COMPLETE trials, or None for failed/pruned attempts. Populated
+    # from the crash-safe trial-history JSONL below (so restarts remember
+    # everything previous runs already paid for) and extended live via the
+    # after-trial callback.
+    def _param_key(params: dict) -> tuple:
+        return tuple(sorted((k, repr(v)) for k, v in params.items()))
+
+    known_configs: dict = {}
 
     def objective(trial: optuna.Trial) -> float:
         cfg = _build_config_from_trial(trial, variant_enum, horizon_days,
                                        min_context_window=min_context_window)
+
+        # Never re-train a config we've already tried (this run or any
+        # previous one). Completed duplicates return their cached value
+        # (costs nothing, still informs the sampler); failed/pruned
+        # duplicates are pruned again — retrying an OOM'd config would
+        # just OOM again and waste budget.
+        key = _param_key(trial.params)
+        if key in known_configs:
+            cached = known_configs[key]
+            if cached is not None:
+                logger.info("Trial %d duplicates an already-completed config "
+                            "— returning cached value %.6f (no training).",
+                            trial.number, cached)
+                return cached
+            raise optuna.TrialPruned("Duplicate of a previously failed/pruned config")
 
         try:
             result = train_one_fold(
@@ -242,8 +273,101 @@ def run_search(
         logger.info("[%s] Best config saved → %s (trial %d, val=%.6f)",
                     label, out_json, best_trial.number, best_trial.value)
 
+    history_path = output_path / f"trial_history_{variant}_h{horizon_days}d.jsonl"
+
+    # ── Backfill from trial history (never repeat a paid-for config) ──
+    # Previous runs (including ones killed by walltime/OOM) logged every
+    # trial to the JSONL above. Re-inject COMPLETE trials into the fresh
+    # study so the TPE sampler starts warm instead of from scratch, and
+    # register every previously seen params-set (complete or failed) in
+    # known_configs so the objective never re-trains one.
+    def _backfill_from_history():
+        if not history_path.exists():
+            return
+        from optuna.distributions import CategoricalDistribution, FloatDistribution
+        from optuna.trial import TrialState, create_trial
+
+        lr_lo, lr_hi = SEARCH_SPACE["learning_rate"]
+        wd_lo, wd_hi = SEARCH_SPACE["weight_decay"]
+
+        def _dist_for(name):
+            if name == "learning_rate":
+                return FloatDistribution(lr_lo, lr_hi, log=True)
+            if name == "weight_decay":
+                return FloatDistribution(wd_lo, wd_hi, log=True)
+            return CategoricalDistribution(SEARCH_SPACE[name])
+
+        n_added = n_failed = 0
+        with open(history_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                params = rec.get("params") or {}
+                if not params:
+                    continue
+                key = _param_key(params)
+                if key in known_configs:
+                    continue
+                value = rec.get("value")
+                if rec.get("state") == "COMPLETE" and value is not None:
+                    try:
+                        study.add_trial(create_trial(
+                            params=params,
+                            distributions={k: _dist_for(k) for k in params},
+                            value=float(value),
+                            state=TrialState.COMPLETE,
+                        ))
+                        known_configs[key] = float(value)
+                        n_added += 1
+                    except Exception as exc:
+                        logger.warning("Could not backfill a trial from history: %s", exc)
+                else:
+                    known_configs[key] = None
+                    n_failed += 1
+        if n_added or n_failed:
+            logger.info(
+                "Backfilled %d completed trials from history (+%d known "
+                "failed/pruned configs blocked from retry).",
+                n_added, n_failed,
+            )
+            _save_current_best(study, label="backfill")
+
+    _backfill_from_history()
+
+    def _log_trial_history(trial):
+        """Append this trial (accepted or rejected) to a crash-safe JSONL
+        log, so the full search history survives even if the job is
+        killed mid-run — not just the current best config."""
+        record = {
+            "trial_number": trial.number,
+            "state": trial.state.name,
+            "value": trial.value,
+            "params": trial.params,
+            "user_attrs": trial.user_attrs,
+        }
+        try:
+            with open(history_path, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to append trial %d to history: %s", trial.number, exc)
+
     def _after_trial_callback(study, trial):
-        """Optuna callback: persist best config after every finished trial."""
+        """Optuna callback: log every trial (tested/rejected included), and
+        persist the current best config after every finished trial."""
+        _log_trial_history(trial)
+        # Register this config so later trials in this run can't repeat it
+        key = _param_key(trial.params)
+        if key not in known_configs:
+            known_configs[key] = (
+                float(trial.value)
+                if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
+                else None
+            )
         if trial.state == optuna.trial.TrialState.COMPLETE:
             n_complete = len([t for t in study.trials
                              if t.state == optuna.trial.TrialState.COMPLETE])

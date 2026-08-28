@@ -1,0 +1,54 @@
+{
+  "script": "train_prophet_lstm_v2.py",
+  "started": "2026-08-25T18:52:14.451184",
+  "model": "van_de_sande_prophet_lstm",
+  "device": "cpu",
+  "features": [
+    "day_of_year",
+    "week_of_year",
+    "quarter",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "year",
+    "is_public_holiday",
+    "is_school_holiday",
+    "load_lag_12h",
+    "load_lag_24h",
+    "load_lag_1w",
+    "load_lag_1y",
+    "solar_rad_lag_10h",
+    "humidity_lag_12h",
+    "temp_lag_107h"
+  ],
+  "n_base_features": 19,
+  "prophet_components": [
+    "yhat",
+    "trend",
+    "daily",
+    "weekly",
+    "yearly"
+  ],
+  "n_lstm_features": 24,
+  "rocv": {
+    "start_date": "2012-01-01",
+    "min_train_years": 2,
+    "fold_step_months": 13,
+    "horizons_days": [
+      60
+    ],
+    "validation_holdout": "1 year"
+  },
+  "lstm": {
+    "lstm1_units": 30,
+    "lstm2_units": 90,
+    "epochs": 50,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "early_stop_patience": 3
+  },
+  "total_elapsed_s": 1572.5
+}

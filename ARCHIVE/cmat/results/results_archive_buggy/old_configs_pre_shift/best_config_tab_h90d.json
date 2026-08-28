@@ -1,0 +1,23 @@
+{
+  "context_window_hours": 168,
+  "embed_dim": 256,
+  "self_attn_heads": 4,
+  "cross_attn_heads": 4,
+  "transformer_depth": 2,
+  "ntl_patch_size": 8,
+  "image_mask_ratio": 0.9,
+  "dropout": 0.2,
+  "batch_size": 64,
+  "learning_rate": 0.0007293326375597061,
+  "weight_decay": 3.209914396210174e-05,
+  "variant": "tab",
+  "horizon_days": 90,
+  "best_val_loss": 0.0074464095118283126,
+  "best_trial_number": 25,
+  "test_rmse": 485.69324302747003,
+  "test_mae": 399.4370975111383,
+  "test_mape": 2.99472593258515,
+  "test_pcc": 0.983065750020503,
+  "test_n_params": 1637288,
+  "test_n_epochs": 13
+}

@@ -10,8 +10,8 @@ Handles:
   - Crash-safe result persistence with file locking
 """
 
-import fcntl
 import logging
+import os
 import random
 import math
 import sys
@@ -282,7 +282,7 @@ class CMATDataset(Dataset):
 def train_epoch(
     model: CMAT,
     loader: DataLoader,
-    criterion: PinballLoss,
+    criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     scaler: torch.amp.GradScaler = None,
@@ -329,7 +329,7 @@ def train_epoch(
 def evaluate(
     model: CMAT,
     loader: DataLoader,
-    criterion: PinballLoss,
+    criterion: nn.Module,
     device: torch.device,
     use_amp: bool = False,
 ) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -569,10 +569,27 @@ def train_one_fold(
         logger.warning("Test dataset has 0 samples — skipping fold.")
         return None
 
-    # Data loaders — use more workers and prefetching for GPU throughput
+    # Data loaders — use more workers and prefetching for GPU throughput.
+    #
+    # Exception: for spatial variants (ntl_store is not None), force
+    # num_workers=0. CMATDataset reads from ntl_store's preloaded ~15.5GB
+    # image array. Storing it as one contiguous array instead of a
+    # Dict[date, np.ndarray] (see ntl_images.py) avoids the classic
+    # per-element refcount copy-on-write leak, but empirically that alone
+    # is not enough: forking num_workers processes against an already
+    # ~15.5GB-resident process gets accounted against SLURM's cgroup
+    # memory limit at spawn time and OOM-kills the job within minutes,
+    # before training even starts (confirmed 2026-08-26 — killed right at
+    # first-batch worker spawn, not a gradual leak). num_workers=0 avoids
+    # forking entirely. Tab/NTL variants (no ntl_store) are unaffected and
+    # keep full worker parallelism.
     is_cuda = device.type == "cuda"
-    num_workers = min(8, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
-    # If NTL images are preloaded into RAM, workers just do numpy slicing (fast)
+    if ntl_store is not None:
+        # Override via CMAT_SPATIAL_NUM_WORKERS for controlled experiments
+        # (default 0 — the only setting confirmed safe so far).
+        num_workers = int(os.environ.get("CMAT_SPATIAL_NUM_WORKERS", "0"))
+    else:
+        num_workers = min(8, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
     loader_kwargs = dict(
         pin_memory=is_cuda,
         persistent_workers=(num_workers > 0),
@@ -589,15 +606,18 @@ def train_one_fold(
         pin_memory=is_cuda,
         persistent_workers=(val_workers > 0),
     )
+    test_workers = 0 if ntl_store is not None else 8
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=8,
+        num_workers=test_workers,
         pin_memory=is_cuda,
-        persistent_workers=(8 > 0),
+        persistent_workers=(test_workers > 0),
     )
 
     # Build model (H_pred=1: single-step prediction)
-    model = CMAT(cfg).to(device)
+    # n_cont must match cont_cols exactly (base features + this fold's
+    # per-fold PCA components, whose count varies fold-to-fold).
+    model = CMAT(cfg, n_cont=len(cont_cols)).to(device)
     # Initialise decoder's W_H for (W, 1)
     model.decoder.set_horizon(cfg.context_window_hours, 1)
     model.decoder._W_H = model.decoder._W_H.to(device)
@@ -679,7 +699,7 @@ def train_one_fold(
         model = model.to(device)
 
     # Save checkpoint for post-hoc analysis (permutation importance, etc.)
-    ckpt_dir = Path(C.OUTPUT_DIR) / "checkpoints"
+    ckpt_dir = Path(C.CHECKPOINT_DIR)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     seed = cfg.seed
     ckpt_path = ckpt_dir / f"ckpt_{cfg.variant.value}_h{horizon_hours // 24}d_f{fold_idx}_s{seed}.pt"
@@ -699,6 +719,11 @@ def train_one_fold(
     }, ckpt_path)
     logger.info("Saved checkpoint → %s", ckpt_path)
 
+    # Inverse Min-Max normalisation: x_original = x_norm * (max - min) + min
+    target_range = target_max - target_min
+    if target_range < 1e-8:
+        target_range = 1.0
+
     # Evaluate on validation set (for Optuna objective — no test leakage)
     val_loss_final, val_preds_norm, val_targets_norm = evaluate(
         model, val_loader, criterion, device
@@ -712,14 +737,11 @@ def train_one_fold(
     )
 
     # Evaluate on test set
+    t0_infer = time.time()
     test_loss, preds_norm, targets_norm = evaluate(
         model, test_loader, criterion, device
     )
-
-    # Inverse Min-Max normalisation: x_original = x_norm * (max - min) + min
-    target_range = target_max - target_min
-    if target_range < 1e-8:
-        target_range = 1.0
+    infer_time = time.time() - t0_infer
     preds_mw = preds_norm * target_range + target_min
     targets_mw = targets_norm * target_range + target_min
 
@@ -737,8 +759,12 @@ def train_one_fold(
         "targets_mw": targets_mw,
         "best_val_loss": best_val_loss,
         "train_time_s": train_time,
+        "infer_time_s": infer_time,
         "n_params": n_params,
         "n_epochs": epoch,
+        "n_train": len(train_ds),
+        "n_val": len(val_ds),
+        "n_test": len(test_ds),
     }
 
 
@@ -752,30 +778,25 @@ def save_fold_result_locked(
     output_dir: Path,
     model_name: str,
 ) -> None:
-    """Append a fold result with file-locking for parallel-job safety."""
-    csv_path = output_dir / f"rocv_results_{model_name}.csv"
-    lock_path = output_dir / f".lock_{model_name}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Append a fold result to this task's own shard file.
 
-    with open(lock_path, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            if csv_path.exists():
-                disk_rows = pd.read_csv(csv_path).to_dict("records")
-            else:
-                disk_rows = []
-            disk_rows.append(result_row)
-            # Deduplicate by (model, fold, horizon_days)
-            seen: Dict[tuple, Dict] = {}
-            for row in disk_rows:
-                key = (row["model"], int(row["fold"]), int(row["horizon_days"]),
-                       int(row.get("seed", 42)))
-                seen[key] = row
-            deduped = list(seen.values())
-            pd.DataFrame(deduped).to_csv(csv_path, index=False)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    Each (model, horizon, seed) combination owns an exclusive shard file
+    under ``_shards/``, so concurrent SLURM array tasks (possibly on
+    different nodes) never contend for the same path. This avoids
+    relying on fcntl.flock() for cross-node mutual exclusion, which is
+    not reliably honoured on this GPFS-mounted scratch filesystem and
+    previously caused silent data loss when multiple baseline tasks
+    wrote a shared CSV concurrently. Shards are combined into the final
+    rocv_results_{model_name}.csv via baselines/merge_shards.py.
+    """
     results_list.append(result_row)
+
+    shard_dir = output_dir / "_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    h = int(result_row["horizon_days"])
+    seed = int(result_row.get("seed", 42))
+    shard_path = shard_dir / f"{model_name}_h{h}_s{seed}.csv"
+    pd.DataFrame(results_list).to_csv(shard_path, index=False)
 
 
 def is_fold_done(
@@ -785,15 +806,13 @@ def is_fold_done(
     horizon_days: int,
     seed: int = None,
 ) -> bool:
-    """Check if a fold/horizon combo has already been completed."""
-    csv_path = output_dir / f"rocv_results_{model_name}.csv"
-    if not csv_path.exists():
+    """Check if a fold/horizon/seed combo has already been completed,
+    by looking at this (model, horizon, seed)'s own shard file."""
+    shard_path = output_dir / "_shards" / f"{model_name}_h{horizon_days}_s{seed if seed is not None else 42}.csv"
+    if not shard_path.exists():
         return False
     try:
-        df = pd.read_csv(csv_path)
-        match = df[(df["fold"] == fold_idx) & (df["horizon_days"] == horizon_days)]
-        if "seed" in df.columns and seed is not None:
-            match = match[match["seed"] == seed]
-        return len(match) > 0
+        df = pd.read_csv(shard_path)
+        return len(df[df["fold"] == fold_idx]) > 0
     except Exception:
         return False

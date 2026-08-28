@@ -1,0 +1,17 @@
+{
+  "context_window_hours": 168,
+  "embed_dim": 64,
+  "self_attn_heads": 2,
+  "transformer_depth": 2,
+  "dropout": 0.2,
+  "batch_size": 32,
+  "cross_attn_heads": 8,
+  "ntl_patch_size": 32,
+  "image_mask_ratio": 0.25,
+  "learning_rate": 0.0009895016116901194,
+  "weight_decay": 2.7287886172565828e-05,
+  "variant": "full",
+  "horizon_days": 120,
+  "best_val_loss": 0.002917033422712153,
+  "best_trial_number": 11
+}

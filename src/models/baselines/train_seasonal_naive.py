@@ -121,9 +121,7 @@ def run_seasonal_naive_fold(
     ts_lookup = df.set_index("timestamp")[TARGET]
 
     y_true = test_df[TARGET].values
-    y_pred = np.full_like(y_true,
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2), np.nan, dtype=np.float64)
+    y_pred = np.full_like(y_true, np.nan, dtype=np.float64)
 
     for i, ts in enumerate(test_df["timestamp"].values):
         ts = pd.Timestamp(ts)
@@ -148,9 +146,7 @@ def run_seasonal_naive_fold(
                        n_valid, test_origin, horizon_days)
         return {"n_test": n_valid}
 
-    metrics = compute_metrics(y_true[valid],
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2), y_pred[valid])
+    metrics = compute_metrics(y_true[valid], y_pred[valid])
     infer_time_s = time.time() - t0
     elapsed = infer_time_s
     train_time_s = 0.0
@@ -235,9 +231,8 @@ def main():
                     "n_val": 0,
                     "train_time_s": result.get("train_time_s", 0.0),
                     "infer_time_s": result.get("infer_time_s", 0.0),
+                    "n_train": result.get("n_train", 0),
                     "seed": "N/A",
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2),
                     **m.to_dict(),
                 }
 
@@ -253,7 +248,7 @@ def main():
 
     out_path = os.path.join(args.results_dir, "seasonal_naive_rocv.json")
     with open(out_path, "w") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(meta, f, indent=2, default=str)
     logger.info("Results saved to %s", out_path)
 
     # Print summary table

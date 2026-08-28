@@ -1,0 +1,394 @@
+% =============================================================================
+% Methodology Section 
+% Required packages (ensure these are in your preamble):
+% \usepackage{booktabs, graphicx, amsmath, amssymb, multirow, caption, subcaption, tikz}
+% \usetikzlibrary{shapes, arrows, positioning, fit, backgrounds}
+% =============================================================================
+
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Problem Framing}
+\label{subsec:problem_framing}
+
+\paragraph{Target Variable}
+The target variable for this study is the mean pan-national electrical grid load over hourly intervals for the Netherlands, measured in megawatts (MW). In analyses presented in the ENTSO-E's seasonal outlook \cite{nseasonal} and midterm adequacy forecasts \cite{midterm_adequacy}, we note that forecasts at varying time granularities are used. Hour-level forecasts provide useful information in order to establish daily operational rhythms \cite{midterm_adequacy, nseasonal}. The target data is sourced from the ENTSO-E statistical reports of aggregated hourly load by country \cite{entsoe_power_stats}. As noted by ENTSO-E, "starting from 2019, Power Statistics data is published based on aggregations of Transparency Platform data." Based on a review of the ENTSO-E Transparency Platform and its Manual of Procedures \cite{entsoe_mop}, it is critical to acknowledge that the reported "Total Load" does not perfectly equate to the actual, metered electricity consumption of end-users (i.e., households and businesses). Instead, it represents the "System Load": a top-down calculation of the total electrical energy the transmission and distribution networks must physically deliver to satisfy demand and keep the grid balanced at 50Hz. Because electricity supply must perfectly match demand at all times, TSOs calculate load by taking the total energy injected into the grid and subtracting what left the grid for reasons other than end-use \cite{entsoe_mop}. Therefore, while the reported measures serve as relevant proxies for the \textbf{real energy demand}  of end-users and are undeniably a vital measure for national TSOs and ENTSO-E \cite{entsoe_mop}, they should \textbf{not} be treated as the absolute measure of real energy demand. The references to energy demand forecasting literature in this paper are thus noted as highly relevant but not precisely analogous to this study!
+
+\paragraph{Forecasting Horizons}
+The study focuses on generating direct multi-step forecasts for medium-term operational capacity planning, specifically evaluating horizons ($H_{pred}$) of 60 days, 120 days and 180 days; the model shall output point predictions at the given horizon based solely on trained weights and input context vectors (without using its own predictions as inputs for further predictions). This strategic horizon directly aligns with the lead-time experimental framework of \cite{van_de_sande_enhancing_2024}, lending credence to comparative benchmarking. The relevance of medium-horizon forecasts for operational planning has already been noted through the analysis of ENTSO-E and TenneT procedures. Prior research in the Dutch context further recommends the exploration of horizons up to 180 days \cite{van_de_sande_enhancing_2024}.
+
+
+\paragraph{Predictor Variable Availability and Look-ahead Bias}
+A rigorous forecasting protocol is enforced to prevent look-ahead bias, with predictor availability governed by the epistemic status of each feature group. All autoregressive and cross-correlation lag features are strictly historical: they are horizon-shifted so that, for every prediction, they reflect only observations recorded at or before the forecast origin. Deterministic calendar features (hour, weekday, month, and holiday indicators) are known exactly for any future target date and require no such restriction. The PCA-compressed exogenous covariates (meteorological and macroeconomic), by contrast, are treated as \textit{known at the target date}. Although prior national studies assumed these factors to be unknown at prediction time \cite{ashtar_hybrid_2025,van_de_sande_enhancing_2024}, numerous operational means of predicting them exist --- numerical weather prediction products and seasonal meteorological outlooks for the KNMI variables, and official projections for the slow-moving CBS indicators, whose quarterly values change little over the studied horizons. For the purposes of this study we assume \textit{perfect prediction} of these covariates, leaving it open to future operational or academic research to quantify how performance degrades under imperfect covariate forecasts. We note, moreover, that conditioning on stale weather observations from months before the target date carries little operational relevance: in practice, weather forecasts for the target period are routinely available to grid operators, making the known-covariate convention the more operationally realistic framing for this feature group.
+
+\subsection{Data Sources and Granularity}
+\label{subsec:data_sources}
+
+The modeling dataset integrates five heterogeneous data streams spanning 14 years (January 2012 to December 2025). Aligning these streams requires mapping varying native frequencies (hourly, daily, monthly, quarterly) onto a contiguous hourly UTC timeline.
+
+
+\begin{table}[htbp]
+    \centering
+    \scriptsize
+    \setlength{\tabcolsep}{2pt}
+    \caption{Comprehensive overview of data streams.}
+    \label{tab:data_sources_full}
+    \begin{tabularx}{\columnwidth}{@{} >{\raggedright\arraybackslash}X l >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X l r @{}}
+        \toprule
+        \textbf{Data Stream} & \textbf{Source} & \textbf{Native Granularity} & \textbf{Spatial Resolution} & \textbf{Time Span} & \textbf{Coverage} \\
+        \midrule
+        \textbf{Electricity Load} & ENTSO-E & Hourly & NL Bidding Zone & 2006--2025 & 100.0\% \\
+        \textbf{Weather (Validated)} & KNMI & Hourly & $\sim$61 Stations (Mean) & 2012--2025 & 100.0\% \\
+        \textbf{Satellite NTL (A2-all)} & NASA (VNP46A2) & Daily & $\sim$500m (2D Spatial Array) & 2012--2025 & 97.5\% \\
+        \textbf{Macroeconomic Data} & CBS & Monthly / Quarterly & National (NL) & 1996--2025 & 100.0\% \\
+        \textbf{Holiday Calendars} & \texttt{holidays} lib.\ / OpenHolidays & Daily (flags) & National (NL) & 2012--2025 & 100.0\% \\
+        \bottomrule
+        \multicolumn{6}{@{}p{\columnwidth}@{}}{\vspace{1pt}}
+    \end{tabularx}
+\end{table}
+
+% =============================================================================
+% REVISED: Data Processing Pipeline + Feature Engineering → Predictor Set
+% =============================================================================
+
+\subsection{Data Processing Pipeline}
+\label{subsec:data_processing}
+
+Data ingestion and standardization are executed via a highly parallelized, Extract-Transform-Load (ETL) pipeline utilizing Apache Spark and Python, deployed on the SURF Snellius supercomputer. This pipeline runs in three broad phases:
+
+\begin{enumerate}
+    \item \textbf{Phase 1 (Extraction \& Spatial Masking):} Raw heterogeneous files are parsed into standardized Parquet formats. A fast WGS84 bounding-box crop reduces the global MODIS sinusoidal tile (h18v03) of the VIIRS NTL data \cite{nasa_viirs_vnp46a2}. A precise vectorized point-in-polygon test utilizing the Shapely library and the GADM 4.1 Netherlands Level 0 boundary then masks the grid \cite{gadm2024}, ensuring exactly 285,719 pixels are retained per daily array, restricting observations strictly to Dutch land territory and islands. KNMI hourly NetCDF4 files are extracted to Parquet and station-averaged. CBS data is extracted from CSVs and Excels to Parquet.
+    \item \textbf{Phase 2 (Aggregation):} Aggregates are calculated upon VIIRS arrays, to create daily national summary scalars (radiance mean and sum). A \textit{10\% minimum coverage filter} was applied to prevent spatial selection bias caused by localized heavy cloud cover in these 1D scalars.  Features such as binary flags, cyclical time encodings, and lag features are computed.
+    \item \textbf{Phase 3 (Merging):} All processed tabular data streams are combined onto the continuous hourly UTC spine (2012-01-01 00:00 to 2025-12-31 23:00) using broadcast left-joins. Lower-frequency tabular signals and pointers to the daily 2D image states are propagated across the hourly spine using \textbf{strict forward-filling} to prevent data leakage.
+\end{enumerate}
+
+
+% =============================================================================
+\subsection{Exploratory Data Analysis and Feature Engineering}
+\label{subsec:eda_feature_engineering}
+% =============================================================================
+
+A comprehensive batch-mode EDA on the full 14-year hourly dataset (122,723 observations) allowed us to understand the nature of the given data, and informed our choices regarding predictor selection, missing-value treatment, and dimensionality reduction. The outcome is a curated set of \textbf{19 tabular predictor variables} as well as \textbf{79 candidate CBS/KNMI features} shared across all baseline models and the tabular branch of the proposed multimodal architecture. These features are organized into three distinct groups: 12 temporal/calendar features, 7 lag features, and a variable number of PCA-compressed exogenous components.
+
+% ─────────────────────────────────────────────────────
+\subsubsection{Treatment of Missing Values and Look-ahead Bias}
+\label{subsubsec:missing_values}
+% ─────────────────────────────────────────────────────
+
+EDA reveals that missing data in this dataset heavily violate the Missing At Random (MAR) assumption. For example, NTL data is missing in known maintenance windows \cite{nasa_viirs_vnp46a2} and CBS data is missing in known windows where none was recorded \cite{cbs_statline}. Applying standard statistical imputation (e.g., MICE) would inject severe interpolation bias. Thus, missing values for exogenous features are handled via strict \textbf{forward-filling} from the most recent valid historical observation, within each training fold. Minor target-variable gaps (13 hours due to Daylight Saving Time) are linearly interpolated, also within each training fold.
+
+% ─────────────────────────────────────────────────────
+\subsubsection{NTL Product Selection}
+\label{subsubsec:ntl_clarification}
+% ─────────────────────────────────────────────────────
+
+To identify a reliable proxy for electric load, three VIIRS nighttime light (NTL) variants were evaluated: VNP46A1 (daily raw at-sensor top-of-atmosphere radiance), VNP46A2-selective (moonlight- and atmospheric-corrected radiance filtered strictly for high clear-sky quality), and VNP46A2-all (the corrected A2 product incorporating historically imputed, gap-filled pixels). While the strictly filtered A2-selective product suffered from severe survivorship bias—yielding zero valid summer observations due to persistent Dutch cloud cover—both raw A1 ($r = 0.121$) and imputed A2-all ($r = 0.112$) exhibited comparable positive correlations with load, rendering dual inclusion redundant. Consequently, \textbf{VNP46A2-all} was selected as the sole spatial input to leverage its atmospheric corrections and maintain continuous 97.5\% temporal coverage for the visual encoder.
+
+% ─────────────────────────────────────────────────────
+\subsubsection{Construction of the Predictor Set}
+\label{subsubsec:feature_set}
+% ─────────────────────────────────────────────────────
+
+All baseline models and the tabular encoder of the proposed architecture share an identical set of input features. These features are divided into three groups, each motivated by distinct EDA findings and deliberately engineered to avoid multicollinearity, data leakage, and information redundancy. Table~\ref{tab:36_features} provides a complete list.
+
+\paragraph{Group 1: Temporal and Calendar Features}
+\label{par:temporal_features}
+
+STL decomposition of the ENTSO-E load series over the full 2012-2025 period (Figure~\ref{fig:entsoe_stl}) confirmed that \textbf{58.0\% of total variance resides in the seasonal component}. Autocorrelation analysis (Figure~\ref{fig:entsoe_acf}) quantified massive seasonal correlation at 24 hours ($r = 0.842$) and 168 hours ($r = 0.924$), establishing the diurnal and weekly cycles as the dominant predictive signals.
+
+To maintain these seasonalities while reflecting the continuous nature of time, cyclical encodings using sine/cosine pairs are employed for hour-of-day , day-of-week , and month. Three additional linear temporal features are retained (\texttt{day\_of\_year}, \texttt{week\_of\_year}, and \texttt{quarter}) to capture seasonal position within the annual cycle. This approach has been validated in the energy prediction field by \cite{khazem2025cyclical}. The integer \texttt{year} variable captures secular trends, specifically the 31.7\% trend-variance component identified by STL.
+
+Two binary holiday indicators are introduced, both validated via one-sided Welch's $t$-tests ($H_1{:}\ \mu_{\text{flagged}} < \mu_{\text{unflagged}}$). Public holidays, computed algorithmically from Dutch legislation using the \texttt{holidays} Python library~\cite{holidays_python}, covering fixed dates (New Year, Christmas), Easter-dependent dates (Good Friday, Ascension, Whitsun), and moveable observances (King's Day, Liberation Day), suppress load by 12.1\% (mean 11,227 vs.\ 12,773~MW; $t = -57.31$, $p < 10^{-300}$). School holidays, sourced from the OpenHolidays API~\cite{openholidays_api} for 2020-2025 and extrapolated to 2012-2019 using stable ISO-week-of-year windows set by the Dutch Ministry of Education, exert a milder but still highly significant 2.5\% reduction (mean 12,524 vs.\ 12,840~MW; $t = -25.27$, $p = 1.04 \times 10^{-140}$).
+
+\paragraph{Group 2: Autoregressive and Cross-Correlation Lag Features}
+\label{par:lag_features}
+
+The strong autoregressive structure of the hourly system load, confirmed by ACF analysis, motivates four target lag variables: 12-hour ($r = 0.695$), 24-hour ($r = 0.842$), 1-week ($r = 0.924$), and 1-year ($r = 0.671$). These capture intra-day, diurnal, weekly, and annual seasonality without requiring the models to predict outcomes based on context windows alone, and thus making the feasible choice of said context windows for the model smaller and more computationally viable.
+
+Cross-correlation functions (CCF) with validated KNMI weather variables (Figure~\ref{fig:multi_ccf}) revealed phase-delayed effects between meteorological conditions and grid load. Three weather lags are thus selected at the following offsets:
+
+\begin{itemize}
+    \item \texttt{solar\_rad\_lag\_10h}: Solar radiation exhibits a delayed anti-correlation, peaking at a $-10$ hour lag ($r = -0.544$). This captures the temporal offset between peak daytime photovoltaic generation and the evening surge in grid demand. The 10-hour offset is consistent with PV curtailment of daytime load followed by evening demand recovery.
+    \item \texttt{humidity\_lag\_12h}: Relative humidity correlates positively at a 12-hour lag ($r = 0.411$), capturing the delayed thermodynamic effect of overnight moisture conditions on subsequent-day heating/cooling loads.
+    \item \texttt{temp\_lag\_107h}: Air temperature peaks at a $-107$ hour lag ($r = -0.399$). This $\sim$4.5-day offset captures the slow thermal inertia of building stock and the delayed behavioral response of occupants adjusting heating and cooling systems to sustained temperature changes. This phenomenon results in diverse delayed effects on heating/cooling energy consumption depending on prevalent building materials and urban density \cite{verbeke_thermal_2018}. Even in the Dutch context a standard measure of offset correlation has not been established \cite{hoes_exploring_2010}. Hence, we rely on our EDA to guide us in the selection of a lag that represents this effect.
+\end{itemize}
+
+
+\paragraph{Group 3: PCA-Compressed Exogenous Features}
+\label{par:pca_features}
+
+The raw exogenous feature space consists of 9 validated KNMI meteorological parameters and 57 CBS economic indicators (Table~\ref{tab:pca_inputs}), many of which are severely multicollinear, a problem also noted by \cite{ashtar_hybrid_2025,van_de_sande_enhancing_2024,curiel_integrating_2025}. VIF analysis identified \textbf{extreme redundancy}: KNMI humidity ($\text{VIF} \approx 53{,}000$), CBS CPI energy ($\text{VIF} \approx 37{,}000$), and validated temperature ($\text{VIF} \approx 8{,}600$) all exceed safe thresholds by orders of magnitude. To address the above issues, Principal Component Analysis (PCA) is applied to the full-coverage subset of CBS and KNMI validated features (Table~\ref{tab:pca_inputs}) within each training fold. After zero-mean, unit-variance standardization, PCA is fitted on complete rows and the top principal components are selected dynamically such that 95\% of variance is maintained. This results in the number of components selected with respect to each training fold varying between 7 and 16, growing with the length of the fold's training window. We note that this is a step that has not been implemented by the reference papers \cite{ashtar_hybrid_2025,van_de_sande_enhancing_2024,curiel_integrating_2025}, despite their observations that multicollinearity degraded the predictive effects of exogenous variables.
+
+For reference, PCA was conducted on the missingness-filtered subset of the 79 CBS+KNMI variables across the 14-year timeline. The elbow analysis in Figure \ref{fig:pca_elbow} reveals that 16 principal components capture ${\sim}95$\% of the combined CBS+KNMI validated variance, with steep marginal gains in the first 5 components and diminishing returns thereafter. This further validates our choice to subject these predictors to PCA in training to eliminating multicollinearity; the choice to implement PCA in-training as opposed to using these 16 components prevents data leakage.
+
+\begin{table}[htbp]
+\centering
+\caption{Predictor set (26--35 features per fold, depending on the per-fold
+PCA component count) shared by all tested baseline unimodal models, and
+included in the newly proposed model. NTL is included only in the newly
+proposed multimodal model.}
+\label{tab:36_features}
+\footnotesize
+\begin{tabularx}{\columnwidth}{r l X}
+\toprule
+\textbf{\#} & \textbf{Feature} & \textbf{Derivation / Justification} \\
+\midrule
+\multicolumn{3}{l}{\textit{Temporal \& Calendar (12)}} \\
+\addlinespace[2pt]
+1  & \texttt{day\_of\_year}       & Ordinal seasonal position \\
+2  & \texttt{week\_of\_year}      & Ordinal weekly position \\
+3  & \texttt{quarter}             & Quarterly seasonal indicator \\
+4  & \texttt{hour\_sin}           & Cyclical encoding ($r = -0.211$) \\
+5  & \texttt{hour\_cos}           & Cyclical encoding ($r = -0.535$) \\
+6  & \texttt{dow\_sin}            & Cyclical encoding ($r = 0.287$) \\
+7  & \texttt{dow\_cos}            & Cyclical encoding ($r = -0.099$) \\
+8  & \texttt{month\_sin}          & Cyclical encoding ($r = -0.112$) \\
+9  & \texttt{month\_cos}          & Cyclical encoding ($r = 0.341$) \\
+10 & \texttt{year}                & Trend (31.7\% of STL var.) \\
+11 & \texttt{is\_public\_holiday} & $-12.1$\% load ($p < 10^{-300}$) \\
+12 & \texttt{is\_school\_holiday} & $-2.5$\% load ($p \approx 10^{-140}$) \\
+\midrule
+\multicolumn{3}{l}{\textit{Autoregressive \& Cross-Correlation Lags (7)}} \\
+\addlinespace[2pt]
+13 & \texttt{load\_lag\_12h}        & ACF $r = 0.695$ \\
+14 & \texttt{load\_lag\_24h}        & ACF $r = 0.842$ (diurnal) \\
+15 & \texttt{load\_lag\_1w}         & ACF $r = 0.924$ (weekly) \\
+16 & \texttt{load\_lag\_1y}         & ACF $r = 0.671$ (annual) \\
+17 & \texttt{solar\_rad\_lag\_10h}  & CCF peak $-10$h ($r = -0.544$) \\
+18 & \texttt{humidity\_lag\_12h}    & CCF peak $-12$h ($r = 0.411$) \\
+19 & \texttt{temp\_lag\_107h}       & CCF peak $-107$h ($r = -0.399$) \\
+\midrule
+\multicolumn{3}{l}{\textit{PCA-Compressed Exogenous (7--16, refit per fold)}} \\
+\addlinespace[2pt]
+20\,--\,$19{+}k$ & \texttt{pca\_fold\_01\,...\,pca\_fold\_$k$} & $k \in [7, 16]$ leading PCs (${\geq}95$\% cumulative var.\ of 66 CBS+KNMI covariates, refit on each fold's training window) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Preprocessing at Training Time} Within each ROCV fold, all continuous features undergo IQR-based outlier removal (clipping at $Q_1 - 1.5 \times \text{IQR}$ and $Q_3 + 1.5 \times \text{IQR}$), followed by forward-filling as previously noted to handle any residual nulls. To optimize gradient-descent convergence, all continuous tabular variables are Min-Max normalized to a $[0, 1]$ range. \textit{Scaling parameters ($x_{\min}, x_{\max}$) are computed exclusively on the training fold} to prevent information leakage into validation and test sets. PCA is refitted within each fold on the 79 candidate exogenous CBS+KNMI covariates filtered for missingness over that fold's training window (retaining 66; up to 75 in the latest MLR folds, whose merged training$+$validation window extends furthest), and the minimal number of leading components capturing $\geq 95\%$ cumulative variance is kept (7-16 across folds), as described in \ref{sec:apx:second_appendix}. 
+\textbf{All lag features are horizon-shifted} during training: each lag column is shifted forward by $H \times 24$ hours (where $H$ is the forecast horizon in days), ensuring the autoregressive and weather-lag predictors only access observations available at the forecast origin, eliminating look-ahead leakage across all ROCV folds. Consistent with the availability convention of §\ref{subsec:problem_framing}, the deterministic calendar features and the PCA-compressed exogenous components are used at their target-time values.
+
+
+\subsection{Proposed Model: Cross-Modal Attention Transformer (CMAT)}
+\label{subsec:cmat_model}
+
+This study proposes a \textbf{Cross-Modal Attention Transformer (CMAT)}. This two-branch architecture adapts the multimodal fusion principles of SolarCrossFormer~\cite{schubnel_solarcrossformer_2025} and Wang et al.~\cite{wang_causal-aware_2025}. The model ingests the tabular predictor set (Table~\ref{tab:36_features}) through a temporal self-attention encoder, while simultaneously encoding daily VNP46A2-all satellite images within the context window through a spatial patch embedding. The model then fuses both modalities via cross-modal attention to allow the temporal state of the grid to selectively attend to specific geographic regions and their evolution across the context window. The diagram ~\ref{fig:architecture} describes the proposed model architecture. A more detailed algebraic explanation of the forward-pass mechanism is provided in ~\ref{sec:apx:third_appendinx}.
+
+% ─────────────────────────────────────────────────────
+% TIKZ DIAGRAM
+% ─────────────────────────────────────────────────────
+\begin{figure}[htbp]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[
+    >=stealth,
+    node distance=0.6cm and 0.8cm,
+    % ── Styles ──
+    dataNode/.style={rectangle, draw=black!80, fill=blue!5,
+        rounded corners=3pt, minimum height=0.8cm, text width=3.0cm,
+        align=center, font=\scriptsize\sffamily},
+    encNode/.style={rectangle, draw=black!80, fill=orange!10,
+        rounded corners=3pt, minimum height=1.0cm, text width=3.2cm,
+        align=center, font=\scriptsize\sffamily},
+    attnNode/.style={rectangle, draw=black!80, fill=green!10,
+        rounded corners=3pt, minimum height=0.9cm, text width=3.2cm,
+        align=center, font=\scriptsize\sffamily},
+    normNode/.style={rectangle, draw=black!80, fill=yellow!20,
+        rounded corners=2pt, minimum height=0.7cm, text width=3.0cm,
+        align=center, font=\scriptsize\sffamily},
+    decNode/.style={rectangle, draw=black!80, fill=yellow!15,
+        rounded corners=3pt, minimum height=0.9cm, text width=4.2cm,
+        align=center, font=\scriptsize\sffamily},
+    outNode/.style={rectangle, draw=black!80, fill=red!10,
+        rounded corners=3pt, minimum height=0.8cm, text width=3.2cm,
+        align=center, font=\scriptsize\sffamily\bfseries},
+    arrow/.style={->, thick, draw=black!80},
+    skipArrow/.style={->, thick, draw=black!50, rounded corners=5pt,
+        dashed},
+    branchLabel/.style={font=\scriptsize\sffamily\bfseries,
+        text=black!70},
+]
+
+% ═══════════════════════════════════════════════
+% TABULAR BRANCH (left, x=0)
+% ═══════════════════════════════════════════════
+\node[branchLabel] at (0, 0.7) {Tabular Branch};
+
+\node[dataNode] (tab) at (0, 0)
+    {Tabular Input\\$X_{tab} \in \mathbb{R}^{W \times \#Features}$};
+
+\node[encNode, text width=3.6cm] (feat) at (0, -1.7)
+    {Feature Encoding\\[2pt]
+     Cont.\,($16{+}k$): $W_c\, x_c + b_c$\\
+     Cat.\,(3): $\sum_j E_j[x_j]$\\[1pt]
+     + Temporal Pos.\,Enc.};
+
+\node[attnNode] (msa) at (0, -3.7)
+    {Multi-Head\\Self-Attention $\times L$\\($h_s$ heads)};
+
+\node[normNode] (msaNorm) at (0, -5.3)
+    {Add \& LayerNorm\\$Z_{tab} \in \mathbb{R}^{W \times d}$};
+
+\draw[arrow] (tab) -- (feat);
+\draw[arrow] (feat) -- (msa);
+\draw[arrow] (msa) -- (msaNorm);
+\draw[skipArrow] (feat.west) -- ++(-0.8,0) |- (msaNorm.west);
+
+% ═══════════════════════════════════════════════
+% SPATIAL BRANCH (right, x=6)
+% ═══════════════════════════════════════════════
+\node[branchLabel] at (6, 0.7) {Spatial Branch};
+
+\node[dataNode, text width=3.4cm] (img) at (6, 0)
+    {$D_W$ NTL 2D Images\\
+     $\{X_{img}^{(k)}\}_{k=1}^{D_W}$\\
+     $D_W = \lceil W/24 \rceil$};
+
+\node[encNode, text width=3.4cm] (patch) at (6, -1.7)
+    {Linear Patch Embed\\($P \times P$ patches)\\
+     $\times\, D_W$ images\\
+     + SPE $+$ DPE};
+
+\node[normNode, text width=3.4cm] (imgOut) at (6, -3.4)
+    {$Z_{img} \in \mathbb{R}^{(D_W \cdot N_p) \times d}$};
+
+\draw[arrow] (img) -- (patch);
+\draw[arrow] (patch) -- (imgOut);
+
+% ═══════════════════════════════════════════════
+% CROSS-MODAL FUSION (center-bottom)
+% ═══════════════════════════════════════════════
+\node[attnNode, text width=4.4cm, fill=green!15] (cross) at (2.8, -7.0)
+    {Cross-Modal Attention\\($h_c$ heads)\\[2pt]
+     $\text{softmax}\!\left(\dfrac{QK^\top}{\sqrt{d_k}}\right) V$};
+
+\node[normNode] (crossNorm) at (2.8, -8.7)
+    {Add \& LayerNorm\\$Z_{fused} \in \mathbb{R}^{W \times d}$};
+
+% Arrows into cross-attention
+\draw[arrow] (msaNorm.south) -- ++(0,-0.4)
+    -| node[pos=0.25, left, font=\scriptsize\sffamily] {$Q$}
+    (cross.160);
+\draw[arrow] (imgOut.south) -- ++(0,-1.8)
+    -| node[pos=0.25, right, font=\scriptsize\sffamily] {$K,\, V$}
+    (cross.20);
+\draw[arrow] (cross) -- (crossNorm);
+\draw[skipArrow] ([xshift=-1.3cm]msaNorm.south)
+    -- ++(0,-0.4) |- (crossNorm.west);
+
+% ═══════════════════════════════════════════════
+% DECODER
+% ═══════════════════════════════════════════════
+\node[decNode] (dec) at (2.8, -10.2)
+    {Factorised Linear Decoder\\
+     $\hat{Y} = W_H^\top\, Z_{fused}\, w_\tau$};
+
+\node[outNode] (out) at (2.8, -11.5)
+    {Point Forecast\\$\hat{Y} \in \mathbb{R}^{H_{pred}}$};
+
+\draw[arrow] (crossNorm) -- (dec);
+\draw[arrow] (dec) -- (out);
+
+% ═══════════════════════════════════════════════
+% BACKGROUND
+% ═══════════════════════════════════════════════
+\begin{scope}[on background layer]
+    \node[draw=gray!40, dashed, rounded corners=6pt, fill=gray!3,
+          fit=(tab)(img)(out), inner sep=0.55cm] {};
+\end{scope}
+
+\end{tikzpicture}%
+}
+\caption{Proposed Cross-Modal Attention Transformer (CMAT) architecture. The tabular branch encodes continuous features via linear projection and categorical features via learned embeddings, processing the resulting $W$-step sequence through $L$ layers of multi-head self-attention. The spatial branch encodes all $D_W = \lceil W/24 \rceil$ daily VNP46A2-all NTL images within the lookback window via linear patch embedding with dual spatial (SPE) and temporal-day (DPE) positional encodings. Cross-modal attention fuses both modalities by allowing temporal query tokens to attend to spatial patch tokens across multiple days, yielding point forecasts via a factorised linear decoder.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Hyperparameter Search Strategy}
+\label{subsec:hyperparameter_search}
+
+Hyperparameter choices are optimized via \textbf{Optuna}~\cite{akiba_optuna_2019}, whereby a search with $ \geq 25$ trials is run on fold 0 separately for each horizon choice. Table~\ref{tab:cmat_hparams} enumerates the complete search space. The context window choices (96 hrs/4 days/0.6 week and 168 hrs/7 days/1 week) were selected as potential representatives of weekly patterns, chosen for their computational feasibility. An initial search showed that context window sizes under 96 hours produced degenerate results, indicating a strong utility for local weekly pattern information, as evidenced by ACF (Figure~\ref{fig:entsoe_acf}). The position-wise FFN within each transformer layer uses a fixed expansion factor of $r_{ff} = 4$, following the standard transformer convention~\cite{vaswani_attention_2023}. To prevent Optuna from selecting configurations that achieve low validation loss by predicting the mean, the search employs a \textbf{composite objective} that penalizes low validation set Pearson Correlation Coefficient (PCC):
+\begin{equation}
+    \mathcal{J}_{\text{search}} = \mathcal{L}_{\text{val}} \cdot (2 - \text{PCC}),
+    \label{eq:composite_objective}
+\end{equation}
+where $\mathcal{L}_{\text{val}}$ is the validation mean squared error and PCC is the validation-set Pearson correlation (clamped to $[0, 1]$). Samples from said validation set are excluded from subsequent ROCV test sets. A configuration that captures the temporal structure well (PCC\,$\approx$\,1) incurs a factor of ${\approx}1.0\times$, whereas a mean predictor (PCC\,$\approx$\,0) receives a $2.0\times$ penalty, effectively doubling its objective value.
+
+
+\begin{table}[htbp]
+\centering
+\caption{CMAT hyperparameter search space. Categorical parameters are sampled uniformly; continuous parameters are sampled log-uniformly where indicated. Constraint pruning enforces $h_s \mid d$ and $h_c \mid d$ (attention heads must evenly divide the embedding dimension).}
+\label{tab:cmat_hparams}
+\footnotesize
+\begin{tabularx}{\columnwidth}{l c X}
+\toprule
+\textbf{Hyperparameter} & \textbf{Symbol}
+    & \textbf{Search Space} \\
+\midrule
+\multicolumn{3}{l}{\textit{Architecture}} \\
+\addlinespace[2pt]
+Context window (hours) & $W$
+    & $\{96,\ 168\}$ \\
+Embedding dimension    & $d$
+    & $\{64,\ 128\}$ \\
+Self-attn.\ heads      & $h_s$
+    & $\{2,\ 4,\ 8\}$ \\
+Cross-attn.\ heads     & $h_c$
+    & $\{2,\ 4,\ 8\}$ \\
+Transformer depth      & $L$
+    & $\{2,\ 3\}$ \\
+NTL patch size (px)    & $P$
+    & $\{8,\ 16,\ 32\}$ \\
+\midrule
+\multicolumn{3}{l}{\textit{Regularization}} \\
+\addlinespace[2pt]
+Image mask ratio       & $\rho_{img}$
+    & $\{0.25,\ 0.50,\ 0.75\}$ \\
+Dropout                & $p_{drop}$
+    & $\{0.1,\ 0.2,\ 0.3\}$ \\
+\midrule
+\multicolumn{3}{l}{\textit{Optimization}} \\
+\addlinespace[2pt]
+Learning rate          & $\eta$
+    & $[10^{-4},\ 10^{-3}]$ \textit{(log)} \\
+Weight decay           & $\lambda$
+    & $[10^{-5},\ 10^{-4}]$ \textit{(log)} \\
+Batch size             & $B$
+    & $\{32,\ 64\}$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ─────────────────────────────────────────────────────
+% TRAINING DYNAMICS
+% ─────────────────────────────────────────────────────
+
+\subsection{Training Dynamics and Regularization Strategy}
+\label{subsec:training_dynamics}
+
+The model is optimized via the \textbf{Mean Squared Error (MSE)} loss, training a single point forecast per target hour. For a target $y$ and prediction $\hat{y}$:
+\begin{equation}
+    \mathcal{L}(y, \hat{y}) = (y - \hat{y})^2,
+\end{equation}
+averaged over all forecast hours in a batch.
+
+While the MSE loss serves as the gradient-level training objective, an additional form of \textbf{model-selection regularization} is applied at the hyperparameter search level. As described in Section~\ref{subsec:hyperparameter_search}, the Optuna search selects configurations by minimizing the composite objective $\mathcal{J}_{\text{search}} = \mathcal{L}_{\text{val}} \cdot (2 - \text{PCC})$ (Eq.~\ref{eq:composite_objective}). This criterion penalizes configurations whose low validation loss arises from degenerate mean-reverting predictions rather than genuine temporal structure learning, effectively regularizing the hyperparameter search against capacity:data imbalance. \textbf{Dynamic image masking} is further applied during training. By stochastically replacing a random $\rho_{img}$ fraction of spatial patch tokens with a learnable \texttt{[MASK]} token across the $D_W$ daily images, the model prevents the cross-attention mechanism from memorizing spatial topologies and forces the encoder to learn robust features from partial observations, as in ~\cite{schubnel_solarcrossformer_2025}. The mask ratio $\rho_{img} \in \{0.25, 0.50, 0.75\}$ is optimized as a searched hyperparameter (Table~\ref{tab:cmat_hparams}). Standard neural network regularization complements the spatial masking: dropout ($p_{drop} \in \{0.1, 0.2, 0.3\}$) is applied after each attention and FFN sub-layer, and the transformer depth is kept shallow ($L \in \{2, 3\}$) to limit model capacity commensurate with the dataset scale. The learning rate follows a cosine annealing schedule with warm restarts. Early stopping is monitored on the active ROCV validation fold, but with a \textbf{minimum epoch guard}: the patience counter is disabled for the first $E_{\min} = 10$ epochs, after which training halts if validation MSE does not improve for $P = 15$ consecutive epochs. Training is capped at a maximum of 50 epochs.
+
+\subsection{Benchmarking, Evaluation Metrics, and Inclusion/Exclusion Analysis}
+\label{subsec:evaluation_ablation}
+
+CMAT is benchmarked against unimodal baselines successfully deployed in recent Dutch grid forecasting literature. These baselines utilize the same temporal, meteorological, and economic data, but omit the 2D visual NTL modality. Comparative baselines presented are Prophet-LSTM configured with best hyperparameters from \cite{van_de_sande_enhancing_2024}, Seq2Seq configured with best hyperparameters from \cite{ashtar_hybrid_2025}, Multiple Linear Regression, a Seasonal-Naive baseline that predicts the value at a 1-year lag, a 24-hour Naive baseline that predicts the last 24 hours from the training set on repeat, and a drift baseline that solely captures trend. All neural baseline results are reported as aggregates across three random seeds.
+
+To ensure strict chronological integrity during evaluation, an expanding-window Rolling-Origin Cross-Validation (ROCV) protocol is employed, following the frameworks established in recent national studies \cite{van_de_sande_enhancing_2024, curiel_integrating_2025}. For each fold, the training set utilizes the full available timeline starting from January 2012 up until the prediction target timestamp minus the horizon value. Similar to the methodology of \cite{curiel_integrating_2025,van_de_sande_enhancing_2024}, because all data from the beginning of the timeline is included, different folds inherently possess different training set volumes. To ensure the model realistically captures and learns complete annual seasonal cycles, a strict minimum of two years of historical training data is required to initialize the first fold, as in \cite{van_de_sande_enhancing_2024}. Furthermore, as applied by \cite{curiel_integrating_2025}, the last calendar year of every constructed training split is actively reserved for validation for early stopping. Consequently, the very first data split utilizes January 2012 through December 2013 for training, and January 2014 through December 2014 for validation, with test targets first evaluated from January 1, 2015 across the horizons, as in the lead-time experiment setup of \cite{van_de_sande_enhancing_2024}. The forecasting "origin" then advances by a fixed step of 13 months between successive folds. Because the step exceeds one year by a single month, consecutive forecast origins cycle through different parts of the calendar year (January, February, and onward through October across the ten folds), so that no season is systematically over- or under-represented among the test windows. This expanding-window strategy also mimics the sequential accumulation of data in operational grid management.
+
+Model efficacy across the ROCV folds is evaluated using five standard point-forecast metrics, including scaled and unscaled measures: \textbf{Root Mean Square Error (RMSE)}, \textbf{Mean Absolute Percentage Error (MAPE)}, \textbf{Mean Absolute Error (MAE)}, \textbf{Mean Absolute Scaled Error (MASE)} --- computed relative to the mean absolute error of a 24-hour persistence na\"ive forecast over the same evaluation window --- and the \textbf{Pearson Correlation Coefficient ($r$)}.
+
+To isolate the contribution of each architectural component, an inclusion/exclusion study trains and evaluates the network under three configurations, following the example of \cite{wang_causal-aware_2025}. For each proposed configuration, aggregate results across three random seeds are reported.
+
+\begin{enumerate}
+    \item \textbf{CMAT-Tab (Tabular Only):} The spatial branch is entirely disabled. The full tabular input set is processed through the self-attention encoder and decoded directly. This configuration isolates the contribution of the transformer architecture on the same feature set available to the unimodal baselines.
+
+    \item \textbf{CMAT-NTL (Tabular Only with NTL):} The spatial branch is entirely disabled. The full tabular input set including the scalar \texttt{ntl\_a2\_all\_mean} aggregate is processed through the self-attention encoder and decoded directly. This configuration isolates the contribution of any NTL data at all, without the involvement of patch embeddings.
+    
+    \item \textbf{CMAT-Full (Proposed):} The complete architecture with dedicated cross-modal attention, as described in §\ref{subsec:cmat_model}.
+    
+\end{enumerate}

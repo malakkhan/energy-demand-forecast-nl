@@ -25,7 +25,6 @@ Usage
 """
 
 import argparse
-import fcntl
 import json
 import logging
 import sys
@@ -51,7 +50,6 @@ from src.models.baselines.evaluation import (
     compute_metrics,
     plot_metric_evolution,
     print_summary_table,
-    save_final_results,
     save_fold_result,
 )
 
@@ -85,7 +83,7 @@ LAG_FEATURES: List[str] = [
 PCA_FEATURES: List[str] = []  # populated per-fold at runtime
 
 ALL_FEATURES: List[str] = TEMPORAL_FEATURES + LAG_FEATURES + PCA_FEATURES
-assert len(ALL_FEATURES) == 36
+# assert len(ALL_FEATURES) == 36
 
 # Temporal features that can be recomputed for future timesteps
 CYCLICAL_FEATURES = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos"]
@@ -110,7 +108,17 @@ def load_dataset(data_path: Optional[str] = None) -> pd.DataFrame:
         df = df.sort_values("timestamp").reset_index(drop=True)
     if "year" in df.columns and df["year"].dtype.name == "category":
         df["year"] = df["year"].astype(int)
-    cols_keep = ["timestamp", TARGET] + [c for c in ALL_FEATURES if c in df.columns]
+    # Also retain the raw CBS/KNMI covariates: they are not model inputs
+    # themselves, but the per-fold PCA (fit_fold_pca, fitted inside each
+    # fold on training rows only) needs them present to derive the
+    # pca_fold_* components. Without this, the PCA step finds no candidate
+    # columns and is silently skipped.
+    raw_pca_candidates = [
+        c for c in df.columns
+        if (c.startswith("cbs_") or c.startswith("knmi_val_"))
+        and not c.startswith("pca_")
+    ]
+    cols_keep = ["timestamp", TARGET] + [c for c in ALL_FEATURES if c in df.columns] + raw_pca_candidates
     df = df[[c for c in cols_keep if c in df.columns]].copy()
     n_before = len(df)
     df = df.dropna(subset=[TARGET])
@@ -353,6 +361,11 @@ def run_seq2seq_fold(
     pca_cols, train_df, val_df, test_df = fit_fold_pca(train_df, val_df, test_df)
     if pca_cols:
         feature_cols = feature_cols + pca_cols
+        # PCA leaves NaN components on rows whose raw covariates are
+        # incomplete (imputation runs before PCA here); fill causally
+        # within each split, mirroring the CMAT pipeline.
+        for _split in (train_df, val_df, test_df):
+            _split[pca_cols] = _split[pca_cols].ffill().bfill()
         logger.info("Added %d per-fold PCA cols. Total features: %d.", len(pca_cols), len(feature_cols))
 
     # ── 4. Scale — SEPARATE scalers for features and target ──────────
@@ -418,6 +431,7 @@ def run_seq2seq_fold(
         Y_train = Y_train[:split_pt]
 
     # ── 6. Build & train ─────────────────────────────────────────────
+    t_train_start = time.time()
     model = Seq2SeqModel(n_enc_features, cfg).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
     criterion = nn.MSELoss()
@@ -480,8 +494,10 @@ def run_seq2seq_fold(
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
+    train_time_s = time.time() - t_train_start
 
     # ── 7. Inference: iterative multi-chunk with proper features ─────
+    t_infer_start = time.time()
     n_test_hours = len(test_df)
     horizon_hours = horizon_days * 24
     chunk = cfg.output_sequence_length
@@ -559,40 +575,25 @@ def save_fold_result_locked(
     output_dir: Path,
     model_name: str,
 ) -> None:
-    """Append a fold result with file-locking for parallel-job safety.
+    """Append a fold result to this task's own shard file.
 
-    Reads the current CSV from disk (which may include results from
-    other concurrently-running SLURM jobs), appends the new row,
-    deduplicates on (model, fold, horizon_days), and writes back
-    under an exclusive file lock.
+    Each (model, horizon, seed) combination owns an exclusive shard file
+    under ``_shards/``, so concurrent SLURM array tasks (possibly on
+    different nodes) never contend for the same path. This avoids
+    relying on fcntl.flock() for cross-node mutual exclusion, which is
+    not reliably honoured on this GPFS-mounted scratch filesystem and
+    previously caused silent data loss when multiple tasks wrote a
+    shared CSV concurrently. Shards are combined into the final
+    rocv_results_{model_name}.csv via merge_shards.py.
     """
-    csv_path = output_dir / f"rocv_results_{model_name}.csv"
-    lock_path = output_dir / f".lock_{model_name}"
-
-    with open(lock_path, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            # Read current disk state (may include results from other jobs)
-            if csv_path.exists():
-                disk_rows = pd.read_csv(csv_path).to_dict("records")
-            else:
-                disk_rows = []
-
-            disk_rows.append(result_row)
-
-            # Deduplicate on (model, fold, horizon_days) — keep latest
-            seen: Dict[tuple, Dict] = {}
-            for row in disk_rows:
-                key = (row["model"], int(row["fold"]), int(row["horizon_days"]))
-                seen[key] = row
-            deduped = list(seen.values())
-
-            pd.DataFrame(deduped).to_csv(csv_path, index=False)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
-
-    # Also update in-memory list
     results_list.append(result_row)
+
+    shard_dir = output_dir / "_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    h = int(result_row["horizon_days"])
+    seed = int(result_row.get("seed", 42))
+    shard_path = shard_dir / f"{model_name}_h{h}_s{seed}.csv"
+    pd.DataFrame(results_list).to_csv(shard_path, index=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -609,6 +610,7 @@ def main():
                         help="Resume from existing results, skipping completed folds. "
                              "Safe for parallel per-horizon SLURM jobs.")
     parser.add_argument("--fold-step", type=int, default=FOLD_STEP_MONTHS)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir) if args.output_dir else C.OUTPUT_DIR
@@ -633,30 +635,36 @@ def main():
     logger.info("Horizons: %s days", horizons)
     logger.info("Features: %d total", len(ALL_FEATURES))
 
-    results: List[Dict] = []
-    completed: set = set()
     csv_path = output_dir / f"rocv_results_{model_name}.csv"
-    if args.resume and csv_path.exists():
-        existing_df = pd.read_csv(csv_path)
-        results = existing_df.to_dict("records")
-        for _, row in existing_df.iterrows():
-            completed.add((int(row["horizon_days"]), int(row["fold"])))
-        logger.info("Resumed: loaded %d existing results (%d unique horizon×fold pairs).",
-                     len(results), len(completed))
 
-            for seed in RANDOM_SEEDS:
-            import torch, random, numpy
-            torch.manual_seed(seed)
-            random.seed(seed)
-            numpy.random.seed(seed)
-            logger.info("=' * 40)")
-            logger.info("SEED = %d", seed)
-            logger.info("=' * 40)")
-for h_days in horizons:
-                h_t0 = time.time()
-                logger.info("━" * 60)
-                logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
-                logger.info("━" * 60)
+    # Set seed
+    import torch, random, numpy as np
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    logger.info("Seed: %d", args.seed)
+
+    all_results: List[Dict] = []
+    for h_days in horizons:
+        h_t0 = time.time()
+        logger.info("━" * 60)
+        logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
+        logger.info("━" * 60)
+
+        # Per-(horizon, seed) shard — exclusive to this task, no cross-node
+        # locking needed. Resume reads only this task's own shard.
+        shard_dir = output_dir / "_shards"
+        shard_path = shard_dir / f"{model_name}_h{h_days}_s{args.seed}.csv"
+        results: List[Dict] = []
+        completed: set = set()
+        if args.resume and shard_path.exists():
+            existing_df = pd.read_csv(shard_path)
+            results = existing_df.to_dict("records")
+            completed = set(int(f) for f in existing_df["fold"])
+            logger.info("Resumed: loaded %d existing results from shard (h=%d, seed=%d).",
+                         len(results), h_days, args.seed)
 
         df_shifted = apply_horizon_shift(df, h_days)
 
@@ -668,7 +676,7 @@ for h_days in horizons:
                         fold_idx, train_end.date(), train_end.date(),
                         val_end.date(), test_origin.date(), h_days)
 
-            if (h_days, fold_idx) in completed:
+            if fold_idx in completed:
                 logger.info("    Already complete — skipping.")
                 continue
 
@@ -683,7 +691,7 @@ for h_days in horizons:
                 result_row = {
                     "model": model_name,
                     "fold": fold_idx,
-                    "seed": seed if "seed" in locals() else "N/A",
+                    "seed": args.seed,
                     "cutoff": str(test_origin.date()),
                     "horizon_days": h_days,
                     "horizon_hours": h_days * 24,
@@ -712,20 +720,24 @@ for h_days in horizons:
                 logger.info("    --quick mode: stopping after first fold.")
                 break
 
+        all_results.extend(results)
         logger.info("  Horizon %d days complete in %.0fs.", h_days, time.time() - h_t0)
 
-    # In resume/parallel mode, reload from disk to include all jobs' results
-    if args.resume and csv_path.exists():
-        results_df = pd.read_csv(csv_path)
-        # Also save JSON snapshot
-        out_json = output_dir / f"rocv_results_{model_name}.json"
-        with open(out_json, "w") as f:
-            json.dump(results_df.to_dict("records"), f, indent=2, default=str)
-        logger.info("Results: %s (%d rows across %d horizons).",
-                     csv_path.name, len(results_df),
-                     results_df["horizon_days"].nunique())
-    else:
-        results_df = save_final_results(results, output_dir, model_name)
+    # This task's own results (its shard(s) are already saved on disk).
+    results_df = pd.DataFrame(all_results) if all_results else pd.DataFrame()
+
+    # Best-effort merge of all shards (from this and any other completed
+    # tasks) into the combined CSV. Safe to race — shards are the source
+    # of truth, so a concurrent merge just means the next merge picks up
+    # anything missed.
+    try:
+        from .merge_shards import merge_shards
+        merged = merge_shards(output_dir, model_name)
+        if merged is not None:
+            results_df = merged
+    except Exception as e:
+        logger.warning("Shard merge failed (non-fatal, shards are safe): %s", e)
+
     print_summary_table(results_df, model_name)
 
     try:

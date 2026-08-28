@@ -87,14 +87,19 @@ class TabularEncoder(nn.Module):
     z_t^(0) = W_c * x_cont_t + b_c + Σ_j E_j[x_j_t] + PE(t)
     """
 
-    def __init__(self, cfg: CMATConfig):
+    def __init__(self, cfg: CMATConfig, n_cont: int = None):
         super().__init__()
         d = cfg.embed_dim
 
-        # Determine number of continuous features
-        n_cont = C.N_CONTINUOUS
-        if cfg.uses_ntl_scalar:
-            n_cont += 1  # add ntl_a2_all_mean for CMAT-NTL variant
+        # Determine number of continuous features. Callers that know the
+        # actual per-fold column count (base features + per-fold PCA
+        # components, which varies by fold) should pass it explicitly;
+        # falling back to the static pre-PCA count is only correct when
+        # no PCA columns are added.
+        if n_cont is None:
+            n_cont = C.N_CONTINUOUS
+            if cfg.uses_ntl_scalar:
+                n_cont += 1  # add ntl_a2_all_mean for CMAT-NTL variant
 
         # Continuous projection: W_c * x_cont + b_c
         self.cont_proj = nn.Linear(n_cont, d)
@@ -405,13 +410,13 @@ class CMAT(nn.Module):
     Supports four variants via ``cfg.variant``.
     """
 
-    def __init__(self, cfg: CMATConfig):
+    def __init__(self, cfg: CMATConfig, n_cont: int = None):
         super().__init__()
         self.cfg = cfg
         d = cfg.embed_dim
 
         # ── Phase 1: Tabular encoder ──
-        self.tabular_encoder = TabularEncoder(cfg)
+        self.tabular_encoder = TabularEncoder(cfg, n_cont=n_cont)
 
         # ── Phase 1: Spatial encoder (for EARLY_FUSION and FULL) ──
         if cfg.uses_spatial:

@@ -139,7 +139,15 @@ def run_rocv(
             folds = folds[:max_folds]
             logger.info("Limiting to %d folds.", max_folds)
 
+    # Pre-load this (model, horizon, seed)'s own shard so a resumed run
+    # appends to its existing rows instead of overwriting them.
     results = []
+    shard_path = output_dir / "_shards" / f"{model_name}_h{horizon_days}_s{cfg.seed}.csv"
+    if resume and shard_path.exists():
+        import pandas as pd
+        results = pd.read_csv(shard_path).to_dict("records")
+        logger.info("Resumed: loaded %d existing results from shard.", len(results))
+
     t0_total = time.time()
 
     for fold_idx, train_end, val_end, test_origin in folds:
@@ -203,7 +211,12 @@ def run_rocv(
                 "best_val_loss": result["best_val_loss"],
                 "n_params": result["n_params"],
                 "n_epochs": result["n_epochs"],
-                "train_time_s": fold_time,
+                "train_time_s": result["train_time_s"],
+                "infer_time_s": result["infer_time_s"],
+                "n_train": result["n_train"],
+                "n_val": result["n_val"],
+                "n_test": result["n_test"],
+                "elapsed_s": fold_time,
                 "seed": cfg.seed,
             }
 
@@ -235,6 +248,16 @@ def run_rocv(
         "ROCV complete: %d folds in %.1fs (%.1f min).",
         len(results), total_time, total_time / 60,
     )
+
+    # Best-effort merge of all shards (from this and any other completed
+    # tasks) into the combined CSV. Safe to race — shards are the source
+    # of truth, so a concurrent merge just means the next merge picks up
+    # anything missed.
+    try:
+        from baselines.merge_shards import merge_shards
+        merge_shards(output_dir, model_name)
+    except Exception as exc:
+        logger.warning("Shard merge failed (non-fatal, shards are safe): %s", exc)
 
 
 def main():

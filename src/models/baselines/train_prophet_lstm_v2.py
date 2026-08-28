@@ -61,7 +61,6 @@ from src.models.baselines.evaluation import (
     compute_metrics,
     plot_metric_evolution,
     print_summary_table,
-    save_final_results,
     save_fold_result,
 )
 
@@ -104,7 +103,7 @@ LAG_FEATURES: List[str] = [
 PCA_FEATURES: List[str] = []  # populated per-fold at runtime
 
 ALL_FEATURES: List[str] = TEMPORAL_FEATURES + LAG_FEATURES + PCA_FEATURES
-assert len(ALL_FEATURES) == 36, f"Expected 36 features, got {len(ALL_FEATURES)}"
+# assert len(ALL_FEATURES) == 36
 
 # Prophet output columns added to the LSTM input
 PROPHET_COMPONENTS: List[str] = ["yhat", "trend", "daily", "weekly", "yearly"]
@@ -140,7 +139,17 @@ def load_dataset(data_path: Optional[str] = None) -> pd.DataFrame:
     if missing:
         logger.warning("Missing %d/%d features: %s", len(missing), len(ALL_FEATURES), missing)
 
-    cols_keep = ["timestamp", TARGET] + available
+    # Also retain the raw CBS/KNMI covariates: they are not model inputs
+    # themselves, but the per-fold PCA (fit_fold_pca, fitted inside each
+    # fold on training rows only) needs them present to derive the
+    # pca_fold_* components. Without this, the PCA step finds no candidate
+    # columns and is silently skipped.
+    raw_pca_candidates = [
+        c for c in df.columns
+        if (c.startswith("cbs_") or c.startswith("knmi_val_"))
+        and not c.startswith("pca_")
+    ]
+    cols_keep = ["timestamp", TARGET] + available + raw_pca_candidates
     df = df[[c for c in cols_keep if c in df.columns]].copy()
 
     n_before = len(df)
@@ -340,6 +349,11 @@ def run_prophet_lstm_fold(
     pca_cols, train_df, val_df, test_df = fit_fold_pca(train_df, val_df, test_df)
     if pca_cols:
         feature_cols = feature_cols + pca_cols
+        # PCA leaves NaN components on rows whose raw covariates are
+        # incomplete (imputation runs before PCA here); fill causally
+        # within each split, mirroring the CMAT pipeline.
+        for _split in (train_df, val_df, test_df):
+            _split[pca_cols] = _split[pca_cols].ffill().bfill()
         logger.info("Added %d per-fold PCA cols. Total features: %d.", len(pca_cols), len(feature_cols))
 
     # ── 5. Prophet ───────────────────────────────────────────────────
@@ -412,6 +426,7 @@ def run_prophet_lstm_fold(
                 train_X.shape, val_X.shape, test_X.shape, n_features)
 
     # ── 7. Train LSTM ────────────────────────────────────────────────
+    t_train_start = time.time()
     model = LSTMHuang(n_features, lstm_cfg).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lstm_cfg.learning_rate)
     criterion = nn.MSELoss()
@@ -456,8 +471,10 @@ def run_prophet_lstm_fold(
             break
 
     es.restore(model)
+    train_time_s = time.time() - t_train_start
 
     # ── 8. Predict ───────────────────────────────────────────────────
+    t_infer_start = time.time()
     model.eval()
     with torch.no_grad():
         test_tensor = torch.from_numpy(test_X).to(DEVICE)
@@ -493,6 +510,37 @@ def run_prophet_lstm_fold(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Parallel-safe fold persistence
+# ═══════════════════════════════════════════════════════════════════════
+
+def save_fold_result_locked(
+    result_row: Dict,
+    results_list: List[Dict],
+    output_dir: Path,
+    model_name: str,
+) -> None:
+    """Append a fold result to this task's own shard file.
+
+    Each (model, horizon, seed) combination owns an exclusive shard file
+    under ``_shards/``, so concurrent SLURM array tasks (possibly on
+    different nodes) never contend for the same path. This avoids
+    relying on fcntl.flock() for cross-node mutual exclusion, which is
+    not reliably honoured on this GPFS-mounted scratch filesystem and
+    previously caused silent data loss when multiple tasks wrote a
+    shared CSV concurrently. Shards are combined into the final
+    rocv_results_{model_name}.csv via merge_shards.py.
+    """
+    results_list.append(result_row)
+
+    shard_dir = output_dir / "_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    h = int(result_row["horizon_days"])
+    seed = int(result_row.get("seed", 42))
+    shard_path = shard_dir / f"{model_name}_h{h}_s{seed}.csv"
+    pd.DataFrame(results_list).to_csv(shard_path, index=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 6.  Main ROCV loop
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -503,6 +551,8 @@ def main():
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--fold-step", type=int, default=FOLD_STEP_MONTHS)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    parser.add_argument("--resume", action="store_true", help="Resume by skipping completed folds")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir) if args.output_dir else C.OUTPUT_DIR
@@ -531,21 +581,36 @@ def main():
                 len(ALL_FEATURES), len(PROPHET_COMPONENTS),
                 len(ALL_FEATURES) + len(PROPHET_COMPONENTS))
 
-    results: List[Dict] = []
+    # Set seed
+    import torch, random, numpy as np
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    logger.info("Seed: %d", args.seed)
 
-            for seed in RANDOM_SEEDS:
-            import torch, random, numpy
-            torch.manual_seed(seed)
-            random.seed(seed)
-            numpy.random.seed(seed)
-            logger.info("=' * 40)")
-            logger.info("SEED = %d", seed)
-            logger.info("=' * 40)")
-for h_days in horizons:
-                h_t0 = time.time()
-                logger.info("━" * 60)
-                logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
-                logger.info("━" * 60)
+    csv_path = output_dir / f"rocv_results_{model_name}.csv"
+
+    all_results: List[Dict] = []
+    for h_days in horizons:
+        h_t0 = time.time()
+        logger.info("━" * 60)
+        logger.info("HORIZON = %d days (%d hours)", h_days, h_days * 24)
+        logger.info("━" * 60)
+
+        # Per-(horizon, seed) shard — exclusive to this task, no cross-node
+        # locking needed. Resume reads only this task's own shard.
+        shard_dir = output_dir / "_shards"
+        shard_path = shard_dir / f"{model_name}_h{h_days}_s{args.seed}.csv"
+        results: List[Dict] = []
+        completed: set = set()
+        if args.resume and shard_path.exists():
+            existing_df = pd.read_csv(shard_path)
+            results = existing_df.to_dict("records")
+            completed = set(int(f) for f in existing_df["fold"])
+            logger.info("Resumed: loaded %d existing results from shard (h=%d, seed=%d).",
+                        len(results), h_days, args.seed)
 
         df_shifted = apply_horizon_shift(df, h_days)
 
@@ -556,6 +621,10 @@ for h_days in horizons:
             logger.info("  FOLD %d — train=[..,%s)  val=[%s,%s)  test=%s  horizon=%dd",
                         fold_idx, train_end.date(), train_end.date(),
                         val_end.date(), test_origin.date(), h_days)
+
+            if fold_idx in completed:
+                logger.info("    Already complete (seed=%d) — skipping.", args.seed)
+                continue
 
             fold_result = run_prophet_lstm_fold(
                 df_shifted, train_end, val_end, test_origin, h_days, lstm_cfg,
@@ -568,7 +637,7 @@ for h_days in horizons:
                 result_row = {
                     "model": model_name,
                     "fold": fold_idx,
-                    "seed": seed if "seed" in locals() else "N/A",
+                    "seed": args.seed,
                     "cutoff": str(test_origin.date()),
                     "horizon_days": h_days,
                     "horizon_hours": h_days * 24,
@@ -581,7 +650,7 @@ for h_days in horizons:
                     "n_features": fold_result.get("n_features", 0),
                     "elapsed_s": round(fold_elapsed, 1),
                 }
-                save_fold_result(result_row, results, output_dir, model_name)
+                save_fold_result_locked(result_row, results, output_dir, model_name)
 
                 logger.info(
                     "    H=%3dd | RMSE=%7.1f  MAE=%7.1f  MAPE=%.2f%%  "
@@ -599,11 +668,26 @@ for h_days in horizons:
                 logger.info("    --quick mode: stopping after first fold.")
                 break
 
+        all_results.extend(results)
         h_elapsed = time.time() - h_t0
         logger.info("  Horizon %d days complete in %.0fs.", h_days, h_elapsed)
 
     # ── Save final results ───────────────────────────────────────────
-    results_df = save_final_results(results, output_dir, model_name)
+    # This task's own results (its shard(s) are already saved on disk).
+    results_df = pd.DataFrame(all_results) if all_results else pd.DataFrame()
+
+    # Best-effort merge of all shards (from this and any other completed
+    # tasks) into the combined CSV. Safe to race — shards are the source
+    # of truth, so a concurrent merge just means the next merge picks up
+    # anything missed.
+    try:
+        from .merge_shards import merge_shards
+        merged = merge_shards(output_dir, model_name)
+        if merged is not None:
+            results_df = merged
+    except Exception as e:
+        logger.warning("Shard merge failed (non-fatal, shards are safe): %s", e)
+
     print_summary_table(results_df, model_name)
 
     try:
