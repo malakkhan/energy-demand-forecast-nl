@@ -1,0 +1,51 @@
+\subsubsection{Feature Summary}
+\label{subsubsec:feature_summary}
+% ─────────────────────────────────────────────────────
+
+\begin{table}[htbp]
+\centering
+\caption{Predictor set (26--35 features per fold, depending on the per-fold
+PCA component count) shared by all tested baseline unimodal models, and
+included in the newly proposed model. NTL is included only in the newly
+proposed multimodal model.}
+\label{tab:36_features}
+\footnotesize
+\begin{tabularx}{\columnwidth}{r l X}
+\toprule
+\textbf{\#} & \textbf{Feature} & \textbf{Derivation / Justification} \\
+\midrule
+\multicolumn{3}{l}{\textit{Temporal \& Calendar (12)}} \\
+\addlinespace[2pt]
+1  & \texttt{day\_of\_year}       & Ordinal seasonal position \\
+2  & \texttt{week\_of\_year}      & Ordinal weekly position \\
+3  & \texttt{quarter}             & Quarterly seasonal indicator \\
+4  & \texttt{hour\_sin}           & Cyclical encoding ($r = -0.211$) \\
+5  & \texttt{hour\_cos}           & Cyclical encoding ($r = -0.535$) \\
+6  & \texttt{dow\_sin}            & Cyclical encoding ($r = 0.287$) \\
+7  & \texttt{dow\_cos}            & Cyclical encoding ($r = -0.099$) \\
+8  & \texttt{month\_sin}          & Cyclical encoding ($r = -0.112$) \\
+9  & \texttt{month\_cos}          & Cyclical encoding ($r = 0.341$) \\
+10 & \texttt{year}                & Trend (31.7\% of STL var.) \\
+11 & \texttt{is\_public\_holiday} & $-12.1$\% load ($p < 10^{-300}$) \\
+12 & \texttt{is\_school\_holiday} & $-2.5$\% load ($p \approx 10^{-140}$) \\
+\midrule
+\multicolumn{3}{l}{\textit{Autoregressive \& Cross-Correlation Lags (7)}} \\
+\addlinespace[2pt]
+13 & \texttt{load\_lag\_12h}        & ACF $r = 0.695$ \\
+14 & \texttt{load\_lag\_24h}        & ACF $r = 0.842$ (diurnal) \\
+15 & \texttt{load\_lag\_1w}         & ACF $r = 0.924$ (weekly) \\
+16 & \texttt{load\_lag\_1y}         & ACF $r = 0.671$ (annual) \\
+17 & \texttt{solar\_rad\_lag\_10h}  & CCF peak $-10$h ($r = -0.544$) \\
+18 & \texttt{humidity\_lag\_12h}    & CCF peak $-12$h ($r = 0.411$) \\
+19 & \texttt{temp\_lag\_107h}       & CCF peak $-107$h ($r = -0.399$) \\
+\midrule
+\multicolumn{3}{l}{\textit{PCA-Compressed Exogenous (7--16, refit per fold)}} \\
+\addlinespace[2pt]
+20\,--\,$19{+}k$ & \texttt{pca\_fold\_01\,...\,pca\_fold\_$k$} & $k \in [7, 16]$ leading PCs (${\geq}95$\% cumulative var.\ of 66 CBS+KNMI covariates, refit on each fold's training window) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+
+\paragraph{Preprocessing at Training Time.}
+Within each ROCV fold, all continuous features undergo IQR-based outlier removal (clipping at $Q_1 - 1.5 \times \text{IQR}$ and $Q_3 + 1.5 \times \text{IQR}$), followed by forward-filling as previously noted to handle any residual nulls. To optimize gradient-descent convergence, all continuous tabular variables are Min-Max normalized to a $[0, 1]$ range. \textit{Scaling parameters ($x_{\min}, x_{\max}$) are computed exclusively on the training fold} to prevent information leakage into validation and test sets. PCA is refitted within each fold on the 79 candidate exogenous CBS+KNMI covariates filtered for missingness over that fold's training window (retaining 66; up to 75 in the latest MLR folds, whose merged training$+$validation window extends furthest), and the minimal number of leading components capturing $\geq 95\%$ cumulative variance is kept (7--16 across folds), as described in \ref{sec:apx:second_appendix}.

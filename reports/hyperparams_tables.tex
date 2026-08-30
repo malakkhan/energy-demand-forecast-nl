@@ -1,0 +1,65 @@
+\section{Hyperparameter Search Results}
+\label{sec:apx:fifth_app}
+
+%============================================================
+% Hyperparameter Tables (Tab, NTL, Full)
+%============================================================
+% Generated from src/models/cmat/results/best_config_{tab,ntl,full}_h{60,180}d.json
+% (leakage-fixed pipeline: 13-month ROCV, fold-0 search, val-only PCC objective).
+% Tab/NTL: final 50-trial search results (2026-08-25).
+% Full: FINAL search results (2026-08-29; 25/26 completed trials for h60/h180
+% across two 24h walltime rounds with cross-round backfill).
+% Study scope: h60 + h180 (h120 deferred 2026-08-29).
+
+\begin{table}[h]
+\centering
+\footnotesize
+\caption{Winning hyperparameters for CMAT-TAB across horizons.}
+\label{tab:hyperparams_tab}
+\begin{tabular}{r r r r r r r r r}
+\toprule
+\textbf{H (d)} & \textbf{Context (h)} & \textbf{Embed Dim} & \textbf{Attn Heads} & \textbf{Trans. Depth} &
+\textbf{Dropout} & \textbf{Batch Size} & \textbf{Learning Rate} & \textbf{Weight Decay} \\
+\midrule
+60 & 168 & 128 & 2 & 2 & 0.3 & 32 & 1.3e-04 & 1.5e-05 \\
+180 & 168 & 128 & 2 & 2 & 0.2 & 32 & 2.9e-04 & 8.4e-05 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\footnotesize
+\caption{Winning hyperparameters for CMAT-NTL across horizons.}
+\label{tab:hyperparams_ntl}
+\begin{tabular}{r r r r r r r r r}
+\toprule
+\textbf{H (d)} & \textbf{Context (h)} & \textbf{Embed Dim} & \textbf{Attn Heads} & \textbf{Trans. Depth} &
+\textbf{Dropout} & \textbf{Batch Size} & \textbf{Learning Rate} & \textbf{Weight Decay} \\
+\midrule
+60 & 168 & 64 & 2 & 3 & 0.3 & 32 & 6.3e-04 & 2.5e-05 \\
+180 & 96 & 128 & 4 & 2 & 0.1 & 64 & 8.7e-04 & 2.4e-05 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\scriptsize
+\caption{Winning hyperparameters for CMAT-Full across horizons. CMAT-Full
+additionally searches the spatial-branch parameters (cross-attention heads,
+NTL patch size, image mask ratio), which are fixed at defaults for the
+Tab/NTL variants.}
+\label{tab:hyperparams_full}
+\begin{tabular}{r r r r r r r r r r r r}
+\toprule
+\textbf{H (d)} & \textbf{Context (h)} & \textbf{Embed Dim} & \textbf{Attn Heads} & \textbf{Cross Heads} & \textbf{Trans. Depth} &
+\textbf{Patch Size} & \textbf{Mask Ratio} & \textbf{Dropout} & \textbf{Batch Size} & \textbf{Learning Rate} & \textbf{Weight Decay} \\
+\midrule
+60 & 168 & 128 & 8 & 4 & 3 & 32 & 0.25 & 0.1 & 64 & 6.5e-04 & 7.4e-05 \\
+180 & 168 & 128 & 8 & 2 & 3 & 32 & 0.50 & 0.2 & 32 & 9.9e-04 & 1.9e-05 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\clearpage

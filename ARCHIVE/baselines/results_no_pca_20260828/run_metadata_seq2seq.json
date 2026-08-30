@@ -1,0 +1,44 @@
+{
+  "script": "train_seq2seq_v2.py",
+  "started": "2026-08-25T20:04:36.043499",
+  "model": "ashtar_seq2seq",
+  "device": "cuda",
+  "features": [
+    "day_of_year",
+    "week_of_year",
+    "quarter",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "year",
+    "is_public_holiday",
+    "is_school_holiday",
+    "load_lag_12h",
+    "load_lag_24h",
+    "load_lag_1w",
+    "load_lag_1y",
+    "solar_rad_lag_10h",
+    "humidity_lag_12h",
+    "temp_lag_107h"
+  ],
+  "n_features": 19,
+  "architecture": "Ashtar-matched full-sequence decoder",
+  "fixes_applied": [
+    "Fix 1: full-sequence decoder with return_sequences=True",
+    "Fix 2: separate MinMaxScaler for features and target",
+    "Fix 3: proper temporal feature computation during inference",
+    "Fix 4: gradient clipping (max_norm=1.0) + shuffle=True"
+  ],
+  "seq2seq": {
+    "input_sequence_length": 720,
+    "output_sequence_length": 168,
+    "encoder_units": 64,
+    "decoder_units": 64,
+    "epochs": 20,
+    "batch_size": 16
+  },
+  "total_elapsed_s": 503.7
+}

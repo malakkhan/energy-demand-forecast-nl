@@ -7,6 +7,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -108,21 +109,6 @@ def run_rocv(
     # Load data
     df = load_dataset()
 
-    # NTL image store (for spatial variants)
-    ntl_store = None
-    if cfg.uses_spatial:
-        from .ntl_images import NTLImageStore
-        ntl_store = NTLImageStore()
-        # Preload all images into RAM — eliminates GPFS I/O during training
-        logger.info("Preloading NTL images into RAM...")
-        ntl_store.preload_all()
-
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Device: %s", device)
-    if device.type == "cuda":
-        logger.info("GPU: %s", torch.cuda.get_device_name(0))
-
     # Generate folds
     rocv_cfg = BC.ROCVConfig()
     folds = list(rocv_folds(df, rocv_cfg))
@@ -139,7 +125,48 @@ def run_rocv(
             folds = folds[:max_folds]
             logger.info("Limiting to %d folds.", max_folds)
 
+    # Pre-load this task's OWN shard so a resumed run appends to its
+    # existing rows instead of overwriting them. With CMAT_SHARD_SUFFIX
+    # set (per-fold parallel tasks) each task reloads only its own file,
+    # never the combo base shard — one writer per file, always.
+    shard_suffix = os.environ.get("CMAT_SHARD_SUFFIX", "")
+    if shard_suffix and not shard_suffix.startswith("_"):
+        shard_suffix = "_" + shard_suffix
     results = []
+    shard_path = (
+        output_dir / "_shards"
+        / f"{model_name}_h{horizon_days}_s{cfg.seed}{shard_suffix}.csv"
+    )
+    if resume and shard_path.exists():
+        import pandas as pd
+        results = pd.read_csv(shard_path).to_dict("records")
+        logger.info("Resumed: loaded %d existing results from shard.", len(results))
+
+    # Early exit BEFORE the ~12-minute NTL image preload if every
+    # requested fold is already saved (in any shard) — makes re-submitted
+    # sweeps over completed combos nearly free.
+    if resume and folds and all(
+        is_fold_done(output_dir, model_name, f[0], horizon_days, seed=cfg.seed)
+        for f in folds
+    ):
+        logger.info("All requested folds already done — exiting before NTL preload.")
+        return
+
+    # NTL image store (for spatial variants)
+    ntl_store = None
+    if cfg.uses_spatial:
+        from .ntl_images import NTLImageStore
+        ntl_store = NTLImageStore()
+        # Preload all images into RAM — eliminates GPFS I/O during training
+        logger.info("Preloading NTL images into RAM...")
+        ntl_store.preload_all()
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
+    if device.type == "cuda":
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
+
     t0_total = time.time()
 
     for fold_idx, train_end, val_end, test_origin in folds:
@@ -203,7 +230,12 @@ def run_rocv(
                 "best_val_loss": result["best_val_loss"],
                 "n_params": result["n_params"],
                 "n_epochs": result["n_epochs"],
-                "train_time_s": fold_time,
+                "train_time_s": result["train_time_s"],
+                "infer_time_s": result["infer_time_s"],
+                "n_train": result["n_train"],
+                "n_val": result["n_val"],
+                "n_test": result["n_test"],
+                "elapsed_s": fold_time,
                 "seed": cfg.seed,
             }
 
@@ -235,6 +267,18 @@ def run_rocv(
         "ROCV complete: %d folds in %.1fs (%.1f min).",
         len(results), total_time, total_time / 60,
     )
+
+    # Best-effort merge of all shards into the combined CSV — but only
+    # for suffix-less (sequential) runs: dozens of concurrently-finishing
+    # per-fold tasks all rewriting the combined CSV non-atomically could
+    # leave it garbled for hours. Shards stay the source of truth; the
+    # fan-out chain runs one authoritative merge_shards job at the end.
+    if not shard_suffix:
+        try:
+            from baselines.merge_shards import merge_shards
+            merge_shards(output_dir, model_name)
+        except Exception as exc:
+            logger.warning("Shard merge failed (non-fatal, shards are safe): %s", exc)
 
 
 def main():

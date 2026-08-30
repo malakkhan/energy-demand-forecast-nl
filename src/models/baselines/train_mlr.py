@@ -162,7 +162,17 @@ def load_dataset(data_path: Optional[str] = None) -> pd.DataFrame:
                         len(missing), len(ALL_FEATURES), missing)
 
     # ── Select only the columns we need ──
-    cols_keep = ["timestamp", TARGET] + available
+    # Also retain the raw CBS/KNMI covariates: they are not model inputs
+    # themselves, but the per-fold PCA (fit_fold_pca, fitted inside each
+    # fold on training rows only) needs them present to derive the
+    # pca_fold_* components. Without this, the PCA step finds no candidate
+    # columns and is silently skipped.
+    raw_pca_candidates = [
+        c for c in df.columns
+        if (c.startswith("cbs_") or c.startswith("knmi_val_"))
+        and not c.startswith("pca_")
+    ]
+    cols_keep = ["timestamp", TARGET] + available + raw_pca_candidates
     df = df[[c for c in cols_keep if c in df.columns]].copy()
 
     # ── Drop rows where target is NaN ──
@@ -358,8 +368,13 @@ def run_mlr_fold(
     # ── 4b. Per-fold PCA (fitted on training data only) ───────────
     pca_cols, train_df, _, test_df = fit_fold_pca(train_df, None, test_df)
     if pca_cols:
-        usable_cols = usable_cols + pca_cols
-        logger.info("Added %d per-fold PCA cols. Total features: %d.", len(pca_cols), len(usable_cols))
+        feature_cols = feature_cols + pca_cols
+        # PCA leaves NaN components on rows whose raw covariates are
+        # incomplete (imputation runs before PCA here); fill causally
+        # within each split, mirroring the CMAT pipeline.
+        for _split in (train_df, test_df):
+            _split[pca_cols] = _split[pca_cols].ffill().bfill()
+        logger.info("Added %d per-fold PCA cols. Total features: %d.", len(pca_cols), len(feature_cols))
 
     # ── 5. Fit ───────────────────────────────────────────────────────
     X_train = train_df[feature_cols].values

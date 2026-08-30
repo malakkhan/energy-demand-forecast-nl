@@ -1,0 +1,212 @@
+{
+  "models": [
+    {
+      "name": "van_de_sande_mlr",
+      "horizons": [
+        {
+          "horizon_days": 60,
+          "rmse_mean": 31153.8809,
+          "mae_mean": 31052.7391,
+          "mape_pct_mean": 232.0509,
+          "mase_mean": 40.8354,
+          "nmae_mean": 2.2614,
+          "nrmse_mean": 2.2687,
+          "pcc_mean": 0.7506,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 75,
+          "rmse_mean": 20581.4909,
+          "mae_mean": 20442.9445,
+          "mape_pct_mean": 149.8982,
+          "mase_mean": 26.312,
+          "nmae_mean": 1.4619,
+          "nrmse_mean": 1.4721,
+          "pcc_mean": 0.707,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 90,
+          "rmse_mean": 20964.4791,
+          "mae_mean": 20766.6055,
+          "mape_pct_mean": 151.9773,
+          "mase_mean": 26.8523,
+          "nmae_mean": 1.4827,
+          "nrmse_mean": 1.4982,
+          "pcc_mean": 0.7568,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 105,
+          "rmse_mean": 23670.1182,
+          "mae_mean": 22612.4245,
+          "mape_pct_mean": 174.7073,
+          "mase_mean": 30.2801,
+          "nmae_mean": 1.7126,
+          "nrmse_mean": 1.7899,
+          "pcc_mean": 0.5578,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 120,
+          "rmse_mean": 47627.6709,
+          "mae_mean": 47036.3373,
+          "mape_pct_mean": 359.9773,
+          "mase_mean": 62.5094,
+          "nmae_mean": 3.5088,
+          "nrmse_mean": 3.5542,
+          "pcc_mean": 0.493,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 135,
+          "rmse_mean": 25731.8645,
+          "mae_mean": 25086.1291,
+          "mape_pct_mean": 196.0927,
+          "mase_mean": 33.9459,
+          "nmae_mean": 1.9266,
+          "nrmse_mean": 1.978,
+          "pcc_mean": 0.4398,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 150,
+          "rmse_mean": 14757.6491,
+          "mae_mean": 14134.5618,
+          "mape_pct_mean": 114.8027,
+          "mase_mean": 19.059,
+          "nmae_mean": 1.1277,
+          "nrmse_mean": 1.1776,
+          "pcc_mean": 0.4254,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 165,
+          "rmse_mean": 26111.4791,
+          "mae_mean": 25627.2027,
+          "mape_pct_mean": 203.3782,
+          "mase_mean": 35.4699,
+          "nmae_mean": 1.987,
+          "nrmse_mean": 2.0261,
+          "pcc_mean": 0.2775,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 180,
+          "rmse_mean": 21529.3473,
+          "mae_mean": 20924.8927,
+          "mape_pct_mean": 165.0618,
+          "mase_mean": 28.9971,
+          "nmae_mean": 1.6167,
+          "nrmse_mean": 1.6649,
+          "pcc_mean": 0.5051,
+          "n_folds": 11
+        }
+      ]
+    },
+    {
+      "name": "van_de_sande_prophet_lstm",
+      "horizons": [
+        {
+          "horizon_days": 60,
+          "rmse_mean": 1280.6945,
+          "mae_mean": 1032.7891,
+          "mape_pct_mean": 7.5318,
+          "mase_mean": 1.3702,
+          "nmae_mean": 0.0744,
+          "nrmse_mean": 0.0925,
+          "pcc_mean": 0.9142,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 75,
+          "rmse_mean": 1255.5409,
+          "mae_mean": 992.6091,
+          "mape_pct_mean": 7.4355,
+          "mase_mean": 1.305,
+          "nmae_mean": 0.0727,
+          "nrmse_mean": 0.0922,
+          "pcc_mean": 0.9031,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 90,
+          "rmse_mean": 1807.1055,
+          "mae_mean": 1481.6136,
+          "mape_pct_mean": 11.2336,
+          "mase_mean": 1.9852,
+          "nmae_mean": 0.1099,
+          "nrmse_mean": 0.1345,
+          "pcc_mean": 0.8642,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 105,
+          "rmse_mean": 1791.6091,
+          "mae_mean": 1481.1209,
+          "mape_pct_mean": 11.5136,
+          "mase_mean": 1.9926,
+          "nmae_mean": 0.1113,
+          "nrmse_mean": 0.135,
+          "pcc_mean": 0.861,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 120,
+          "rmse_mean": 1712.2373,
+          "mae_mean": 1365.0155,
+          "mape_pct_mean": 10.7636,
+          "mase_mean": 1.8435,
+          "nmae_mean": 0.1042,
+          "nrmse_mean": 0.131,
+          "pcc_mean": 0.8395,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 135,
+          "rmse_mean": 1719.7218,
+          "mae_mean": 1396.3091,
+          "mape_pct_mean": 11.0427,
+          "mase_mean": 1.8773,
+          "nmae_mean": 0.1077,
+          "nrmse_mean": 0.1329,
+          "pcc_mean": 0.8359,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 150,
+          "rmse_mean": 1912.3855,
+          "mae_mean": 1555.7218,
+          "mape_pct_mean": 12.4091,
+          "mase_mean": 2.0919,
+          "nmae_mean": 0.1209,
+          "nrmse_mean": 0.1489,
+          "pcc_mean": 0.8148,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 165,
+          "rmse_mean": 1792.1727,
+          "mae_mean": 1416.8473,
+          "mape_pct_mean": 11.3245,
+          "mase_mean": 1.8894,
+          "nmae_mean": 0.111,
+          "nrmse_mean": 0.1406,
+          "pcc_mean": 0.8164,
+          "n_folds": 11
+        },
+        {
+          "horizon_days": 180,
+          "rmse_mean": 2037.7245,
+          "mae_mean": 1649.87,
+          "mape_pct_mean": 13.3245,
+          "mase_mean": 2.2128,
+          "nmae_mean": 0.1295,
+          "nrmse_mean": 0.1602,
+          "pcc_mean": 0.8031,
+          "n_folds": 11
+        }
+      ]
+    }
+  ]
+}

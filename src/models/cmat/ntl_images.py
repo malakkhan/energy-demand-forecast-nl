@@ -98,8 +98,17 @@ class NTLImageStore:
             self._read_image_uncached
         )
 
-        # Optional: preloaded image array (set via preload_all())
-        self._preloaded: Optional[Dict[date, np.ndarray]] = None
+        # Optional: preloaded images, stored as ONE stacked array (set via
+        # preload_all()) plus a small date -> row-index map. A single big
+        # array is safe to share across forked DataLoader workers: only the
+        # one array PyObject gets refcount-touched, not one PyObject per
+        # image. A Dict[date, np.ndarray] of ~5000 separate array objects
+        # (the previous approach) triggers copy-on-write page duplication
+        # of the whole structure in every worker process on every access,
+        # which is what caused CMAT-Full search to be OOM-killed by SLURM
+        # after several hours.
+        self._preload_array: Optional[np.ndarray] = None
+        self._preload_index: Optional[Dict[date, int]] = None
 
         logger.info(
             "NTLImageStore: %d images indexed, mask shape %s, "
@@ -112,22 +121,31 @@ class NTLImageStore:
     def preload_all(self) -> None:
         """Load ALL NTL images into RAM for fast access during training.
 
+        Stored as one stacked (n_dates, H, W) array — not a dict of
+        per-date arrays — so the structure is safe to share across
+        forked DataLoader worker processes (see comment on
+        self._preload_array in __init__).
+
         Memory: ~5080 images × 768 × 992 × 4B ≈ 14.7 GB.
         This eliminates per-sample HDF5 I/O from GPFS.
         """
         import time as _time
         t0 = _time.time()
         dates = sorted(self._date_index.keys())
-        self._preloaded = {}
+        self._preload_array = np.empty(
+            (len(dates), C.NTL_IMG_H, C.NTL_IMG_W), dtype=np.float32
+        )
+        self._preload_index = {}
         for i, d in enumerate(dates):
-            self._preloaded[d] = self._read_image_uncached(d)
+            self._preload_array[i] = self._read_image_uncached(d)
+            self._preload_index[d] = i
             if (i + 1) % 500 == 0:
                 logger.info("  Preloaded %d / %d images...", i + 1, len(dates))
         elapsed = _time.time() - t0
-        mem_gb = len(self._preloaded) * C.NTL_IMG_H * C.NTL_IMG_W * 4 / 1e9
+        mem_gb = self._preload_array.nbytes / 1e9
         logger.info(
             "NTL preload complete: %d images in %.1fs (%.1f GB RAM).",
-            len(self._preloaded), elapsed, mem_gb,
+            len(dates), elapsed, mem_gb,
         )
 
     # ------------------------------------------------------------------
@@ -241,10 +259,10 @@ class NTLImageStore:
 
         Returns shape (NTL_IMG_H, NTL_IMG_W), dtype float32.
         """
-        if self._preloaded is not None:
-            img = self._preloaded.get(d)
-            if img is not None:
-                return img
+        if self._preload_array is not None:
+            idx = self._preload_index.get(d)
+            if idx is not None:
+                return self._preload_array[idx]
             # Date not in preloaded set → return zero image
             return np.zeros((C.NTL_IMG_H, C.NTL_IMG_W), dtype=np.float32)
         return self._get_image_cached(d)

@@ -23,6 +23,13 @@ VIIRS_DIR = Path(os.environ.get(
 GEOJSON_PATH = REPO_ROOT / "data" / "geo" / "gadm41_NLD_0.json"
 OUTPUT_DIR = REPO_ROOT / "src" / "models" / "cmat" / "results"
 
+# Allow runtime override via CMAT_CHECKPOINT_DIR env var (e.g. when the
+# default results/checkpoints/ is not writable by the running user).
+CHECKPOINT_DIR = Path(os.environ.get(
+    "CMAT_CHECKPOINT_DIR",
+    str(OUTPUT_DIR / "checkpoints"),
+))
+
 TARGET = "entsoe_load_mw"
 
 # ---------------------------------------------------------------------------

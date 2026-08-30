@@ -1,0 +1,76 @@
+{
+  "script": "train_mlr.py",
+  "started": "2026-08-25T17:43:36.193773",
+  "model": "van_de_sande_mlr",
+  "features": [
+    "day_of_year",
+    "week_of_year",
+    "quarter",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "year",
+    "is_public_holiday",
+    "is_school_holiday",
+    "load_lag_12h",
+    "load_lag_24h",
+    "load_lag_1w",
+    "load_lag_1y",
+    "solar_rad_lag_10h",
+    "humidity_lag_12h",
+    "temp_lag_107h"
+  ],
+  "n_features": 19,
+  "feature_groups": {
+    "temporal": [
+      "day_of_year",
+      "week_of_year",
+      "quarter",
+      "hour_sin",
+      "hour_cos",
+      "dow_sin",
+      "dow_cos",
+      "month_sin",
+      "month_cos",
+      "year",
+      "is_public_holiday",
+      "is_school_holiday"
+    ],
+    "lag": [
+      "load_lag_12h",
+      "load_lag_24h",
+      "load_lag_1w",
+      "load_lag_1y",
+      "solar_rad_lag_10h",
+      "humidity_lag_12h",
+      "temp_lag_107h"
+    ],
+    "pca": []
+  },
+  "rocv": {
+    "start_date": "2012-01-01",
+    "min_train_years": 2,
+    "fold_step_months": 13,
+    "horizons_days": [
+      60,
+      75,
+      90,
+      105,
+      120,
+      135,
+      150,
+      165,
+      180
+    ],
+    "validation_merged_into_training": true
+  },
+  "preprocessing": {
+    "max_nan_frac": 0.5,
+    "imputation": "ffill \u2192 bfill \u2192 median (no MICE)",
+    "outlier_removal": "IQR 1.5\u00d7 (train only)"
+  },
+  "total_elapsed_s": 46.6
+}

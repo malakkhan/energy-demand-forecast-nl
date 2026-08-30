@@ -122,18 +122,14 @@ def run_naive_fold(
     y_true = test_df[TARGET].values
     # Tile the 24h seed cyclically
     n_test = len(y_true)
-    y_pred = np.tile(seed_values,
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2), (n_test // n_seed) + 1)[:n_test]
+    y_pred = np.tile(seed_values, (n_test // n_seed) + 1)[:n_test]
 
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
     n_valid = valid.sum()
     if n_valid < 10:
         return {"n_test": n_valid}
 
-    metrics = compute_metrics(y_true[valid],
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2), y_pred[valid])
+    metrics = compute_metrics(y_true[valid], y_pred[valid])
     infer_time_s = time.time() - t0
     elapsed = infer_time_s
     train_time_s = 0.0
@@ -193,9 +189,7 @@ def run_drift_fold(
     # Predictions
     y_true = test_df[TARGET].values
     n_test = len(y_true)
-    h_steps = np.arange(1,
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2), n_test + 1)
+    h_steps = np.arange(1, n_test + 1)
     y_pred = y_last + drift_per_step * h_steps
 
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
@@ -203,9 +197,7 @@ def run_drift_fold(
     if n_valid < 10:
         return {"n_test": n_valid}
 
-    metrics = compute_metrics(y_true[valid],
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2), y_pred[valid])
+    metrics = compute_metrics(y_true[valid], y_pred[valid])
     infer_time_s = time.time() - t0
     elapsed = infer_time_s
     train_time_s = 0.0
@@ -248,9 +240,8 @@ def _run_model(model_name, fold_fn, df, folds, horizons):
                     "n_val": 0,
                     "train_time_s": result.get("train_time_s", 0.0),
                     "infer_time_s": result.get("infer_time_s", 0.0),
+                    "n_train": result.get("n_train", 0),
                     "seed": "N/A",
-        "train_time_s": round(train_time_s, 2),
-        "infer_time_s": round(infer_time_s, 2),
                     **m.to_dict(),
                 }
     return all_results
@@ -321,7 +312,7 @@ def main():
 
         out_path = os.path.join(out_dir, f"{dir_name}_rocv.json")
         with open(out_path, "w") as f:
-            json.dump(meta, f, indent=2)
+            json.dump(meta, f, indent=2, default=str)
         logger.info("Results saved to %s", out_path)
 
         _print_summary(model_name, results, args.horizons)

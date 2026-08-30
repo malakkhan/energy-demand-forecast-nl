@@ -10,8 +10,8 @@ Handles:
   - Crash-safe result persistence with file locking
 """
 
-import fcntl
 import logging
+import os
 import random
 import math
 import sys
@@ -150,7 +150,10 @@ class CMATDataset(Dataset):
     Features are pre-shifted by H hours upstream (in train_one_fold) so that
     at each row t the features correspond to time t−H while the target is
     the load at time t.  Each sliding window of W hours therefore produces
-    a direct H-ahead forecast.
+    a direct H-ahead forecast.  NTL images follow the same H-hour shift by
+    default (window ending at the sample's issue time); set
+    CMAT_NTL_UNSHIFTED=1 to reproduce the legacy ~1-day-lead image
+    convention used for the thesis results.
     """
 
     def __init__(
@@ -176,6 +179,11 @@ class CMATDataset(Dataset):
         self.target_min = target_min
         self.target_max = target_max
         self.horizon_hours = horizon_hours
+        # Image-date convention: horizon-shifted by default (images obey the
+        # same H-day lead as the tabular features). CMAT_NTL_UNSHIFTED=1
+        # restores the legacy ~1-day-lead convention used for the thesis
+        # results (kept only for exact reproduction of those runs).
+        self._ntl_unshifted = os.environ.get("CMAT_NTL_UNSHIFTED", "0") == "1"
 
         W = cfg.context_window_hours
 
@@ -253,16 +261,29 @@ class CMATDataset(Dataset):
 
         # NTL images (if spatial branch is active)
         if self.ntl_store is not None and self.cfg.uses_spatial:
-            # The features are horizon-shifted, so self.timestamps[i + self.W - 1]
-            # already refers to the forecast origin time.
-            # The NTL image date is the date of the forecast origin,
-            # shifted back by the horizon to avoid leakage.
-            origin_ts = self.timestamps[i + self.W - 1]
-            origin_date = origin_ts.date() if hasattr(origin_ts, 'date') else origin_ts
+            # self.timestamps holds the RAW row index (target-side times);
+            # only the feature COLUMNS were horizon-shifted upstream. To
+            # honour the same H-day availability constraint as the tabular
+            # predictors, the image window must therefore end at the last
+            # context row's time MINUS the horizon (the sample's issue
+            # time), not at the raw row time.
+            #
+            # Legacy behaviour (CMAT_NTL_UNSHIFTED=1): images end at the
+            # raw row time, i.e. ~1 day before the target — the convention
+            # under which the thesis results were produced (see the
+            # limitations discussion in the report).
+            last_ctx_ts = self.timestamps[i + self.W - 1]
+            if self._ntl_unshifted:
+                img_end_ts = last_ctx_ts
+            else:
+                img_end_ts = last_ctx_ts - timedelta(hours=self.horizon_hours)
+            img_end_date = (
+                img_end_ts.date() if hasattr(img_end_ts, 'date') else img_end_ts
+            )
 
             D_W = self.cfg.n_images
             imgs = self.ntl_store.get_images_for_window(
-                end_date=origin_date, n_days=D_W
+                end_date=img_end_date, n_days=D_W
             )  # (D_W, H_img, W_img)
 
             # Normalise NTL images
@@ -282,7 +303,7 @@ class CMATDataset(Dataset):
 def train_epoch(
     model: CMAT,
     loader: DataLoader,
-    criterion: PinballLoss,
+    criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     scaler: torch.amp.GradScaler = None,
@@ -329,7 +350,7 @@ def train_epoch(
 def evaluate(
     model: CMAT,
     loader: DataLoader,
-    criterion: PinballLoss,
+    criterion: nn.Module,
     device: torch.device,
     use_amp: bool = False,
 ) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -569,14 +590,33 @@ def train_one_fold(
         logger.warning("Test dataset has 0 samples — skipping fold.")
         return None
 
-    # Data loaders — use more workers and prefetching for GPU throughput
+    # Data loaders — use more workers and prefetching for GPU throughput.
+    #
+    # Exception: for spatial variants (ntl_store is not None), force
+    # num_workers=0. CMATDataset reads from ntl_store's preloaded ~15.5GB
+    # image array. Storing it as one contiguous array instead of a
+    # Dict[date, np.ndarray] (see ntl_images.py) avoids the classic
+    # per-element refcount copy-on-write leak, but empirically that alone
+    # is not enough: forking num_workers processes against an already
+    # ~15.5GB-resident process gets accounted against SLURM's cgroup
+    # memory limit at spawn time and OOM-kills the job within minutes,
+    # before training even starts (confirmed 2026-08-26 — killed right at
+    # first-batch worker spawn, not a gradual leak). num_workers=0 avoids
+    # forking entirely. Tab/NTL variants (no ntl_store) are unaffected and
+    # keep full worker parallelism.
     is_cuda = device.type == "cuda"
-    num_workers = min(8, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
-    # If NTL images are preloaded into RAM, workers just do numpy slicing (fast)
+    if ntl_store is not None:
+        # Override via CMAT_SPATIAL_NUM_WORKERS for controlled experiments
+        # (default 0 — the only setting confirmed safe so far).
+        num_workers = int(os.environ.get("CMAT_SPATIAL_NUM_WORKERS", "0"))
+    else:
+        num_workers = min(8, len(train_ds) // cfg.batch_size) if len(train_ds) > 0 else 0
     loader_kwargs = dict(
         pin_memory=is_cuda,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=(
+            int(os.environ.get("CMAT_PREFETCH_FACTOR", "4")) if num_workers > 0 else None
+        ),
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -589,15 +629,18 @@ def train_one_fold(
         pin_memory=is_cuda,
         persistent_workers=(val_workers > 0),
     )
+    test_workers = 0 if ntl_store is not None else 8
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=8,
+        num_workers=test_workers,
         pin_memory=is_cuda,
-        persistent_workers=(8 > 0),
+        persistent_workers=(test_workers > 0),
     )
 
     # Build model (H_pred=1: single-step prediction)
-    model = CMAT(cfg).to(device)
+    # n_cont must match cont_cols exactly (base features + this fold's
+    # per-fold PCA components, whose count varies fold-to-fold).
+    model = CMAT(cfg, n_cont=len(cont_cols)).to(device)
     # Initialise decoder's W_H for (W, 1)
     model.decoder.set_horizon(cfg.context_window_hours, 1)
     model.decoder._W_H = model.decoder._W_H.to(device)
@@ -679,7 +722,7 @@ def train_one_fold(
         model = model.to(device)
 
     # Save checkpoint for post-hoc analysis (permutation importance, etc.)
-    ckpt_dir = Path(C.OUTPUT_DIR) / "checkpoints"
+    ckpt_dir = Path(C.CHECKPOINT_DIR)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     seed = cfg.seed
     ckpt_path = ckpt_dir / f"ckpt_{cfg.variant.value}_h{horizon_hours // 24}d_f{fold_idx}_s{seed}.pt"
@@ -699,6 +742,11 @@ def train_one_fold(
     }, ckpt_path)
     logger.info("Saved checkpoint → %s", ckpt_path)
 
+    # Inverse Min-Max normalisation: x_original = x_norm * (max - min) + min
+    target_range = target_max - target_min
+    if target_range < 1e-8:
+        target_range = 1.0
+
     # Evaluate on validation set (for Optuna objective — no test leakage)
     val_loss_final, val_preds_norm, val_targets_norm = evaluate(
         model, val_loader, criterion, device
@@ -712,14 +760,11 @@ def train_one_fold(
     )
 
     # Evaluate on test set
+    t0_infer = time.time()
     test_loss, preds_norm, targets_norm = evaluate(
         model, test_loader, criterion, device
     )
-
-    # Inverse Min-Max normalisation: x_original = x_norm * (max - min) + min
-    target_range = target_max - target_min
-    if target_range < 1e-8:
-        target_range = 1.0
+    infer_time = time.time() - t0_infer
     preds_mw = preds_norm * target_range + target_min
     targets_mw = targets_norm * target_range + target_min
 
@@ -737,8 +782,12 @@ def train_one_fold(
         "targets_mw": targets_mw,
         "best_val_loss": best_val_loss,
         "train_time_s": train_time,
+        "infer_time_s": infer_time,
         "n_params": n_params,
         "n_epochs": epoch,
+        "n_train": len(train_ds),
+        "n_val": len(val_ds),
+        "n_test": len(test_ds),
     }
 
 
@@ -752,30 +801,37 @@ def save_fold_result_locked(
     output_dir: Path,
     model_name: str,
 ) -> None:
-    """Append a fold result with file-locking for parallel-job safety."""
-    csv_path = output_dir / f"rocv_results_{model_name}.csv"
-    lock_path = output_dir / f".lock_{model_name}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Append a fold result to this task's own shard file.
 
-    with open(lock_path, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            if csv_path.exists():
-                disk_rows = pd.read_csv(csv_path).to_dict("records")
-            else:
-                disk_rows = []
-            disk_rows.append(result_row)
-            # Deduplicate by (model, fold, horizon_days)
-            seen: Dict[tuple, Dict] = {}
-            for row in disk_rows:
-                key = (row["model"], int(row["fold"]), int(row["horizon_days"]),
-                       int(row.get("seed", 42)))
-                seen[key] = row
-            deduped = list(seen.values())
-            pd.DataFrame(deduped).to_csv(csv_path, index=False)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    Each (model, horizon, seed) combination owns an exclusive shard file
+    under ``_shards/``, so concurrent SLURM array tasks (possibly on
+    different nodes) never contend for the same path. This avoids
+    relying on fcntl.flock() for cross-node mutual exclusion, which is
+    not reliably honoured on this GPFS-mounted scratch filesystem and
+    previously caused silent data loss when multiple baseline tasks
+    wrote a shared CSV concurrently. Shards are combined into the final
+    rocv_results_{model_name}.csv via baselines/merge_shards.py.
+    """
     results_list.append(result_row)
+
+    shard_dir = output_dir / "_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    h = int(result_row["horizon_days"])
+    seed = int(result_row.get("seed", 42))
+    # Optional task-unique suffix (e.g. "_f7") lets multiple SLURM tasks
+    # work on the same (model, horizon, seed) concurrently, each owning
+    # its own file. merge_shards' glob + (fold, horizon, seed) dedup
+    # combines them. Empty suffix = classic one-shard-per-combo layout.
+    suffix = os.environ.get("CMAT_SHARD_SUFFIX", "")
+    if suffix and not suffix.startswith("_"):
+        suffix = "_" + suffix
+    shard_path = shard_dir / f"{model_name}_h{h}_s{seed}{suffix}.csv"
+    # Write via a pid-unique tmp + atomic rename: a task killed mid-write
+    # can never leave a truncated shard, and the .tmp name is outside the
+    # merge glob so partial files are never ingested.
+    tmp_path = shard_path.with_name(f"{shard_path.name}.tmp.{os.getpid()}")
+    pd.DataFrame(results_list).to_csv(tmp_path, index=False)
+    os.replace(tmp_path, shard_path)
 
 
 def is_fold_done(
@@ -785,15 +841,27 @@ def is_fold_done(
     horizon_days: int,
     seed: int = None,
 ) -> bool:
-    """Check if a fold/horizon combo has already been completed."""
-    csv_path = output_dir / f"rocv_results_{model_name}.csv"
-    if not csv_path.exists():
-        return False
-    try:
-        df = pd.read_csv(csv_path)
-        match = df[(df["fold"] == fold_idx) & (df["horizon_days"] == horizon_days)]
-        if "seed" in df.columns and seed is not None:
-            match = match[match["seed"] == seed]
-        return len(match) > 0
-    except Exception:
-        return False
+    """Check if a fold/horizon/seed combo has already been completed,
+    by looking at the combo's base shard AND any task-suffixed shards
+    (e.g. cmat_full_h60_s42_f7.csv from per-fold parallel tasks)."""
+    s = seed if seed is not None else 42
+    shard_dir = output_dir / "_shards"
+    candidates = [shard_dir / f"{model_name}_h{horizon_days}_s{s}.csv"]
+    # The mandatory "_" after the seed prevents cross-seed matches
+    # (s7_* cannot match s77.csv).
+    candidates += sorted(shard_dir.glob(f"{model_name}_h{horizon_days}_s{s}_*.csv"))
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            df = pd.read_csv(p)
+            hit = df[
+                (df["fold"] == fold_idx)
+                & (df["horizon_days"] == horizon_days)
+                & (df["seed"] == s)
+            ]
+            if len(hit) > 0:
+                return True
+        except Exception:
+            continue
+    return False

@@ -192,7 +192,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Load checkpoint ──
-    ckpt_dir = Path(C.OUTPUT_DIR) / "checkpoints"
+    # CHECKPOINT_DIR honours the CMAT_CHECKPOINT_DIR env override, matching
+    # where run_rocv.py under the leakage-fixed pipeline saves checkpoints.
+    ckpt_dir = Path(C.CHECKPOINT_DIR)
     ckpt_path = ckpt_dir / f"ckpt_{args.variant}_h{args.horizon}d_f{args.fold}_s{args.seed}.pt"
 
     if not ckpt_path.exists():
@@ -212,12 +214,17 @@ def main():
     ntl_std = ckpt.get("ntl_std", 1.0)
 
     # ── Rebuild model ──
-    model = CMAT(cfg).to(device)
+    # n_cont must match training exactly: base features + this fold's
+    # per-fold PCA columns. The saved cont_min array has one entry per
+    # continuous input, so its length is the authoritative count.
+    n_cont = len(cont_min)
+    model = CMAT(cfg, n_cont=n_cont).to(device)
     model.decoder.set_horizon(cfg.context_window_hours, 1)
     model.decoder._W_H = model.decoder._W_H.to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    logger.info("Model loaded: %s params", f"{ckpt['n_params']:,}")
+    logger.info("Model loaded: %s params (%d continuous inputs)",
+                f"{ckpt['n_params']:,}", n_cont)
 
     # ── Load NTL images if needed ──
     ntl_store = None
@@ -232,20 +239,26 @@ def main():
     horizon_days = args.horizon
     horizon_hours = horizon_days * 24
 
-    # Load full dataset and get fold split
+    # Load full dataset and get fold split — the SAME 13-month-step ROCV
+    # protocol as run_rocv.py (leakage-fixed pipeline), not the old
+    # annual-origin split.
     full_df = load_dataset()
 
-    # ROCV split: same logic as run_rocv.py
-    cutoffs = pd.date_range("2014-01-01", "2024-01-01", freq="YS")
-    fold_idx = args.fold
-    train_end = cutoffs[fold_idx]
-    test_start = train_end
-    test_end = test_start + pd.DateOffset(days=horizon_days)
-    val_start = train_end - pd.DateOffset(days=horizon_days)
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from baselines import config as BC
+    from baselines.data_loader import rocv_folds, split_fold
 
-    train_df = full_df[:val_start - pd.Timedelta(hours=1)].copy()
-    val_df = full_df[val_start:train_end - pd.Timedelta(hours=1)].copy()
-    test_df = full_df[test_start:test_end].copy()
+    rocv_cfg = BC.ROCVConfig()
+    folds = list(rocv_folds(full_df, rocv_cfg))
+    fold_idx = args.fold
+    if fold_idx >= len(folds):
+        logger.error("Fold %d not available (max=%d)", fold_idx, len(folds) - 1)
+        return
+    _, train_end, val_end, test_origin = folds[fold_idx]
+    train_df, val_df, test_df = split_fold(
+        full_df, train_end, val_end, test_origin, horizon_days
+    )
 
     logger.info("Fold %d: train=%d, val=%d, test=%d",
                 fold_idx, len(train_df), len(val_df), len(test_df))
@@ -253,7 +266,11 @@ def main():
     # Get feature columns
     cont_cols, cat_cols = get_feature_columns(train_df, cfg)
 
-    # Apply feature shifting (same as train_one_fold)
+    # ── Preprocessing: must mirror train_one_fold EXACTLY ──
+    # Order there: shift → IQR clip (train only) → per-fold PCA (fit on
+    # train, transform all splits) → ffill → MinMax (via saved stats).
+
+    # 1. Feature shifting
     if horizon_hours > 0:
         combined = pd.concat([train_df, val_df, test_df])
         for col in cont_cols:
@@ -262,7 +279,31 @@ def main():
         val_df = combined.loc[val_df.index].copy()
         test_df = combined.loc[test_df.index].copy()
 
-    # Forward-fill NaNs
+    # 2. IQR clipping on training data (needed so the PCA refit below sees
+    #    identical inputs to the one fitted at training time)
+    from .train import clip_iqr, _fit_fold_pca
+    train_df = clip_iqr(train_df, cont_cols)
+
+    # 3. Per-fold PCA — deterministic refit on the same training data
+    #    reproduces the identical components the checkpointed model was
+    #    trained with; transforms all splits and appends the PCA columns.
+    pca_col_names, train_df, val_df, test_df = _fit_fold_pca(
+        train_df, val_df, test_df,
+    )
+    if pca_col_names:
+        cont_cols = cont_cols + pca_col_names
+        logger.info("Recreated %d per-fold PCA columns. Total continuous: %d.",
+                    len(pca_col_names), len(cont_cols))
+    if len(cont_cols) != n_cont:
+        logger.error(
+            "Feature count mismatch: rebuilt %d continuous cols but the "
+            "checkpoint expects %d — preprocessing drifted from training. "
+            "Aborting rather than computing wrong importances.",
+            len(cont_cols), n_cont,
+        )
+        return
+
+    # 4. Forward-fill NaNs
     for split_df in [train_df, val_df, test_df]:
         for col in cont_cols + [C.TARGET]:
             if col in split_df.columns:

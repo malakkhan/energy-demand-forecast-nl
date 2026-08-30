@@ -1,0 +1,20 @@
+{
+  "context_window_hours": 1,
+  "embed_dim": 64,
+  "self_attn_heads": 8,
+  "transformer_depth": 1,
+  "dropout": 0.2,
+  "batch_size": 128,
+  "learning_rate": 0.00018185840869366,
+  "weight_decay": 1.5203349979005766e-05,
+  "variant": "ntl",
+  "horizon_days": 105,
+  "best_val_loss": 0.03796429111473802,
+  "best_trial_number": 0,
+  "test_rmse": 4475.694103154315,
+  "test_mae": 3908.0571353029477,
+  "test_mape": 27.134414933090007,
+  "test_pcc": 0.10549699046549993,
+  "test_n_params": 64449,
+  "test_n_epochs": 9
+}

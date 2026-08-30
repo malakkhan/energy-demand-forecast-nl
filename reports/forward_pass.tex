@@ -1,0 +1,77 @@
+\section{Model Forward Pass Description}
+\label{sec:apx:third_appendinx}
+
+
+\subsection{Phase 1: Modality-Specific Feature Encoding}
+
+Heterogeneous data is first isolated and projected into a shared latent dimensionality $d$ via modality-specific encoders. The input vector at each hourly timestep $t$ consists of $16 + k$~continuous and 3~categorical features, where $k \in [7, 16]$ is the number of per-fold PCA components retained for that fold (Appendix~\ref{sec:apx:second_appendix}), each of which are handled distinctly. The 6~cyclical sine/cosine pairs, 3~ordinal temporal features (\texttt{day\_of\_year}, \texttt{week\_of\_year}, \texttt{quarter}), 4~autoregressive load lags, 3~CCF-optimal weather lags, and $k$~PCA components are jointly projected via a shared linear layer:
+    \begin{equation}
+        h_{cont,t} = W_c\, x_{cont,t} + b_c, \qquad
+        W_c \in \mathbb{R}^{(16+k) \times d}
+    \end{equation}
+
+The two binary indicators (\texttt{is\_public\_holiday}, \texttt{is\_school\_holiday}; each with 2~levels) and the calendar year (14~levels, 2012--2025) are each mapped via per-feature learned embedding tables $E_j$:
+    \begin{equation}
+        h_{cat,t} = \sum_{j=1}^{3} E_j\!\left[x_{j,t}\right], \qquad
+        E_j \in \mathbb{R}^{|C_j| \times d}
+    \end{equation}
+where $|C_j|$ denotes the cardinality of categorical feature $j$. The continuous and categorical projections are summed element-wise and augmented with a learned temporal positional encoding to form the initial tabular token sequence:
+    \begin{equation}
+        z_t^{(0)} = h_{cont,t} + h_{cat,t} + \text{PE}(t), \qquad
+        Z_{tab}^{(0)} \in \mathbb{R}^{W \times d}
+    \end{equation}
+
+All daily VIIRS VNP46A2-all satellite images falling within the $W$-hour lookback window are ingested, yielding $D_W = \lceil W / 24 \rceil$ single-channel 2D arrays $\{X_{img}^{(k)}\}_{k=1}^{D_W}$, each $X_{img}^{(k)} \in \mathbb{R}^{1 \times H_I \times W_I}$, where $H_I$ and $W_I$ denote the image spatial dimensions. Each image is independently divided into $N_p = \lfloor H_I/P \rfloor \times \lfloor W_I/P \rfloor$ non-overlapping patches of size $P \times P$ pixels, flattened, and linearly mapped into $d$ dimensions. Patch tokens are augmented with both a \textit{spatial positional encoding} (SPE), encoding the within-image patch position, and a \textit{temporal day positional encoding} (DPE), encoding which day in the lookback window the patch originates from:
+    \begin{equation}
+        z_{img}^{(k,i)} = W_{patch}\,\text{flatten}(p_i^{(k)})
+        + b_{patch} + \text{SPE}(i) + \text{DPE}(k)
+    \end{equation}
+    All patch tokens across all $D_W$ days are concatenated to form the
+    full spatio-temporal visual context:
+    \begin{equation}
+        Z_{img} = \bigl[z_{img}^{(1,1)},\ldots,z_{img}^{(1,N_p)},
+        \;\ldots,\;
+        z_{img}^{(D_W,1)},\ldots,z_{img}^{(D_W,N_p)}\bigr]
+        \in \mathbb{R}^{(D_W \cdot N_p) \times d}
+    \end{equation}
+
+This formulation should allow the cross-attention mechanism to capture temporal evolution of regional illumination, including variations in illumination at industrial areas such as the Port of Rotterdam. A full Vision Transformer (ViT) backbone is explicitly avoided to prevent catastrophic memorisation of the limited ${\sim}5{,}080$ unique daily spatial arrays, following the observations of ~\cite{schubnel_solarcrossformer_2025}.
+
+\subsection{Phase 2: Temporal Self-Attention and Cross-Modal Fusion}
+
+\paragraph{Intra-modal Self-Attention.}
+The tabular token sequence $Z_{tab}^{(0)}$ is processed through $L$ stacked layers of multi-head self-attention (MSA) with $h_s$ heads. Each layer applies MSA followed by a position-wise feed-forward network (FFN; fixed expansion factor $r_{ff} = 4$), with residual connections and layer normalisation after each sub-layer:
+\begin{align}
+    Z' &= \text{LayerNorm}\!\left(
+        Z_{tab}^{(\ell-1)} + \text{MSA}_{h_s}\!\left(
+        Z_{tab}^{(\ell-1)}\right)\right) \\
+    Z_{tab}^{(\ell)} &= \text{LayerNorm}\!\left(
+        Z' + \text{FFN}(Z')\right)
+\end{align}
+The self-attention mechanism should capture autoregressive patterns within the $W$-step lookback window. Because the entire lookback is observed at prediction time, self-attention operates bidirectionally.
+
+\paragraph{Cross-Modal Attention.}
+After $L$ self-attention layers, fusion with the spatial modality occurs via a cross-attention layer with $h_c$ heads. The Queries ($Q$) are derived from the temporal sequence $Z_{tab}^{(L)}$, while the Keys ($K$) and Values ($V$) are projected from the spatio-temporal patch tokens $Z_{img}$:
+\begin{equation}
+    Z_{cross} = \text{softmax}\!\left(
+    \frac{Q\, K^\top}{\sqrt{d_k}}\right) V
+\end{equation}
+where $Q = Z_{tab}^{(L)} W_Q \in \mathbb{R}^{W \times d_k}$, $K = Z_{img}\, W_K \in \mathbb{R}^{(D_W \cdot N_p) \times d_k}$, $V = Z_{img}\, W_V$, and $d_k = d / h_c$. Since all spatial context is strictly historical by construction of the lookback window, no causal mask is required. The fused representation is produced via a residual connection:
+\begin{equation}
+    Z_{fused} = \text{LayerNorm}\!\left(
+    Z_{tab}^{(L)} + Z_{cross}\right) \in \mathbb{R}^{W \times d}
+\end{equation}
+This mechanism allows each hourly temporal token to dynamically "attend" to specific spatial regions on specific days. For example, this should allow the model to learn the expected impact of concentrated weekday industrial illumination versus subdued weekend residential patterns. The cross-attention operates over $D_W \cdot N_p$ spatial key--value tokens, enabling the model to distinguish day-specific spatial configurations across the $D_W$-day lookback window.
+
+
+\subsection{Phase 3: Factorised Point-Forecast Decoder}
+
+The fused latent state $Z_{fused}$ is processed via a factorised bilinear projection that maps input timesteps to forecast steps:
+\begin{equation}
+    \hat{Y} = W_H^\top\, Z_{fused}\, w_\tau
+    \in \mathbb{R}^{H_{pred}}
+\end{equation}
+where $W_H \in \mathbb{R}^{W \times H_{pred}}$ maps input timesteps to forecast steps and $w_\tau \in \mathbb{R}^{d}$ maps latent dimensions to the scalar point-forecast channel. This factorisation avoids a monolithic output matrix of size $Wd \times H_{pred}$, reducing decoder parameters by orders of magnitude while maintaining expressiveness. In the deployed configuration each sample produces a single direct $H$-hour-ahead point estimate ($H_{pred} = 1$): the continuous predictors are shifted by the horizon so that the features at each window position correspond to time $t - H$ while the target remains the load at $t$, and hourly forecasts across the full test horizon are obtained by evaluating the model on consecutive hourly windows. Predictions are never fed back as inputs, so no recursive error accumulation occurs.
+
+
+\clearpage

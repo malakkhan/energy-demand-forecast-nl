@@ -1,6 +1,6 @@
 # Energy Demand Forecast — Netherlands
 
-A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherlands energy-demand dataset from heterogeneous raw sources. The pipeline ingests VIIRS VNP46A1/A2 satellite nighttime-lights imagery, CBS consumer energy tariffs, CBS Consumer Price Index, CBS gas and electricity prices by consumption band, CBS quarterly economic statistics, ENTSO-E electricity load data, KNMI hourly in-situ meteorological observations (both non-validated and validated), and Dutch public/school holiday calendars, transforming them into a single, contiguous, year-partitioned Parquet dataset suitable for downstream forecasting models.
+A three-phase ETL pipeline and multi-model forecasting framework for hourly Netherlands electricity-demand prediction. The pipeline ingests VIIRS VNP46A1/A2 satellite nighttime-lights imagery, CBS consumer energy tariffs, CBS Consumer Price Index, CBS gas and electricity prices by consumption band, CBS quarterly economic statistics, ENTSO-E electricity load data, KNMI hourly in-situ meteorological observations (both non-validated and validated), and Dutch public/school holiday calendars, transforming them into a single, contiguous, year-partitioned Parquet dataset (145 columns, 2012–2025). The modelling layer evaluates six literature baselines and a novel Cross-Modal Attention Transformer (CMAT) across four ablation variants using Rolling-Origin Cross-Validation (ROCV) on SURF's Snellius supercomputer.
 
 ---
 
@@ -13,9 +13,13 @@ A three-phase Apache Spark / Python ETL pipeline for building an hourly Netherla
    - [Phase 2 — Aggregate](#phase-2--aggregate)
    - [Phase 3 — Merge](#phase-3--merge)
 4. [Exploratory Data Analysis](#exploratory-data-analysis)
-5. [Running on SLURM (Snellius)](#running-on-slurm-snellius)
-6. [Observability — Logs, Jobs & Efficiency](#observability--logs-jobs--efficiency)
-7. [Directory Layout](#directory-layout)
+5. [Forecasting Models](#forecasting-models)
+   - [Baseline Models](#baseline-models)
+   - [CMAT — Cross-Modal Attention Transformer](#cmat--cross-modal-attention-transformer)
+6. [Results & Report Generation](#results--report-generation)
+7. [Running on SLURM (Snellius)](#running-on-slurm-snellius)
+8. [Observability — Logs, Jobs & Efficiency](#observability--logs-jobs--efficiency)
+9. [Directory Layout](#directory-layout)
 
 ---
 
@@ -27,13 +31,15 @@ This project is designed to run on **Snellius** (SURF's national supercomputer).
 
 | Aspect | Detail |
 |---|---|
-| **Cluster** | Snellius (SURF), `rome` partition |
-| **Nodes** | Single-node jobs; Rome nodes have **128 CPU cores**, **229 GB RAM** |
+| **Cluster** | Snellius (SURF), `rome` partition (CPU) + `gpu_a100` partition (GPU) |
+| **CPU Nodes** | Rome nodes: **128 CPU cores**, **229 GB RAM** |
+| **GPU Nodes** | A100 nodes: **18 CPU cores**, **1× NVIDIA A100 40 GB**, **96 GB RAM** |
 | **Filesystem** | GPFS at `/projects/prjs2061/` (shared project space) |
 | **Scratch** | `$TMPDIR` / `$SLURM_TMPDIR` — node-local SSD, used for Spark shuffle spill |
 | **Scheduler** | SLURM (sbatch / squeue / seff) |
 | **Python** | 3.9+ (system Python on Snellius; a `pip-compile`-locked `requirements.txt` is provided) |
 | **Java** | OpenJDK 17+ (required by PySpark/Spark 4.x; available via `module load` on Snellius) |
+| **CUDA** | 12.1+ (required for CMAT GPU training; load via `module load 2023 CUDA/12.1.1`) |
 
 ### Python Dependencies
 
@@ -55,6 +61,11 @@ Key packages:
 | `pyspark` (4.x) | Distributed aggregation and joins in Phases 2 & 3 |
 | `openpyxl` | Excel reading for ENTSO-E `.xlsx` workbooks |
 | `requests` | KNMI Open Data API downloads |
+| `torch` | PyTorch — LSTM baselines, Seq2Seq, and CMAT training |
+| `scikit-learn` | MLR baseline, PCA, preprocessing, imputation |
+| `prophet` | Prophet component of Prophet-LSTM baseline |
+| `statsmodels` | SARIMAX baseline |
+| `optuna` | Hyperparameter search for CMAT |
 
 ### Environment Variables (`.env`)
 
@@ -624,6 +635,18 @@ A batch-mode EDA script that produces all time series analysis figures and saves
 - CCF uses FFT-based `scipy.signal.correlate` — O(n log n) vs O(n²)
 - `OMP_NUM_THREADS` set to match SLURM CPU allocation for NumPy BLAS parallelism
 
+**Additional analysis scripts:**
+
+| Script | Purpose |
+|--------|---------|
+| `analysis/gap_analysis.py` | KNMI data gap analysis utility; results in `analysis/gap_analysis_results.md` |
+| `analysis/pca_elbow.py` | PCA elbow diagrams for CBS, KNMI validated, and combined feature groups |
+| `analysis/pca_elbow_full_coverage.py` | PCA elbow for full-coverage (CBS + KNMI validated) feature subset |
+| `analysis/pca_elbow_load_lags.py` | PCA elbow diagram for load lag features |
+| `analysis/pca_covariance_matrix.py` | PCA covariance matrix visualisation |
+| `analysis/regenerate_stl_full.py` | Regenerates STL decomposition plot for ENTSO-E over the full date range |
+| `analysis/md_to_pdf.py` | Markdown → PDF conversion utility (used for `eda_report.md` → `eda_report.pdf`) |
+
 **Run:**
 
 ```bash
@@ -636,11 +659,225 @@ sbatch analysis/run_analysis.slurm
 
 ---
 
+## Forecasting Models
+
+All forecasting models are located under `src/models/` and share a common evaluation protocol:
+
+- **Target variable**: `entsoe_load_mw` (hourly Netherlands electricity load in MW)
+- **Evaluation**: Rolling-Origin Cross-Validation (ROCV) with expanding training windows
+  - ROCV origin starts at 2015-01-01, advances by 13 months per fold (cycles through calendar months to avoid seasonal sampling bias)
+  - Minimum 2 years of training data
+  - 10 folds total (fold 0–9)
+- **Forecast horizons**: 60, 75, 90, 105, 120, 135, 150, 165, 180 days (baselines); 60, 120, 180 days (CMAT)
+- **Metrics**: RMSE, MAE, MAPE, MASE, nMAE, nRMSE, PCC — all computed on original-scale MW values
+- **Multi-seed**: Neural models (Seq2Seq, Prophet-LSTM, CMAT) use seeds {42, 123, 7} for reproducibility
+
+### Baseline Models
+
+**Location:** `src/models/baselines/`
+
+Six baseline models replicated from the literature:
+
+| # | Model | Reference | Architecture |
+|---|-------|-----------|-------------|
+| 1 | **van de Sande MLR** | van de Sande et al. | scikit-learn `LinearRegression` with 20 hand-picked + PCA features |
+| 2 | **van de Sande Prophet-LSTM** | van de Sande et al. (Huang) | Prophet → LSTM(30, 90) ensemble |
+| 3 | **Ashtar SARIMAX** | Ashtar et al. | statsmodels `SARIMAX(1,0,1)(1,0,1,168)` |
+| 4 | **Ashtar SARIMAX-LSTM** | Ashtar et al. | SARIMAX residuals → PyTorch LSTM |
+| 5 | **Ashtar Seq2Seq** | Ashtar et al. | Encoder-Decoder LSTM(64), teacher forcing |
+| 6 | **Seasonal Naïve** | — | ŷ(t) = y(t − 365 days), no fitting required |
+
+#### Key source files
+
+| File | Purpose |
+|------|---------|
+| `config.py` | Unified configuration: paths, feature definitions, hyperparameters for all 6 models |
+| `data_loader.py` | Data loading, preprocessing (IQR/Winsorization/MICE/forward-fill), feature engineering, ROCV fold generation |
+| `evaluation.py` | 7-metric evaluation, crash-safe CSV checkpointing, per-horizon aggregation, metric evolution plots |
+| `mlr.py` | MLR model implementation |
+| `prophet_lstm.py` | Prophet-LSTM ensemble (reference-faithful Huang architecture) |
+| `sarimax.py` | SARIMAX model implementation |
+| `sarimax_lstm.py` | SARIMAX-LSTM residual stacking |
+| `seq2seq.py` | Encoder-Decoder LSTM with iterative multi-chunk decoding |
+| `train_baselines.py` | Unified training script for all models |
+| `train_mlr.py` | Dedicated MLR trainer with explicit 36-feature ROCV |
+| `train_prophet_lstm_v2.py` | Dedicated Prophet-LSTM trainer with explicit 36-feature ROCV |
+| `train_seq2seq_v2.py` | Dedicated Seq2Seq trainer with multi-seed/multi-horizon ROCV |
+| `train_seasonal_naive.py` | Seasonal naïve baseline evaluation |
+| `merge_shards.py` | Merges per-(model, horizon, seed) SLURM shard CSVs into combined results |
+| `aggregate_results.py` | Post-processing: unified CSV, summary tables, LaTeX comparison tables |
+
+#### Running Baselines
+
+```bash
+# Unified runner (all models, all horizons, all folds):
+python -u src/models/baselines/train_baselines.py
+
+# Specific model and horizon:
+python -u src/models/baselines/train_baselines.py --model van_de_sande_mlr --horizon 60
+
+# Quick smoke test (1 fold, 1 horizon):
+python -u src/models/baselines/train_baselines.py --model van_de_sande_mlr --quick
+
+# Dedicated MLR (with 36-feature set):
+python -u src/models/baselines/train_mlr.py --horizon 60
+
+# SLURM batch:
+sbatch src/models/baselines/run_mlr.slurm
+sbatch src/models/baselines/run_seq2seq_3seeds_3horizons.slurm
+sbatch src/models/baselines/run_prophet_lstm_3seeds_3horizons.slurm
+
+# Post-processing — merge shards and aggregate:
+python -m src.models.baselines.merge_shards --model-name ashtar_seq2seq
+python -u src/models/baselines/aggregate_results.py
+```
+
+#### Results
+
+Results are stored in `src/models/baselines/results/`:
+- `rocv_results_{model_name}.csv` — per-fold metrics for each (model, horizon, seed)
+- `rocv_results_{model_name}.json` — full results with predictions
+- `run_metadata_{model_name}.json` — experiment metadata (timing, config, versions)
+- `_shards/` — per-SLURM-task shard CSVs (crash-safe incremental persistence)
+- `plots/` — metric evolution plots (metrics across ROCV folds)
+- `seasonal_naive/` — seasonal naïve baseline results
+- `drift/`, `naive_24h/` — additional naïve baseline results
+
+---
+
+### CMAT — Cross-Modal Attention Transformer
+
+**Location:** `src/models/cmat/`
+
+A novel Cross-Modal Attention Transformer that fuses tabular time-series features with 2D satellite nighttime-light imagery via dedicated cross-attention. Implements four ablation variants:
+
+| Variant | Tag | Description |
+|---------|-----|-------------|
+| **CMAT-Tab** | `tab` | Tabular self-attention only (spatial branch disabled) |
+| **CMAT-NTL** | `ntl` | Tabular + scalar NTL aggregate (no spatial image branch) |
+| **CMAT-Early** | `early` | Both branches, early fusion via concatenation + shared self-attention |
+| **CMAT-Full** | `full` | Both branches, dedicated cross-modal attention |
+
+#### Architecture (from `model.py`)
+
+```
+Phase 1: Modality-specific feature encoding
+  → Tabular: continuous features + learned categorical embeddings
+  → Spatial: CNN backbone on 768×992 NTL images (CMAT-Full/Early only)
+
+Phase 2: Temporal self-attention + cross-modal fusion
+  → Windowed multi-head self-attention on tabular tokens
+  → Cross-attention: tabular queries attend to spatial keys/values (CMAT-Full)
+  → Early fusion: concatenation + shared SA (CMAT-Early)
+
+Phase 3: Factorised probabilistic decoder
+  → Point prediction (MSE loss)
+```
+
+#### Key source files
+
+| File | Purpose |
+|------|---------|
+| `config.py` | All hyperparameters, feature definitions, search space, paths, ROCV protocol |
+| `model.py` | PyTorch model implementing all 4 variants |
+| `train.py` | Training pipeline: dataset creation, AdamW + cosine annealing, early stopping, crash-safe file-locked persistence |
+| `ntl_images.py` | `NTLImageStore`: reads VNP46A2 HDF5 → fixed-size 2D tensors with LRU cache, NL polygon masking |
+| `search.py` | Optuna hyperparameter search (per-horizon, per-variant) |
+| `run_rocv.py` | Full ROCV evaluation across all fold/horizon combinations |
+| `feature_importance.py` | Permutation feature importance (ΔRMSE) for trained checkpoints |
+| `submit_fleet_wave.sh` | Fleet job submission for per-fold GPU ROCV on `gpu_a100` |
+
+#### Features (36 total = 32 continuous + 4 categorical)
+
+- **16 core continuous**: 6 cyclical temporal (sin/cos for hour, day-of-week, month), 3 ordinal temporal, 4 autoregressive load lags, 3 CCF-optimal weather lags
+- **PCA components**: fitted **per-fold** on training data only (95% variance threshold) to prevent future data leakage
+- **4 categorical**: embeddings for temporal/calendar features
+
+#### Running CMAT
+
+```bash
+# ROCV evaluation (single variant + horizon):
+python -m src.models.cmat.run_rocv --variant full --horizon 60 --resume
+
+# Quick validation (1 fold):
+python -m src.models.cmat.run_rocv --variant full --horizon 60 --quick
+
+# Hyperparameter search:
+python -m src.models.cmat.search --variant tab --horizon 60
+
+# Feature importance:
+python -m src.models.cmat.feature_importance --variant tab --horizon 60 --fold 0 --seed 42
+
+# SLURM batch (GPU):
+sbatch src/models/cmat/run_cmat_full_rocv.slurm
+
+# Fleet submission (parallel per-fold GPU jobs):
+bash src/models/cmat/submit_fleet_wave.sh 5      # folds 1–5
+bash src/models/cmat/submit_fleet_wave.sh 9 6    # folds 6–9
+```
+
+#### Results
+
+Results are stored in `src/models/cmat/results/`:
+- `best_config_{variant}_h{horizon}d.json` — best Optuna configuration per variant/horizon
+- `trial_history_{variant}_h{horizon}d.jsonl` — full Optuna search history
+- `rocv_results_cmat_{variant}.csv` / `.json` — per-fold ROCV metrics
+- `feature_importance_{variant}_h{horizon}d.csv` — permutation importance rankings
+- `_shards/` — per-SLURM-task shard CSVs (crash-safe for multi-GPU fleet jobs)
+- `checkpoints_v2/` — saved PyTorch model checkpoints (`.pt` files)
+
+---
+
+## Results & Report Generation
+
+### LaTeX Table Generators
+
+**Location:** `src/analysis/`
+
+Scripts that read live result CSVs and generate publication-ready LaTeX tables for the thesis:
+
+| Script | Output | Description |
+|--------|--------|-------------|
+| `generate_results_tables.py` | `reports/results_tables.tex` | Per-fold ROCV longtables comparing all baselines and CMAT variants across 5 metrics (RMSE, MAPE, MAE, MASE, PCC); best per row bolded, multi-seed mean±std |
+| `generate_fi_tables.py` | `reports/feature_importance_tables.tex` | Top-10 permutation feature importance per CMAT variant per horizon |
+| `generate_complexity_table.py` | `reports/complexity_table.tex` | Computational complexity: parameters, mean train/inference wall-clock, epochs per model |
+
+```bash
+# Regenerate all tables:
+.venv/bin/python3 src/analysis/generate_results_tables.py > reports/results_tables.tex
+.venv/bin/python3 src/analysis/generate_fi_tables.py > reports/feature_importance_tables.tex
+.venv/bin/python3 src/analysis/generate_complexity_table.py > reports/complexity_table.tex
+```
+
+### Reports Directory
+
+**Location:** `reports/`
+
+Contains generated LaTeX fragments and thesis components:
+
+| File | Description |
+|------|-------------|
+| `results_tables.tex` | ROCV comparison tables (generated) |
+| `feature_importance_tables.tex` | Feature importance tables (generated) |
+| `complexity_table.tex` | Computational complexity table (generated) |
+| `forward_pass.tex` | CMAT forward-pass description |
+| `hyperparams_tables.tex` | Hyperparameter summary tables |
+| `pca_inputs_table.tex` | PCA input feature tables |
+| `feature_summary.tex` | Feature summary for thesis |
+| `methodology.tex` | Methodology chapter |
+| `introduction.tex` | Introduction chapter |
+| `related_work.tex` | Related work chapter |
+| `methods_snippets.tex` | Reusable methodology text snippets |
+
+---
+
 ## Running on SLURM (Snellius)
 
-Each phase has a corresponding `.slurm` batch script. You can submit them individually or chain them with dependencies.
+### Pipeline Jobs
 
-### Individual Submission
+Each pipeline phase has a corresponding `.slurm` batch script. You can submit them individually or chain them with dependencies.
+
+#### Individual Submission
 
 ```bash
 # Phase 1 — Extract (96 cores, 4-hour time limit)
@@ -653,7 +890,7 @@ sbatch src/pipeline/phase2.slurm
 sbatch src/pipeline/phase3.slurm
 ```
 
-### Chained Submission (Recommended)
+#### Chained Submission (Recommended)
 
 Submit Phase 2 after Phase 1, and Phase 3 after Phase 2, using SLURM dependency chains:
 
@@ -672,14 +909,39 @@ JOB3=$(sbatch --parsable --dependency=afterok:$JOB2 src/pipeline/phase3.slurm)
 echo "Phase 2: $JOB2, Phase 3: $JOB3"
 ```
 
+### Model Training Jobs
+
+#### Baseline SLURM Scripts
+
+| Script | Partition | Resources | Description |
+|--------|-----------|-----------|-------------|
+| `src/models/baselines/run_mlr.slurm` | `rome` | 16 CPUs, 64 GB | MLR with explicit 35-feature ROCV |
+| `src/models/baselines/run_mlr_v3.slurm` | `rome` | 16 CPUs, 64 GB | MLR v3 variant |
+| `src/models/baselines/run_seq2seq_3seeds_3horizons.slurm` | `rome` | — | Seq2Seq multi-seed/horizon sweep |
+| `src/models/baselines/run_prophet_lstm_3seeds_3horizons.slurm` | `rome` | — | Prophet-LSTM multi-seed/horizon sweep |
+
+#### CMAT SLURM Scripts
+
+| Script | Partition | Resources | Description |
+|--------|-----------|-----------|-------------|
+| `run_cmat_full_rocv.slurm` | `gpu_a100` | 1 GPU, 18 CPUs, 96 GB, 24h | CMAT-Full 3-seed × 3-horizon ROCV (array tasks) |
+| `run_cmat_full_fold.slurm` | `gpu_a100` | 1 GPU | Single-fold CMAT-Full training |
+| `run_cmat_full_search.slurm` | `gpu_a100` | 1 GPU | Optuna hyperparameter search |
+| `run_cmat_full_fi.slurm` | `gpu_a100` | 1 GPU | Feature importance for CMAT-Full |
+| `run_cmat_tabntl_full_rocv.slurm` | `gpu_a100` | 1 GPU | CMAT-Tab and CMAT-NTL full ROCV |
+| `run_cmat_tabntl_search50.slurm` | `gpu_a100` | 1 GPU | Tab/NTL Optuna search (50 trials) |
+| `run_cmat_tabntl_fi.slurm` | `gpu_a100` | 1 GPU | Feature importance for Tab/NTL variants |
+
 ### SLURM Resource Allocation Summary
 
-| Phase | SLURM Script | Partition | CPUs | Memory | Time Limit | Node |
+| Job | SLURM Script | Partition | CPUs | GPU | Memory | Time Limit |
 |---|---|---|---|---|---|---|
-| 1 | `src/pipeline/phase1.slurm` | `rome` | 96 | Default (shared) | 4 hours | Shared |
-| 2 | `src/pipeline/phase2.slurm` | `rome` | 128 | Full node | 2 hours | **Exclusive** |
-| 3 | `src/pipeline/phase3.slurm` | `rome` | 32 | 64 GB | 30 minutes | Shared |
-| EDA | `analysis/run_analysis.slurm` | `rome` | 8 | 48 GB | 1 hour | Shared |
+| Pipeline Phase 1 | `src/pipeline/phase1.slurm` | `rome` | 96 | — | Default | 4 hours |
+| Pipeline Phase 2 | `src/pipeline/phase2.slurm` | `rome` | 128 | — | Full node | 2 hours |
+| Pipeline Phase 3 | `src/pipeline/phase3.slurm` | `rome` | 32 | — | 64 GB | 30 minutes |
+| EDA | `analysis/run_analysis.slurm` | `rome` | 8 | — | 48 GB | 1 hour |
+| Baseline MLR | `baselines/run_mlr.slurm` | `rome` | 16 | — | 64 GB | 4 hours |
+| CMAT-Full ROCV | `cmat/run_cmat_full_rocv.slurm` | `gpu_a100` | 18 | 1× A100 | 96 GB | 24 hours |
 
 ---
 
@@ -766,7 +1028,6 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 ├── .env                                  # API tokens (git-ignored)
 ├── .gitignore
 ├── README.md
-├── pipeline_architecture.md              # Pipeline design document
 ├── requirements.in                       # Top-level Python dependencies
 ├── requirements.txt                      # Locked/pinned versions (pip-compile)
 ├── setup_env.sh                          # Venv creation/update + Jupyter kernel setup
@@ -781,26 +1042,103 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   │   ├── phase3.slurm                  # SLURM job script for Phase 3
 │   │   └── jupyter_lab.slurm             # JupyterLab compute-node server
 │   │
-│   └── download/                         # Data download utilities
-│       ├── download_nl_viirs.py          # VIIRS HDF5 download script
-│       ├── download_nl_knmi.py           # KNMI weather data download script
-│       ├── download_nl_holidays.py       # OpenHolidays API holiday download script
-│       └── generate_nl_public_holidays.py # Python holidays library public holiday generator
+│   ├── download/                         # Data download utilities
+│   │   ├── download_nl_viirs.py          # VIIRS HDF5 download script
+│   │   ├── download_nl_knmi.py           # KNMI weather data download script
+│   │   ├── download_nl_holidays.py       # OpenHolidays API holiday download script
+│   │   └── generate_nl_public_holidays.py # Python holidays library generator
+│   │
+│   ├── models/                           # Forecasting models
+│   │   ├── __init__.py
+│   │   │
+│   │   ├── baselines/                    # Six literature baseline models
+│   │   │   ├── config.py                 # Unified config (paths, features, hyperparams)
+│   │   │   ├── data_loader.py            # Data loading, preprocessing, ROCV folds
+│   │   │   ├── evaluation.py             # Metrics, CSV checkpointing, aggregation
+│   │   │   ├── mlr.py                    # Model 1: Multiple Linear Regression
+│   │   │   ├── prophet_lstm.py           # Model 2: Prophet-LSTM ensemble
+│   │   │   ├── sarimax.py               # Model 3: SARIMAX
+│   │   │   ├── sarimax_lstm.py          # Model 4: SARIMAX-LSTM residual stacking
+│   │   │   ├── seq2seq.py               # Model 5: Encoder-Decoder LSTM
+│   │   │   ├── train_baselines.py       # Unified trainer for all baselines
+│   │   │   ├── train_mlr.py             # Dedicated MLR ROCV trainer
+│   │   │   ├── train_prophet_lstm_v2.py # Dedicated Prophet-LSTM ROCV trainer
+│   │   │   ├── train_seq2seq_v2.py      # Dedicated Seq2Seq ROCV trainer
+│   │   │   ├── train_seasonal_naive.py  # Seasonal naïve baseline
+│   │   │   ├── merge_shards.py          # Merge SLURM shard CSVs
+│   │   │   ├── aggregate_results.py     # Post-processing & comparison tables
+│   │   │   ├── run_mlr.slurm            # MLR SLURM batch script
+│   │   │   ├── run_seq2seq_3seeds_3horizons.slurm
+│   │   │   ├── run_prophet_lstm_3seeds_3horizons.slurm
+│   │   │   └── results/                 # ROCV results, metadata, shards, plots
+│   │   │
+│   │   └── cmat/                         # Cross-Modal Attention Transformer
+│   │       ├── config.py                 # Variants, hyperparams, search space, paths
+│   │       ├── model.py                  # PyTorch model (4 ablation variants)
+│   │       ├── train.py                  # Training: dataset, loss, optimiser, early stopping
+│   │       ├── ntl_images.py            # NTL image loader (HDF5 → 2D tensor, LRU cache)
+│   │       ├── search.py                # Optuna hyperparameter search
+│   │       ├── run_rocv.py              # Full ROCV evaluation
+│   │       ├── feature_importance.py    # Permutation feature importance
+│   │       ├── submit_fleet_wave.sh     # Fleet GPU job submission
+│   │       ├── run_cmat_full_rocv.slurm # GPU ROCV SLURM script
+│   │       ├── run_cmat_full_search.slurm
+│   │       ├── run_cmat_full_fi.slurm
+│   │       ├── run_cmat_tabntl_*.slurm  # Tab/NTL variant SLURM scripts
+│   │       └── results/                 # Best configs, trial histories, ROCV results,
+│   │           ├── _shards/             #   per-fold shard CSVs
+│   │           └── checkpoints_v2/      #   saved model checkpoints (.pt)
+│   │
+│   └── analysis/                         # Result table generators
+│       ├── generate_results_tables.py    # ROCV comparison LaTeX tables
+│       ├── generate_fi_tables.py         # Feature importance LaTeX tables
+│       └── generate_complexity_table.py  # Computational complexity LaTeX table
 │
 ├── analysis/                             # Exploratory data analysis
 │   ├── run_analysis.py                   # Batch EDA script (10 sections, all figures)
 │   ├── run_analysis.slurm                # SLURM job script for EDA
 │   ├── eda_results.json                  # Machine-readable EDA results (generated)
 │   ├── eda_report.md                     # Formatted EDA report (generated)
+│   ├── eda_report.pdf                    # PDF version of EDA report (generated)
 │   ├── gap_analysis.py                   # KNMI data gap analysis utility
+│   ├── gap_analysis_results.md           # Gap analysis results
+│   ├── pca_elbow.py                      # PCA elbow diagrams (CBS, KNMI, combined)
+│   ├── pca_elbow_full_coverage.py        # PCA elbow for full-coverage features
+│   ├── pca_elbow_load_lags.py            # PCA elbow for load lag features
+│   ├── pca_covariance_matrix.py          # PCA covariance matrix visualisation
+│   ├── regenerate_stl_full.py            # Full-range STL decomposition regeneration
 │   ├── md_to_pdf.py                      # Markdown → PDF conversion utility
-│   └── figures/                          # Generated PNG figures (git-ignored)
+│   └── figures/                          # Generated PNG figures (~60 plots)
 │
-├── docs/                                 # Thesis and design documents
+├── reports/                              # Generated LaTeX fragments for the thesis
+│   ├── results_tables.tex                # ROCV comparison tables (generated)
+│   ├── feature_importance_tables.tex     # Feature importance tables (generated)
+│   ├── complexity_table.tex              # Computational complexity table (generated)
+│   ├── forward_pass.tex                  # CMAT forward-pass description
+│   ├── hyperparams_tables.tex            # Hyperparameter summary tables
+│   ├── pca_inputs_table.tex              # PCA input feature tables
+│   ├── feature_summary.tex               # Feature summary
+│   ├── methodology.tex                   # Methodology chapter
+│   ├── introduction.tex                  # Introduction chapter
+│   ├── related_work.tex                  # Related work chapter
+│   └── methods_snippets.tex              # Reusable methodology text snippets
+│
+├── docs/                                 # Reference documents
 │   ├── feature_dictionary.csv            # Complete feature column definitions (145 columns)
-│   └── methodology.tex                   # LaTeX methodology chapter
+│   ├── pipeline_architecture.md          # Pipeline design document
+│   ├── baseline_config.yaml              # Baseline experiment configuration reference
+│   ├── methodology.tex                   # LaTeX methodology chapter (draft)
+│   ├── paper_comparison.xlsx             # Literature comparison spreadsheet
+│   └── Thesis_Design_Malak_Khan-2.pdf    # Thesis design document
 │
 ├── figures/                              # EDA figures (repo-root copy, git-ignored)
+│
+├── ARCHIVE/                              # Pre-leakage-fix material (moved 2026-08-27)
+│   ├── README.md                         # Explanation of why this material is stale
+│   ├── baselines/                        # Old baseline results (108 files)
+│   ├── cmat/                             # Old CMAT results, configs, scripts (372 files)
+│   ├── logs/                             # Old SLURM logs before 2026-08-25 (520 files)
+│   └── misc/                             # One-off refactoring helper scripts
 │
 ├── data/                                 # Pipeline outputs (inside repo)
 │   ├── geo/                              # Geospatial reference data
@@ -812,6 +1150,7 @@ energy-demand-forecast-nl/                # Repository root (on Snellius)
 │   │   ├── cbs_gdp/data/                 # Monthly GDP/economic indicators + population
 │   │   ├── cbs_cpi/data/                 # Monthly energy CPI (2015=100)
 │   │   ├── cbs_gep/data/                 # Monthly gas & electricity prices by band
+│   │   ├── cbs_macro/data/               # Additional CBS macroeconomic indicators
 │   │   ├── entsoe/data/year=YYYY/        # Hourly NL load
 │   │   ├── knmi/data/year=YYYY/          # Hourly meteorological observations (non-validated)
 │   │   └── knmi_validated/data/year=YYYY/ # Hourly meteorological observations (validated)

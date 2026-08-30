@@ -1,0 +1,20 @@
+{
+  "context_window_hours": 168,
+  "embed_dim": 128,
+  "self_attn_heads": 2,
+  "transformer_depth": 2,
+  "dropout": 0.2,
+  "batch_size": 32,
+  "learning_rate": 0.0002947688976606175,
+  "weight_decay": 8.43765045771651e-05,
+  "variant": "tab",
+  "horizon_days": 180,
+  "best_val_loss": 0.003082057564302607,
+  "best_trial_number": 23,
+  "test_val_rmse": 580.1167665599679,
+  "test_val_pcc": 0.9694359242263678,
+  "test_test_rmse": 1047.8095339427198,
+  "test_test_pcc": 0.9213769353045408,
+  "test_n_params": 423848,
+  "test_n_epochs": 37
+}

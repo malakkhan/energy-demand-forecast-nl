@@ -1,0 +1,85 @@
+\subsection{Hyperparameter Search Strategy}
+\label{subsec:hyperparameter_search}
+
+Hyperparameter choices are optimized via \textbf{Optuna}~\cite{akiba_optuna_2019}, whereby a search with $ \geq 25$ trials is run on fold 0 separately for each horizon choice. Table~\ref{tab:cmat_hparams} enumerates the complete search space. The position-wise FFN within each transformer layer uses a fixed expansion factor of
+$r_{ff} = 4$, following the standard transformer convention~\cite{vaswani_attention_2023}. To prevent Optuna from selecting configurations that achieve low validation loss by predicting the mean, the search employs a \textbf{composite objective} that penalizes low validation set Pearson Correlation Coefficient (PCC):
+\begin{equation}
+    \mathcal{J}_{\text{search}} = \mathcal{L}_{\text{val}} \cdot (2 - \text{PCC}),
+    \label{eq:composite_objective}
+\end{equation}
+where $\mathcal{L}_{\text{val}}$ is the validation mean squared error and PCC is the validation-set Pearson correlation (clamped to $[0, 1]$). Samples from said validation set are excluded from subsequent ROCV test sets. A configuration that captures the temporal structure well (PCC\,$\approx$\,1) incurs a factor of ${\approx}1.0\times$, whereas a mean predictor (PCC\,$\approx$\,0) receives a $2.0\times$ penalty, effectively doubling its objective value. For each of the three horizons of interest (60 days, 120 days and 180 days), a separate search is conducted.
+
+
+\begin{table}[htbp]
+\centering
+\caption{CMAT hyperparameter search space. Categorical parameters are sampled uniformly; continuous parameters are sampled log-uniformly where indicated. Constraint pruning enforces $h_s \mid d$ and $h_c \mid d$ (attention heads must evenly divide the embedding dimension).}
+\label{tab:cmat_hparams}
+\footnotesize
+\begin{tabularx}{\columnwidth}{l c X}
+\toprule
+\textbf{Hyperparameter} & \textbf{Symbol}
+    & \textbf{Search Space} \\
+\midrule
+\multicolumn{3}{l}{\textit{Architecture}} \\
+\addlinespace[2pt]
+Context window (hours) & $W$
+    & $\{96,\ 168\}$ \\
+Embedding dimension    & $d$
+    & $\{64,\ 128\}$ \\
+Self-attn.\ heads      & $h_s$
+    & $\{2,\ 4,\ 8\}$ \\
+Cross-attn.\ heads     & $h_c$
+    & $\{2,\ 4,\ 8\}$ \\
+Transformer depth      & $L$
+    & $\{2,\ 3\}$ \\
+NTL patch size (px)    & $P$
+    & $\{8,\ 16,\ 32\}$ \\
+\midrule
+\multicolumn{3}{l}{\textit{Regularization}} \\
+\addlinespace[2pt]
+Image mask ratio       & $\rho_{img}$
+    & $\{0.25,\ 0.50,\ 0.75\}$ \\
+Dropout                & $p_{drop}$
+    & $\{0.1,\ 0.2,\ 0.3\}$ \\
+\midrule
+\multicolumn{3}{l}{\textit{Optimization}} \\
+\addlinespace[2pt]
+Learning rate          & $\eta$
+    & $[10^{-4},\ 10^{-3}]$ \textit{(log)} \\
+Weight decay           & $\lambda$
+    & $[10^{-5},\ 10^{-4}]$ \textit{(log)} \\
+Batch size             & $B$
+    & $\{32,\ 64\}$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ─────────────────────────────────────────────────────
+% TRAINING DYNAMICS
+% ─────────────────────────────────────────────────────
+
+\subsection{Training Dynamics and Regularization Strategy}
+\label{subsec:training_dynamics}
+
+The model is optimized via the \textbf{Mean Squared Error (MSE)} loss, training a single point forecast per target hour. For a target $y$ and prediction $\hat{y}$:
+\begin{equation}
+    \mathcal{L}(y, \hat{y}) = (y - \hat{y})^2,
+\end{equation}
+averaged over all forecast hours in a batch.
+
+While the MSE loss serves as the gradient-level training objective, an additional form of \textbf{model-selection regularization} is applied at the hyperparameter search level. As described in Section~\ref{subsec:hyperparameter_search}, the Optuna search selects configurations by minimizing the composite objective $\mathcal{J}_{\text{search}} = \mathcal{L}_{\text{val}} \cdot (2 - \text{PCC})$ (Eq.~\ref{eq:composite_objective}). This criterion penalizes configurations whose low validation loss arises from degenerate mean-reverting predictions rather than genuine temporal structure learning, effectively regularizing the hyperparameter search against capacity:data imbalance.
+
+\textbf{Dynamic image masking} is further applied during training. By stochastically replacing a random $\rho_{img}$ fraction of spatial patch tokens with a learnable \texttt{[MASK]} token across the $D_W$ daily images, the model prevents the cross-attention mechanism from memorizing spatial topologies and forces the encoder to learn robust features from partial observations, as in ~\cite{schubnel_solarcrossformer_2025}. The mask ratio $\rho_{img} \in \{0.25, 0.50, 0.75\}$ is optimized as a searched hyperparameter (Table~\ref{tab:cmat_hparams}).
+
+Standard neural network regularization complements the spatial masking: dropout ($p_{drop} \in \{0.1, 0.2, 0.3\}$) is applied after each attention and FFN sub-layer, and the transformer depth is kept shallow ($L \in \{2, 3\}$) to limit model capacity commensurate with the dataset scale. The learning rate follows a cosine annealing schedule with warm restarts.
+
+Early stopping is monitored on the active ROCV validation fold, but with a \textbf{minimum epoch guard}: the patience counter is disabled for the first $E_{\min} = 10$ epochs, after which training halts if validation MSE does not improve for $P = 15$ consecutive epochs. Training is capped at a maximum of 50 epochs.
+
+\subsection{Benchmarking, Evaluation Metrics, and Inclusion/Exclusion Analysis}
+\label{subsec:evaluation_ablation}
+
+CMAT is benchmarked against unimodal baselines successfully deployed in recent Dutch grid forecasting literature. These baselines (which utilize similar temporal, meteorological, and economic data, but omit the 2D visual NTL modality) include Prophet-LSTM as in \cite{van_de_sande_enhancing_2024}, Sequence-to-Sequence models as in \cite{ashtar_hybrid_2025}, as well as a simple Multiple Regression model.
+
+To ensure strict chronological integrity during evaluation, an expanding-window Rolling-Origin Cross-Validation (ROCV) protocol is employed, following the frameworks established in recent national studies \cite{van_de_sande_enhancing_2024, curiel_integrating_2025}. For each fold, the training set utilizes the full available timeline starting from January 2012 up until the prediction target timestamp minus the horizon value. Similar to the methodology of \cite{curiel_integrating_2025,van_de_sande_enhancing_2024}, because all data from the beginning of the timeline is included, different folds inherently possess different training set volumes. To ensure the model realistically captures and learns complete annual seasonal cycles, a strict minimum of two years of historical training data is required to initialize the first fold, as in \cite{van_de_sande_enhancing_2024}. Furthermore, as applied by \cite{curiel_integrating_2025}, the last calendar year of every constructed training split is actively reserved for validation for early stopping. Consequently, the very first data split utilizes January 2012 through December 2013 for training, and January 2014 through December 2014 for validation, with test targets first evaluated from January 1, 2015 across the horizons, as in the lead-time experiment setup of \cite{van_de_sande_enhancing_2024}. The forecasting "origin" then advances by a fixed step of 13 months between successive folds. Because the step exceeds one year by a single month, consecutive forecast origins cycle through different parts of the calendar year (January, February, and onward through October across the ten folds), so that no season is systematically over- or under-represented among the test windows; this prevents the seasonal sampling bias that would arise if every forecast origin fell at the same point in the annual cycle. This expanding-window strategy mimics the sequential accumulation of data in operational grid management while sampling test conditions across the full range of seasonal regimes.
+
+Model efficacy across the ROCV folds is evaluated using five standard point-forecast metrics, including scaled and unscaled measures: \textbf{Root Mean Square Error (RMSE)}, \textbf{Mean Absolute Percentage Error (MAPE)}, \textbf{Mean Absolute Error (MAE)}, \textbf{Mean Absolute Scaled Error (MASE)} --- computed relative to the mean absolute error of a 24-hour persistence na\"ive forecast over the same evaluation window --- and the \textbf{Pearson Correlation Coefficient ($r$)}.
